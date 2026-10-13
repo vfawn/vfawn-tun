@@ -1,0 +1,78 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Needed by the rule-backend contract tests.
+      - name: Install nftables
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y nftables
+
+      - name: fmt
+        run: cargo fmt --all --check
+
+      - name: clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: test
+        run: cargo test --workspace
+
+      - name: license gate
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+      - name: licenses
+        run: cargo deny check licenses
+
+      - name: line-count report
+        run: cargo run -p xtask -- loc
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: loc-${{ matrix.os }}
+          path: bench/results/loc.json
+
+  fuzz:
+    # cargo-fuzz requires nightly and its dependency set must not leak into
+    # the product workspace resolution, so it lives in its own job.
+    name: fuzz-smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-fuzz
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+      - name: Smoke-run targets
+        run: |
+          if [ -f fuzz/Cargo.toml ]; then
+            for t in fuzz/fuzz_targets/*.rs; do
+              [ -e "$t" ] || continue
+              cargo fuzz run "$(basename "${t%.rs}")" -s none -- -runs=1
+            done
+          else
+            echo "no fuzz crate yet, skipping"
+          fi
