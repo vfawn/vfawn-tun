@@ -1,0 +1,18 @@
+[package]
+name = "vfawn-stack-user"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+
+[features]
+# Termination engine compiled into this crate. Exactly the same contract
+# either way; dependencies attach when each engine lands.
+backend-ipstack = []
+backend-native = []

@@ -1,0 +1,34 @@
+# Local-only directories: design notes, reference checkouts, bench data.
+/doc/
+/refer/
+/bench/
+
+# Markdown is kept to the repo root and .github/; crate documentation
+# lives in rustdoc module comments.
+*.md
+!/*.md
+!.github/**/*.md
+
+# Rust
+/target/
+**/*.rs.bk
+
+# Environment and editors
+.env
+.env.*
+!.env.example
+.DS_Store
+.idea/
+.vscode/
+*.log
+*.swp
+*.swo
+*~
+
+# cargo-fuzz run artifacts
+fuzz/artifacts/
+fuzz/coverage/
+fuzz/crash-*
+fuzz/out/
+fuzz/target/
+*.profraw
