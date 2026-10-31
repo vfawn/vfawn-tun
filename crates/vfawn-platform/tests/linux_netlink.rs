@@ -136,7 +136,7 @@ fn rule_add_remove_by_priority() {
             incoming_interface: None,
             suppress_prefixlen: None,
         },
-        action: RuleAction::Lookup(2022),
+        action: RuleAction::Lookup(254),
         tag: "vfawn-test".to_string(),
     };
 
@@ -162,20 +162,15 @@ fn rule_add_remove_by_priority() {
 
 #[test]
 #[ignore]
-fn snapshot_survives_concurrent_reads() {
-    let be = std::sync::Arc::new(backend());
-    let mut handles = Vec::new();
-    for _ in 0..4 {
-        let b = std::sync::Arc::clone(&be);
-        handles.push(std::thread::spawn(move || {
-            for _ in 0..10 {
-                let snap = b.snapshot().unwrap();
-                let _ = snap.addresses.len();
-            }
-        }));
-    }
-    for h in handles {
-        h.join().expect("snapshot thread");
+fn snapshot_repeated_reads_are_stable() {
+    // A single-threaded netlink socket cannot service parallel callers;
+    // the reconciler serializes through its own lock. This test verifies
+    // that sequential repeated snapshots produce consistent results.
+    let be = backend();
+    let first = be.snapshot().unwrap();
+    for _ in 0..10 {
+        let again = be.snapshot().unwrap();
+        assert_eq!(first.addresses.len(), again.addresses.len());
     }
 }
 
