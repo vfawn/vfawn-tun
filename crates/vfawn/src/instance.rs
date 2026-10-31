@@ -104,6 +104,10 @@ impl Instance {
             .max(536);
         let backend = Box::new(vfawn_stack_user::IpstackBackend {
             mss,
+            udp_nat: std::sync::Arc::new(vfawn_core::UdpNat::from_config(
+                &self.config.stack.udp_nat,
+                self.config.stack.udp_timeout,
+            )),
             udp_timeout_secs: self.config.stack.udp_timeout.as_secs(),
             tcp_timeout_secs: 60,
         });

@@ -28,16 +28,21 @@ use ipstack::{IpStack, IpStackConfig, IpStackStream, IpStackTcpStream, IpStackUd
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use vfawn_core::{
     FlowInfo, FlowTrackerHook, IcmpPacket, Network, PacketDevice, SessionHandler, StackBackend,
-    StackHandle, TcpSession, TcpTransport, UdpSession, UdpTransport, Verdict,
+    StackHandle, TcpSession, TcpTransport, UdpNat, UdpSession, UdpSessionMode, UdpTransport,
+    Verdict,
 };
 
 use crate::ipstack_bridge;
 
 /// Configuration for the transitional ipstack backend.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct IpstackBackend {
     /// Maximum segment size; derived from the device MTU when zero.
     pub mss: u16,
+    /// The NAT table UDP flows are registered in. Shared with the
+    /// runtime's sweep task, which expires idle mappings and reports
+    /// their close to the flow trackers.
+    pub udp_nat: Arc<UdpNat>,
     /// Idle timeout for UDP sessions, in seconds.
     pub udp_timeout_secs: u64,
     /// TCP connection timeout, in seconds.
@@ -48,6 +53,11 @@ impl Default for IpstackBackend {
     fn default() -> Self {
         Self {
             mss: 1460,
+            udp_nat: Arc::new(UdpNat::new(
+                UdpSessionMode::Symmetric,
+                std::time::Duration::from_secs(300),
+                0,
+            )),
             udp_timeout_secs: 300,
             tcp_timeout_secs: 60,
         }
@@ -74,6 +84,7 @@ impl StackBackend for IpstackBackend {
         };
 
         let stop = handle.clone();
+        let udp_nat = Arc::clone(&self.udp_nat);
         std::thread::Builder::new()
             .name("ipstack-runtime".into())
             .spawn(move || {
@@ -90,13 +101,29 @@ impl StackBackend for IpstackBackend {
                         .build()
                         .expect("ipstack runtime");
                     rt.block_on(async move {
+                        // Idle NAT mappings must not wait for the next
+                        // datagram to be reclaimed; a one-second sweep
+                        // keeps close reports flowing on quiet tables.
+                        let sweep_table = Arc::clone(&udp_nat);
+                        let sweep_stop = stop.clone();
+                        tokio::spawn(async move {
+                            let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
+                            loop {
+                                tick.tick().await;
+                                if sweep_stop.is_stopped() {
+                                    break;
+                                }
+                                sweep_table.sweep(std::time::Instant::now());
+                            }
+                        });
+
                         let mut stack = IpStack::new(config, io);
                         loop {
                             if stop.is_stopped() {
                                 break;
                             }
                             match stack.accept().await {
-                                Ok(stream) => dispatch(stream, &handler).await,
+                                Ok(stream) => dispatch(stream, &handler, &udp_nat).await,
                                 Err(_) => break,
                             }
                         }
@@ -133,7 +160,7 @@ fn judged(handler: &Arc<dyn SessionHandler>, flow: &FlowInfo) -> Option<Verdict>
 }
 
 /// Route one accepted stream to the appropriate handler callback.
-async fn dispatch(stream: IpStackStream, handler: &Arc<dyn SessionHandler>) {
+async fn dispatch(stream: IpStackStream, handler: &Arc<dyn SessionHandler>, udp_nat: &Arc<UdpNat>) {
     match stream {
         IpStackStream::Tcp(tcp) => {
             let local = tcp.local_addr();
@@ -185,9 +212,26 @@ async fn dispatch(stream: IpStackStream, handler: &Arc<dyn SessionHandler>) {
             };
             let action = vfawn_core::verdict::execute(verdict, &flow);
             match action {
-                vfawn_core::VerdictAction::CreateSession { tracker, .. } => {
-                    let transport = Box::new(UdpIo { stream: udp });
+                vfawn_core::VerdictAction::CreateSession {
+                    udp_timeout_override,
+                    tracker,
+                } => {
+                    // The NAT table hears about the flow before the host
+                    // does, so return traffic has a path to travel the
+                    // moment the session exists.
                     let tracker = tracker.map(|t| t as Arc<dyn FlowTrackerHook>);
+                    udp_nat.on_outbound(
+                        flow.source,
+                        flow.destination,
+                        tracker.clone(),
+                        udp_timeout_override,
+                        std::time::Instant::now(),
+                    );
+                    let transport = Box::new(UdpIo {
+                        stream: udp,
+                        nat: Arc::clone(udp_nat),
+                        source: flow.source,
+                    });
                     let session = UdpSession::new(flow, transport, tracker);
                     handler.on_udp(session).await;
                 }
@@ -260,17 +304,28 @@ impl TcpTransport for TcpIo {
 /// async datagram stream.
 struct UdpIo {
     stream: IpStackUdpStream,
+    nat: Arc<UdpNat>,
+    source: SocketAddr,
 }
 
 #[async_trait]
 impl UdpTransport for UdpIo {
     async fn recv(&mut self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
-        let n = self.stream.read(buf).await?;
-        // ipstack's UDP stream represents one flow; the remote is the
-        // flow's peer. The full-cone mode, where multiple remotes share
-        // one internal endpoint, is dispatcher-side and not visible here.
-        let remote = self.stream.peer_addr();
-        Ok((n, remote))
+        loop {
+            let n = self.stream.read(buf).await?;
+            // ipstack's UDP stream represents one flow; the remote is
+            // the flow's peer. The table still gets a say, so a path
+            // that expired or was never opened drops here too: the
+            // datagram returns to the host only if the NAT allows it.
+            let remote = self.stream.peer_addr();
+            if self
+                .nat
+                .on_inbound(self.source, remote, std::time::Instant::now())
+                .is_some()
+            {
+                return Ok((n, remote));
+            }
+        }
     }
 
     async fn send(&mut self, data: &[u8], _to: &SocketAddr) -> io::Result<()> {

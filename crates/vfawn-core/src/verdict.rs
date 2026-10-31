@@ -12,7 +12,7 @@
 
 use crate::{FlowInfo, FlowTrackerHook, Verdict};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 /// What the caller should physically do after a verdict.
@@ -44,6 +44,7 @@ pub struct CountingTracker {
     pub reverse: AtomicU64,
     pub established: AtomicU64,
     pub closed: AtomicU64,
+    closed_reported: AtomicBool,
     hook: Option<Arc<dyn FlowTrackerHook>>,
 }
 
@@ -54,6 +55,7 @@ impl CountingTracker {
             reverse: AtomicU64::new(0),
             established: AtomicU64::new(0),
             closed: AtomicU64::new(0),
+            closed_reported: AtomicBool::new(false),
             hook,
         }
     }
@@ -79,7 +81,13 @@ impl CountingTracker {
         }
     }
 
+    /// Report the close exactly once: two owners of a flow (the NAT
+    /// table timing it out, the session handle being dropped) may both
+    /// try, and the first reason to arrive is the truest one.
     pub fn mark_closed(&self, reason: crate::CloseReason) {
+        if self.closed_reported.swap(true, Ordering::AcqRel) {
+            return;
+        }
         self.closed.fetch_add(1, Ordering::Relaxed);
         if let Some(ref h) = self.hook {
             h.closed(reason);
@@ -215,6 +223,31 @@ mod tests {
         assert_eq!(tracker.reverse.load(Ordering::Relaxed), 200);
         assert_eq!(tracker.established.load(Ordering::Relaxed), 1);
         assert_eq!(tracker.closed.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn only_the_first_close_reaches_the_hook() {
+        struct ReasonSink {
+            reported: std::sync::Mutex<Vec<crate::CloseReason>>,
+        }
+        impl FlowTrackerHook for ReasonSink {
+            fn count_forward(&self, _n: u64) {}
+            fn count_reverse(&self, _n: u64) {}
+            fn established(&self) {}
+            fn closed(&self, reason: crate::CloseReason) {
+                self.reported.lock().unwrap().push(reason);
+            }
+        }
+        let sink = Arc::new(ReasonSink {
+            reported: std::sync::Mutex::new(Vec::new()),
+        });
+        let tracker = CountingTracker::new(Some(sink.clone()));
+        tracker.mark_closed(crate::CloseReason::Timeout);
+        tracker.mark_closed(crate::CloseReason::Finished);
+        assert_eq!(
+            *sink.reported.lock().unwrap(),
+            vec![crate::CloseReason::Timeout]
+        );
     }
 
     #[test]

@@ -19,6 +19,7 @@ pub mod device;
 pub mod monitor;
 pub mod session;
 pub mod stack;
+pub mod udp_nat;
 pub mod verdict;
 
 pub use config::{
@@ -33,4 +34,5 @@ pub use session::{
     TcpSession, TcpTransport, UdpSession, UdpTransport, Verdict,
 };
 pub use stack::{StackBackend, StackHandle};
+pub use udp_nat::{UdpFlowOutcome, UdpNat};
 pub use verdict::{CountingTracker, VerdictAction, execute};

@@ -22,8 +22,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use vfawn_core::{
-    DeviceCaps, FlowInfo, PacketDevice, SessionHandler, StackBackend, TcpSession, UdpSession,
-    Verdict,
+    DeviceCaps, FlowInfo, PacketDevice, SessionHandler, StackBackend, TcpSession, UdpNat,
+    UdpSession, UdpSessionMode, Verdict,
 };
 use vfawn_testsuite::{MockDevice, Script};
 
@@ -46,6 +46,7 @@ struct ScriptedHost {
     panic: bool,
     judge_calls: AtomicUsize,
     sessions: AtomicUsize,
+    udp_sessions: AtomicUsize,
 }
 
 #[async_trait::async_trait]
@@ -63,7 +64,9 @@ impl SessionHandler for ScriptedHost {
         self.sessions.fetch_add(1, Ordering::SeqCst);
     }
 
-    async fn on_udp(&self, _session: UdpSession) {}
+    async fn on_udp(&self, _session: UdpSession) {
+        self.udp_sessions.fetch_add(1, Ordering::SeqCst);
+    }
 
     async fn on_icmp(&self, _packet: vfawn_core::IcmpPacket) -> vfawn_core::Action {
         vfawn_core::Action::Drop
@@ -78,6 +81,7 @@ impl ScriptedHost {
             panic: false,
             judge_calls: AtomicUsize::new(0),
             sessions: AtomicUsize::new(0),
+            udp_sessions: AtomicUsize::new(0),
         })
     }
 }
@@ -168,6 +172,7 @@ async fn panicking_judge_costs_the_flow_not_the_process() {
         panic: true,
         judge_calls: AtomicUsize::new(0),
         sessions: AtomicUsize::new(0),
+        udp_sessions: AtomicUsize::new(0),
     });
 
     let backend = Box::new(vfawn_stack_user::IpstackBackend::default());
@@ -209,6 +214,7 @@ async fn slow_judge_slows_its_own_flow() {
         panic: false,
         judge_calls: AtomicUsize::new(0),
         sessions: AtomicUsize::new(0),
+        udp_sessions: AtomicUsize::new(0),
     });
     let slow = run_syn_flow(&slow_host, Duration::from_secs(2)).await;
     assert_eq!(slow.sessions, 1);
@@ -220,4 +226,40 @@ async fn slow_judge_slows_its_own_flow() {
         fast.delivery,
         slow.delivery
     );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn udp_flows_register_in_the_nat_table() {
+    let host = ScriptedHost::with_verdict(|| Verdict::Accept);
+    let nat = Arc::new(UdpNat::new(
+        UdpSessionMode::Symmetric,
+        Duration::from_secs(300),
+        0,
+    ));
+
+    let backend = Box::new(vfawn_stack_user::IpstackBackend {
+        udp_nat: Arc::clone(&nat),
+        ..vfawn_stack_user::IpstackBackend::default()
+    });
+    let owned_device = MockDevice::new(DeviceCaps::MINIMAL);
+    let handle = backend
+        .spawn(owned_device.duplicate().unwrap(), host.clone())
+        .expect("spawn");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let script = Script::new(CLIENT, SERVER);
+    let datagram = script.udp(b"query");
+    owned_device.push(&[&datagram]);
+
+    let deadline = Duration::from_secs(2);
+    let started = Instant::now();
+    while host.udp_sessions.load(Ordering::SeqCst) == 0 && started.elapsed() < deadline {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    handle.stop();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    assert_eq!(host.udp_sessions.load(Ordering::SeqCst), 1);
+    assert_eq!(nat.session_count(), 1, "the flow landed in the NAT table");
 }
