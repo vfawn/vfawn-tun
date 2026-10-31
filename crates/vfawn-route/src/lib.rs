@@ -17,6 +17,7 @@ pub mod backend;
 pub mod dry_run;
 pub mod model;
 pub mod planner;
+pub mod reconciler;
 
 pub use backend::RouteBackend;
 pub use model::{
@@ -24,3 +25,4 @@ pub use model::{
     RuleAction, RuleSelector,
 };
 pub use planner::{RouteParams, desired_from_config, plan, simulate_apply};
+pub use reconciler::{AuditEntry, ReconcileError, Reconciler};

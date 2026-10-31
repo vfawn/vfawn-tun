@@ -1255,6 +1255,7 @@ dependencies = [
  "bytes",
  "vfawn-core",
  "vfawn-device",
+ "vfawn-route",
  "vfawn-stack-user",
  "vfawn-testsuite",
 ]
@@ -1319,6 +1320,8 @@ name = "vfawn-route"
 version = "0.1.0"
 dependencies = [
  "ipnet",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

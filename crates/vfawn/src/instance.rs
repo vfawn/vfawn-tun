@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use vfawn_core::{SessionHandler, StackHandle, VfawnConfig};
+use vfawn_route::Reconciler;
 
 /// Why a reconfiguration cannot proceed right now.
 #[derive(Debug)]
@@ -56,6 +57,7 @@ pub struct Instance {
     config: VfawnConfig,
     handle: Option<StackHandle>,
     panics: Arc<AtomicU64>,
+    reconciler: Option<Reconciler>,
 }
 
 impl Instance {
@@ -74,6 +76,7 @@ impl Instance {
             config,
             handle: None,
             panics: Arc::new(AtomicU64::new(0)),
+            reconciler: None,
         })
     }
 
@@ -137,10 +140,40 @@ impl Instance {
         Ok(())
     }
 
-    /// Hot-reconfiguration. Returns an error explaining what to do until
-    /// the route engine makes incremental reconciliation available.
-    pub fn apply_config(&mut self, _config: &VfawnConfig) -> Result<(), RestartReason> {
-        Err(RestartReason::NeedsRestart)
+    /// Hot-reconfigure the route engine. Builds a new desired state from
+    /// the configuration and lets the reconciler drive the kernel toward
+    /// it. Returns an error naming the first field that requires a restart
+    /// (interface identity, table or rule indices) rather than silently
+    /// ignoring it.
+    pub fn apply_config(&mut self, config: &VfawnConfig) -> Result<(), ApplyError> {
+        let new_desired = vfawn_route::desired_from_config(&vfawn_route::RouteParams {
+            interface: &config.device.name.clone().unwrap_or_default(),
+            addresses: &config
+                .device
+                .inet4_address
+                .iter()
+                .map(|n| n.to_owned().into())
+                .collect::<Vec<_>>(),
+            captured: &config.route.route_address,
+            excluded: &config.route.route_exclude_address,
+            table_index: config.route.table_index,
+            rule_index: config.route.rule_index,
+            strict_route: config.route.strict_route,
+            dns_leak_prevention: config.dns.mode == vfawn_core::DnsMode::Hijack,
+        });
+        if let Some(reason) = needs_restart_desired(&self.config, config) {
+            return Err(ApplyError::NeedsRestart(reason));
+        }
+        let Some(ref re) = self.reconciler else {
+            return Err(ApplyError::NoRouteEngine);
+        };
+        re.apply(&new_desired).map_err(ApplyError::Reconcile)
+    }
+
+    /// Install a route reconciler; the platform layer calls this when it
+    /// has a backend ready.
+    pub fn set_reconciler(&mut self, reconciler: Reconciler) {
+        self.reconciler = Some(reconciler);
     }
 
     /// Current counters.
@@ -197,4 +230,56 @@ mod tests {
         assert_eq!(stats.sessions_total, 0);
         assert_eq!(stats.panics_contained, 0);
     }
+}
+
+/// What went wrong during a hot-reconfiguration attempt.
+#[derive(Debug)]
+pub enum ApplyError {
+    /// A field changed that cannot be hot-updated.
+    NeedsRestart(String),
+    /// No route engine is installed (non-Linux platform or not started).
+    NoRouteEngine,
+    /// The reconciler failed; the message describes what happened.
+    Reconcile(vfawn_route::ReconcileError),
+}
+
+impl std::fmt::Display for ApplyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NeedsRestart(w) => write!(f, "restart required: {w}"),
+            Self::NoRouteEngine => write!(f, "no route engine installed"),
+            Self::Reconcile(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl std::error::Error for ApplyError {}
+
+impl From<ApplyError> for RestartReason {
+    fn from(_: ApplyError) -> Self {
+        RestartReason::NeedsRestart
+    }
+}
+
+/// Check whether two configurations differ in non-hot-updatable fields.
+fn needs_restart_desired(old: &VfawnConfig, new: &VfawnConfig) -> Option<String> {
+    if old.device.mtu != new.device.mtu {
+        return Some(format!("mtu {} -> {}", old.device.mtu, new.device.mtu));
+    }
+    if old.route.table_index != new.route.table_index {
+        return Some(format!(
+            "table_index {} -> {}",
+            old.route.table_index, new.route.table_index
+        ));
+    }
+    if old.route.rule_index != new.route.rule_index {
+        return Some(format!(
+            "rule_index {} -> {}",
+            old.route.rule_index, new.route.rule_index
+        ));
+    }
+    if old.device.name != new.device.name {
+        return Some("interface name changed".to_string());
+    }
+    None
 }
