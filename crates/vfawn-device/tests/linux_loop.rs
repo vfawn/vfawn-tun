@@ -94,13 +94,25 @@ fn shutdown_wakes_a_blocked_reader_from_another_thread() {
     // inside the kernel until the interrupt arrives.
     let mut device = TunDevice::create(&subnet_config(1)).expect("create device");
     let handle = device.shutdown_handle();
+    // A freshly brought-up interface receives kernel housekeeping (IPv6
+    // router solicitations, MLD reports) before it goes quiet, so the
+    // reader keeps reading until the interrupt lands; that it returns at
+    // all is the proof the wake works, and the drain must end in zero.
     let reader = thread::spawn(move || {
         let mut bufs = vec![BytesMut::new(); 4];
-        device.read_batch(&mut bufs)
+        let mut noise = 0usize;
+        loop {
+            match device.read_batch(&mut bufs) {
+                Ok(0) => break Ok(noise),
+                Ok(count) => noise += count,
+                Err(error) => break Err(error),
+            }
+        }
     });
     thread::sleep(Duration::from_millis(300));
     handle.shutdown().expect("shutdown via handle");
-    assert_eq!(reader.join().unwrap().unwrap(), 0);
+    let noise = reader.join().unwrap().unwrap();
+    assert!(noise < 8, "unexpected traffic flood: {noise} packets");
 }
 
 #[test]
