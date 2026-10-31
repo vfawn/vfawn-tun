@@ -249,6 +249,29 @@ fn body() {
     assert_eq!(looped[0] >> 4, 4, "IPv4");
     assert_eq!(looped[9], 17, "UDP");
     assert_eq!(&looped[16..20], &[203, 0, 113, 10], "captured destination");
+
+    // Diagnostics for the escape assertions outside: how much of the
+    // probe traffic also landed in the TUN, and what the constrained
+    // route lookup says.
+    let mut extra = 0;
+    while read_packet(&tun, 0).is_some() {
+        extra += 1;
+    }
+    eprintln!("tun queue held {extra} further packets after the first");
+    let lookup = Command::new("ip")
+        .args(["route", "get", MARKER, "oif", "v0a"])
+        .output()
+        .expect("constrained route get");
+    eprintln!(
+        "route get {MARKER} oif v0a: {}{}",
+        String::from_utf8_lossy(&lookup.stdout),
+        String::from_utf8_lossy(&lookup.stderr)
+    );
+    let neigh = Command::new("ip")
+        .args(["neigh", "show"])
+        .output()
+        .expect("neigh");
+    eprintln!("neighbours: {}", String::from_utf8_lossy(&neigh.stdout));
 }
 
 /// Attach to an existing TUN device and return the fd holding it open.
