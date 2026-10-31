@@ -200,9 +200,13 @@ fn body() {
     let bound = protect(&OutboundFdHook::BindDefaultIface, guarded.as_raw_fd())
         .expect("protect the socket");
     assert_eq!(bound.as_deref(), Some("v0a"));
-    guarded
-        .send_to(b"escape", DST)
-        .expect("send escapes via v0a");
+    // A few probes, not one: the first datagram pays for ARP resolution.
+    for _ in 0..3 {
+        guarded
+            .send_to(b"escape", DST)
+            .expect("send escapes via v0a");
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
 
     // 3. The network changes: default route moves to the second veth.
     run(ip(&[
@@ -232,9 +236,12 @@ fn body() {
         "v0a",
         "old binding persists"
     );
-    fresh
-        .send_to(b"flipped", DST)
-        .expect("send escapes via v1a");
+    for _ in 0..3 {
+        fresh
+            .send_to(b"flipped", DST)
+            .expect("send escapes via v1a");
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
 
     // The plain send from step 1 is waiting in the TUN queue: the
     // datagram the rule captured back, read off the device itself.
