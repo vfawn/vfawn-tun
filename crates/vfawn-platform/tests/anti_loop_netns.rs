@@ -188,9 +188,11 @@ fn policy_capture_loops_and_bound_sockets_escape() {
     stop_capture(v1_capture);
     stop_capture(v0_in);
 
-    let on_v0 = captured_packets("/tmp/vfawn023-v0.pcap");
-    let on_v1 = captured_packets("/tmp/vfawn023-v1.pcap");
-    let inside_v0 = captured_packets("/tmp/vfawn023-v0a.pcap");
+    let on_v0_udp = captured_packets("/tmp/vfawn023-v0.pcap", "UDP");
+    let on_v0_arp = captured_packets("/tmp/vfawn023-v0.pcap", "ARP");
+    let on_v1_udp = captured_packets("/tmp/vfawn023-v1.pcap", "UDP");
+    let inside_udp = captured_packets("/tmp/vfawn023-v0a.pcap", "UDP");
+    let inside_arp = captured_packets("/tmp/vfawn023-v0a.pcap", "ARP");
 
     run(ip(&["netns", "del", NS]));
     let _ = std::fs::remove_file("/tmp/vfawn023-v0.pcap");
@@ -198,16 +200,18 @@ fn policy_capture_loops_and_bound_sockets_escape() {
     let _ = std::fs::remove_file("/tmp/vfawn023-v1.pcap");
 
     assert!(
-        on_v0 >= 1,
-        "the protected socket escaped through v0: {} marker packets left v0a inside, \
-         {} arrived at v0b; inside tcpdump said: {}; outside said: {}",
-        inside_v0,
-        on_v0,
+        on_v0_udp >= 1,
+        "the protected socket escaped through v0: inside v0a saw {} UDP and {} ARP markers, \
+         v0b saw {} UDP and {} ARP markers; inside tcpdump said: {}; outside said: {}",
+        inside_udp,
+        inside_arp,
+        on_v0_udp,
+        on_v0_arp,
         capture_stderr("v0a"),
         capture_stderr("v0b")
     );
     assert!(
-        on_v1 >= 1,
+        on_v1_udp >= 1,
         "after the flip, a fresh socket escaped through v1 (tcpdump said: {})",
         capture_stderr("v1b")
     );
@@ -231,6 +235,16 @@ fn body() {
     let bound = protect(&OutboundFdHook::BindDefaultIface, guarded.as_raw_fd())
         .expect("protect the socket");
     assert_eq!(bound.as_deref(), Some("v0a"));
+    // What the constrained lookup says at send time, before the flip.
+    let pre = Command::new("ip")
+        .args(["route", "get", MARKER, "oif", "v0a"])
+        .output()
+        .expect("pre-flip lookup");
+    eprintln!(
+        "pre-flip route get: {}{}",
+        String::from_utf8_lossy(&pre.stdout),
+        String::from_utf8_lossy(&pre.stderr)
+    );
     // A few probes, not one: the first datagram pays for ARP resolution.
     for _ in 0..3 {
         guarded
@@ -238,6 +252,15 @@ fn body() {
             .expect("send escapes via v0a");
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
+
+    let neigh_after = Command::new("ip")
+        .args(["neigh", "show"])
+        .output()
+        .expect("neigh");
+    eprintln!(
+        "neighbours after the probes: {}",
+        String::from_utf8_lossy(&neigh_after.stdout)
+    );
 
     // 3. The network changes: default route moves to the second veth.
     run(ip(&[
@@ -434,7 +457,9 @@ fn stop_capture(mut child: Child) {
     let _ = child.wait();
 }
 
-fn captured_packets(file: &str) -> usize {
+/// Count captured lines that mention the marker and the given protocol
+/// word; an ARP request for the marker address counts only for "ARP".
+fn captured_packets(file: &str, protocol: &str) -> usize {
     let output = Command::new("tcpdump")
         .args(["-nn", "-r", file])
         .stderr(Stdio::null())
@@ -442,6 +467,6 @@ fn captured_packets(file: &str) -> usize {
         .expect("read capture back");
     String::from_utf8_lossy(&output.stdout)
         .lines()
-        .filter(|line| line.contains(MARKER))
+        .filter(|line| line.contains(MARKER) && line.contains(protocol))
         .count()
 }
