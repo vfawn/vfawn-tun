@@ -13,12 +13,14 @@
 //! Kernel manipulation happens exclusively through the [`RouteBackend`]
 //! contract; implementations live in `vfawn-platform`, never here.
 
+pub mod auto_reconciler;
 pub mod backend;
 pub mod dry_run;
 pub mod model;
 pub mod planner;
 pub mod reconciler;
 
+pub use auto_reconciler::AutoReconciler;
 pub use backend::RouteBackend;
 pub use model::{
     Conflict, DesiredState, InterfaceAddress, ObservedState, Plan, PolicyRule, RouteEntry, RouteOp,

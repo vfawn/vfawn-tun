@@ -1325,6 +1325,7 @@ dependencies = [
  "ipnet",
  "serde",
  "serde_json",
+ "vfawn-core",
 ]
 
 [[package]]
