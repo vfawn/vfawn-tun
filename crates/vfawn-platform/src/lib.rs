@@ -13,10 +13,10 @@
 //! host-supplied fd, and the bindings layer carries the Java/Swift side.
 
 #[cfg(target_os = "linux")]
-mod linux;
+pub mod linux;
 #[cfg(target_os = "macos")]
-mod macos;
+pub mod macos;
 #[cfg(unix)]
-mod unix;
+pub mod unix;
 #[cfg(target_os = "windows")]
-mod windows;
+pub mod windows;

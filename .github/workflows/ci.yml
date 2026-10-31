@@ -44,6 +44,11 @@ jobs:
         if: runner.os == 'Linux'
         run: sudo -E env "PATH=$PATH" cargo test -p vfawn-device -- --ignored --test-threads=1 --nocapture
 
+      # Route backend contract tests need root for netlink and dummy links.
+      - name: route backend tests (root)
+        if: runner.os == 'Linux'
+        run: sudo -E env "PATH=$PATH" cargo test -p vfawn-platform -- --ignored --test-threads=1 --nocapture
+
       - name: license gate
         uses: taiki-e/install-action@v2
         with:
