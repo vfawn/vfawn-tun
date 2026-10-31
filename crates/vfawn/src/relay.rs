@@ -92,7 +92,6 @@ impl SessionHandler for RelayHandler {
     }
 
     async fn on_udp(&self, mut session: UdpSession) {
-        use tokio::io::AsyncReadExt;
         let peer = session.flow().destination;
         let Ok(socket) = tokio::net::UdpSocket::bind("0.0.0.0:0").await else {
             return;

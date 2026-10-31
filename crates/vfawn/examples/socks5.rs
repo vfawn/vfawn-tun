@@ -4,7 +4,7 @@
 //! The host-integration example: a SOCKS5 CONNECT server in front of a
 //! vfawn instance.
 //!
-//! This is deliberately outside the library. A proxy protocol belongs
+//! This sits outside the library on purpose. A proxy protocol belongs
 //! to the host; what the library owes the host is the session contract
 //! this file exercises: one judge call per flow, one session per flow,
 //! and the original destination carried on the session. Everything
@@ -19,16 +19,20 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpListener;
 use vfawn::Instance;
 use vfawn_core::{
     FlowInfo, IcmpPacket, Network, SessionHandler, TcpSession, UdpSession, Verdict, VfawnConfig,
 };
 
-/// The handler the instance runs: every TCP flow is accepted and piped
-/// to a waiting SOCKS front-end through the relay table below.
+/// Sessions the instance produced, parked until the SOCKS front-end
+/// asks for their destination.
+type Waiting = std::sync::Arc<std::sync::Mutex<std::collections::HashMap<SocketAddr, TcpSession>>>;
+
+/// The handler the instance runs: every TCP flow is accepted and
+/// parked in the waiting table for the front-end to pick up.
 struct ToSocks {
-    socks: tokio::sync::mpsc::UnboundedSender<(SocketAddr, TcpSession)>,
+    waiting: Waiting,
 }
 
 #[async_trait::async_trait]
@@ -41,9 +45,9 @@ impl SessionHandler for ToSocks {
     }
 
     async fn on_tcp(&self, session: TcpSession) {
-        // The front-end asked for this destination when it submitted
-        // the flow; the mapping below restores the pair.
-        let _ = self.socks.send((session.flow().destination, session));
+        // TcpSession crosses threads: the handler contract requires it.
+        let destination = session.flow().destination;
+        self.waiting.lock().unwrap().insert(destination, session);
     }
 
     async fn on_udp(&self, _session: UdpSession) {}
@@ -54,7 +58,7 @@ impl SessionHandler for ToSocks {
 }
 
 #[tokio::main(flavor = "multi_thread")]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let address = std::env::args()
         .nth(1)
         .unwrap_or_else(|| "198.18.0.1/15".into());
@@ -64,20 +68,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     config.device.inet4_address = vec![address.parse()?];
     config.route.auto_route = true;
 
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-    let handler: Arc<dyn SessionHandler> = Arc::new(ToSocks { socks: tx });
+    let waiting: Waiting = Default::default();
+    let handler: Arc<dyn SessionHandler> = Arc::new(ToSocks {
+        waiting: Arc::clone(&waiting),
+    });
     let mut instance = Instance::new(config, handler.clone())?;
     instance.start(handler)?;
-
-    // The session half of each captured flow, keyed by the original
-    // destination the SOCKS client asked for.
-    let mut waiting: std::collections::HashMap<SocketAddr, TcpSession> =
-        std::collections::HashMap::new();
-    let reader = tokio::spawn(async move {
-        while let Some((destination, session)) = rx.recv().await {
-            waiting.insert(destination, session);
-        }
-    });
 
     let listener = TcpListener::bind(listen).await?;
     println!("socks5 on {listen}; instance ready");
@@ -127,7 +123,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // destination through the instance's own TUN would be the real
         // trigger; for the example, the waiting table carries whatever
         // the instance already produced for this destination.
-        let Some(mut upstream) = waiting.remove(&destination) else {
+        let Some(mut upstream) = waiting.lock().unwrap().remove(&destination) else {
             let _ = client.write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0]).await;
             let _ = client.shutdown().await;
             continue;
@@ -148,6 +144,5 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 },
             }
         }
-        let _ = reader;
     }
 }
