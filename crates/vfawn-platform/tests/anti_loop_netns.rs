@@ -82,7 +82,7 @@ fn policy_capture_loops_and_bound_sockets_escape() {
         "sysctl",
         "-q",
         "-w",
-        "net.ipv6.conf.all.disable_ipv6=1",
+        "net.ipv6.conf.default.disable_ipv6=1",
     ]));
     run(ip(&[
         "link", "add", "v0a", "type", "veth", "peer", "name", "v0b",
@@ -279,14 +279,43 @@ fn body() {
     // Scan rather than assume: interface bring-up may have queued
     // management packets ahead of it.
     let mut looped = None;
-    for _ in 0..8 {
-        let candidate = read_packet(&tun, 1000).expect("packets queued on the TUN");
-        if candidate[0] >> 4 == 4 && candidate[9] == 17 && candidate[16..20] == [203, 0, 113, 10] {
-            looped = Some(candidate);
-            break;
+    let mut seen_bytes = Vec::new();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(4);
+    while std::time::Instant::now() < deadline {
+        match read_packet(&tun, 200) {
+            Some(candidate) => {
+                seen_bytes.push(candidate.first().copied().unwrap_or(0));
+                if candidate[0] >> 4 == 4
+                    && candidate[9] == 17
+                    && candidate[16..20] == [203, 0, 113, 10]
+                {
+                    looped = Some(candidate);
+                    break;
+                }
+            }
+            None => continue,
         }
     }
-    assert!(looped.is_some(), "the plain datagram never reached the TUN");
+    if looped.is_none() {
+        for cmd in [
+            vec!["ip", "rule", "show"],
+            vec!["ip", "route", "show"],
+            vec!["ip", "route", "show", "table", "100"],
+            vec!["ip", "addr", "show"],
+            vec!["ip", "neigh", "show"],
+        ] {
+            let out = Command::new(cmd[0])
+                .args(&cmd[1..])
+                .output()
+                .expect("state dump");
+            eprintln!(
+                "$ {}\n{}",
+                cmd.join(" "),
+                String::from_utf8_lossy(&out.stdout)
+            );
+        }
+        panic!("the plain datagram never reached the TUN; first bytes seen: {seen_bytes:?}");
+    }
 
     // Diagnostics for the escape assertions outside: how much of the
     // probe traffic also landed in the TUN, and what the constrained
