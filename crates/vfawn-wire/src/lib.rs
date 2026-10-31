@@ -19,6 +19,7 @@
 //! (the internet checksum).
 
 pub mod checksum;
+pub mod emit;
 pub mod error;
 pub mod flow;
 pub mod icmpv4;
@@ -28,6 +29,7 @@ pub mod protocol;
 pub mod tcp;
 pub mod udp;
 
+pub use emit::{icmpv4_unreachable_v4, tcp_rst_teardown_v4, tcp_rst_v4};
 pub use error::ParseError;
 pub use flow::{FlowKey, FragmentKey, flow_key, fragment_info};
 pub use icmpv4::Icmpv4Header;

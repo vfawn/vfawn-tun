@@ -157,20 +157,26 @@ pub struct TcpSession {
     flow: FlowInfo,
     transport: Box<dyn TcpTransport>,
     tracker: Option<Arc<dyn FlowTrackerHook>>,
+    close_reported: bool,
 }
 
 impl TcpSession {
     /// Assemble a session from its parts. Called by the backend that
-    /// terminated the flow.
+    /// terminated the flow, which by contract only happens once the
+    /// handshake is complete; the tracker hears `established` here.
     pub fn new(
         flow: FlowInfo,
         transport: Box<dyn TcpTransport>,
         tracker: Option<Arc<dyn FlowTrackerHook>>,
     ) -> Self {
+        if let Some(ref t) = tracker {
+            t.established();
+        }
         Self {
             flow,
             transport,
             tracker,
+            close_reported: false,
         }
     }
 
@@ -184,14 +190,28 @@ impl TcpSession {
         self.tracker.as_ref()
     }
 
-    /// See [`TcpTransport::read`].
+    /// See [`TcpTransport::read`]. Bytes read count toward the reverse
+    /// direction of the flow.
     pub async fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        self.transport.read(buf).await
+        let n = self.transport.read(buf).await?;
+        if n > 0
+            && let Some(ref t) = self.tracker
+        {
+            t.count_reverse(n as u64);
+        }
+        Ok(n)
     }
 
-    /// See [`TcpTransport::write`].
+    /// See [`TcpTransport::write`]. Bytes accepted count toward the
+    /// forward direction of the flow.
     pub async fn write(&mut self, data: &[u8]) -> io::Result<usize> {
-        self.transport.write(data).await
+        let n = self.transport.write(data).await?;
+        if n > 0
+            && let Some(ref t) = self.tracker
+        {
+            t.count_forward(n as u64);
+        }
+        Ok(n)
     }
 
     /// See [`TcpTransport::shutdown_write`].
@@ -203,6 +223,23 @@ impl TcpSession {
     pub async fn abort(&mut self) -> io::Result<()> {
         self.transport.abort().await
     }
+
+    /// Report the flow closed for `reason`, exactly once. A session
+    /// dropped without this reports `CloseReason::Finished`.
+    pub fn close(&mut self, reason: CloseReason) {
+        if !self.close_reported {
+            self.close_reported = true;
+            if let Some(ref t) = self.tracker {
+                t.closed(reason);
+            }
+        }
+    }
+}
+
+impl Drop for TcpSession {
+    fn drop(&mut self) {
+        self.close(CloseReason::Finished);
+    }
 }
 
 /// A terminated UDP flow handed to the host.
@@ -210,20 +247,26 @@ pub struct UdpSession {
     flow: FlowInfo,
     transport: Box<dyn UdpTransport>,
     tracker: Option<Arc<dyn FlowTrackerHook>>,
+    close_reported: bool,
 }
 
 impl UdpSession {
     /// Assemble a session from its parts. Called by the backend that
-    /// terminated the flow.
+    /// terminated the flow, which happens with the first datagram of the
+    /// flow in hand; the tracker hears `established` here.
     pub fn new(
         flow: FlowInfo,
         transport: Box<dyn UdpTransport>,
         tracker: Option<Arc<dyn FlowTrackerHook>>,
     ) -> Self {
+        if let Some(ref t) = tracker {
+            t.established();
+        }
         Self {
             flow,
             transport,
             tracker,
+            close_reported: false,
         }
     }
 
@@ -237,14 +280,45 @@ impl UdpSession {
         self.tracker.as_ref()
     }
 
-    /// See [`UdpTransport::recv`].
+    /// See [`UdpTransport::recv`]. The datagram length counts toward
+    /// the reverse direction of the flow.
     pub async fn recv(&mut self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
-        self.transport.recv(buf).await
+        let (n, from) = self.transport.recv(buf).await?;
+        if n > 0
+            && let Some(ref t) = self.tracker
+        {
+            t.count_reverse(n as u64);
+        }
+        Ok((n, from))
     }
 
-    /// See [`UdpTransport::send`].
+    /// See [`UdpTransport::send`]. Bytes sent count toward the forward
+    /// direction of the flow.
     pub async fn send(&mut self, data: &[u8], to: &SocketAddr) -> io::Result<()> {
-        self.transport.send(data, to).await
+        self.transport.send(data, to).await?;
+        if !data.is_empty()
+            && let Some(ref t) = self.tracker
+        {
+            t.count_forward(data.len() as u64);
+        }
+        Ok(())
+    }
+
+    /// Report the flow closed for `reason`, exactly once. A session
+    /// dropped without this reports `CloseReason::Finished`.
+    pub fn close(&mut self, reason: CloseReason) {
+        if !self.close_reported {
+            self.close_reported = true;
+            if let Some(ref t) = self.tracker {
+                t.closed(reason);
+            }
+        }
+    }
+}
+
+impl Drop for UdpSession {
+    fn drop(&mut self) {
+        self.close(CloseReason::Finished);
     }
 }
 

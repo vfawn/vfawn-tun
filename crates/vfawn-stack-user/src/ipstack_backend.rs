@@ -28,7 +28,7 @@ use ipstack::{IpStack, IpStackConfig, IpStackStream, IpStackTcpStream, IpStackUd
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use vfawn_core::{
     FlowInfo, FlowTrackerHook, IcmpPacket, Network, PacketDevice, SessionHandler, StackBackend,
-    StackHandle, TcpSession, TcpTransport, UdpSession, UdpTransport,
+    StackHandle, TcpSession, TcpTransport, UdpSession, UdpTransport, Verdict,
 };
 
 use crate::ipstack_bridge;
@@ -81,7 +81,11 @@ impl StackBackend for IpstackBackend {
                 // bug) must not take the process down; the stop flag still
                 // works from outside, so shutdown remains reachable.
                 let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    let rt = tokio::runtime::Builder::new_current_thread()
+                    // Multi-thread, not current-thread: ipstack stream
+                    // teardown calls `block_in_place` on drop, which the
+                    // current-thread flavor rejects outright.
+                    let rt = tokio::runtime::Builder::new_multi_thread()
+                        .worker_threads(2)
                         .enable_all()
                         .build()
                         .expect("ipstack runtime");
@@ -114,6 +118,20 @@ impl StackBackend for IpstackBackend {
     }
 }
 
+/// Run the host's synchronous verdict callback with panic containment:
+/// a panicking host loses this one flow, not the data plane.
+///
+/// The callback runs inline on the stream's dispatch path, so its runtime
+/// is also a backpressure signal: a callback that stalls delays exactly
+/// its own flow, which the contract makes a host-visible property.
+fn judged(handler: &Arc<dyn SessionHandler>, flow: &FlowInfo) -> Option<Verdict> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        handler.judge_flow(flow, &[])
+    }))
+    .map_err(|_| eprintln!("judge_flow panicked for {flow:?}; flow dropped"))
+    .ok()
+}
+
 /// Route one accepted stream to the appropriate handler callback.
 async fn dispatch(stream: IpStackStream, handler: &Arc<dyn SessionHandler>) {
     match stream {
@@ -127,7 +145,9 @@ async fn dispatch(stream: IpStackStream, handler: &Arc<dyn SessionHandler>) {
             };
             // A SYN carries no payload; the handler sees an empty first
             // packet, which matches the contract.
-            let verdict = handler.judge_flow(&flow, &[]);
+            let Some(verdict) = judged(handler, &flow) else {
+                return;
+            };
             let action = vfawn_core::verdict::execute(verdict, &flow);
             match action {
                 vfawn_core::VerdictAction::CreateSession { tracker, .. } => {
@@ -160,7 +180,9 @@ async fn dispatch(stream: IpStackStream, handler: &Arc<dyn SessionHandler>) {
                 source: local,
                 destination: peer,
             };
-            let verdict = handler.judge_flow(&flow, &[]);
+            let Some(verdict) = judged(handler, &flow) else {
+                return;
+            };
             let action = vfawn_core::verdict::execute(verdict, &flow);
             match action {
                 vfawn_core::VerdictAction::CreateSession { tracker, .. } => {
