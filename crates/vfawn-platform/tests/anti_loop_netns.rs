@@ -97,6 +97,14 @@ fn policy_capture_loops_and_bound_sockets_escape() {
         "ip", "tuntap", "add", "dev", "tun0", "mode", "tun",
     ]));
     run(in_ns(&["ip", "link", "set", "dev", "tun0", "up"]));
+    run(in_ns(&[
+        "ip",
+        "addr",
+        "add",
+        "198.18.0.1/32",
+        "dev",
+        "tun0",
+    ]));
     // Main-table default through the first veth; the capture rule sits
     // above it and pulls everything into the TUN.
     run(in_ns(&[
@@ -126,11 +134,10 @@ fn policy_capture_loops_and_bound_sockets_escape() {
         "control must route into the TUN, got: {text}"
     );
 
-    // Three captures: the TUN inside the namespace, both veth peers
-    // outside it. Counts are read from the pcaps at the end.
-    let tun0_capture = spawn_capture(Some(NS), "tun0");
-    let v0_capture = spawn_capture(None, "v0b");
-    let v1_capture = spawn_capture(None, "v1b");
+    // Both veth peers get a capture outside the namespace; the TUN side
+    // needs none, the body reads the loop straight off the device fd.
+    let v0_capture = spawn_capture("v0b");
+    let v1_capture = spawn_capture("v1b");
     std::thread::sleep(std::time::Duration::from_secs(1));
 
     // Re-run this very test inside the namespace.
@@ -153,32 +160,34 @@ fn policy_capture_loops_and_bound_sockets_escape() {
         "namespace body failed (see stderr above)"
     );
 
-    stop_capture(tun0_capture);
     stop_capture(v0_capture);
     stop_capture(v1_capture);
 
-    let on_tun = captured_packets("/tmp/vfawn023-tun0.pcap");
     let on_v0 = captured_packets("/tmp/vfawn023-v0.pcap");
     let on_v1 = captured_packets("/tmp/vfawn023-v1.pcap");
 
     run(ip(&["netns", "del", NS]));
-    let _ = std::fs::remove_file("/tmp/vfawn023-tun0.pcap");
     let _ = std::fs::remove_file("/tmp/vfawn023-v0.pcap");
     let _ = std::fs::remove_file("/tmp/vfawn023-v1.pcap");
 
     assert!(
-        on_tun >= 1,
-        "the unbound socket's datagram looped into the TUN"
+        on_v0 >= 1,
+        "the protected socket escaped through v0 (tcpdump said: {})",
+        capture_stderr("v0b")
     );
-    assert!(on_v0 >= 1, "the protected socket escaped through v0");
     assert!(
         on_v1 >= 1,
-        "after the flip, a fresh socket escaped through v1"
+        "after the flip, a fresh socket escaped through v1 (tcpdump said: {})",
+        capture_stderr("v1b")
     );
 }
 
 /// What runs inside the namespace: real sockets, real `protect` calls.
 fn body() {
+    // Attach the TUN before anything sends: a tun with no reader drops
+    // packets on the floor, and the loop must be observed, not assumed.
+    let tun = attach_tun("tun0");
+
     // 1. The loop: an ordinary socket, captured by the rule.
     let plain = UdpSocket::bind("0.0.0.0:0").expect("plain socket");
     plain
@@ -226,6 +235,62 @@ fn body() {
     fresh
         .send_to(b"flipped", DST)
         .expect("send escapes via v1a");
+
+    // The plain send from step 1 is waiting in the TUN queue: the
+    // datagram the rule captured back, read off the device itself.
+    let looped = read_packet(&tun, 3000).expect("a packet queued on the TUN");
+    assert_eq!(looped[0] >> 4, 4, "IPv4");
+    assert_eq!(looped[9], 17, "UDP");
+    assert_eq!(&looped[12..16], &[203, 0, 113, 10], "captured destination");
+}
+
+/// Attach to an existing TUN device and return the fd holding it open.
+fn attach_tun(name: &str) -> std::fs::File {
+    use std::os::fd::AsRawFd;
+    let tun = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/net/tun")
+        .expect("open /dev/net/tun");
+    #[repr(C)]
+    struct Ifreq {
+        name: [u8; 16],
+        flags: std::os::raw::c_short,
+    }
+    let mut request = Ifreq {
+        name: [0; 16],
+        flags: 0x0001, // IFF_TUN
+    };
+    request.name[..name.len()].copy_from_slice(name.as_bytes());
+    // Safety: a fixed-layout struct passed to one ioctl by pointer.
+    #[allow(unsafe_code)]
+    let rc = unsafe { libc::ioctl(tun.as_raw_fd(), 0x400454ca, &mut request) };
+    assert_eq!(rc, 0, "TUNSETIFF on {name}");
+    tun
+}
+
+/// Read one packet off a TUN fd, waiting up to `timeout_ms`.
+fn read_packet(tun: &std::fs::File, timeout_ms: i32) -> Option<Vec<u8>> {
+    use std::os::fd::AsRawFd;
+    let mut poller = libc::pollfd {
+        fd: tun.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // Safety: a fixed-layout struct passed to poll by pointer.
+    #[allow(unsafe_code)]
+    let ready = unsafe { libc::poll(&mut poller, 1, timeout_ms) };
+    if ready != 1 {
+        return None;
+    }
+    let mut packet = [0u8; 2048];
+    // Safety: a fixed-size buffer with its length passed alongside.
+    #[allow(unsafe_code)]
+    let n = unsafe { libc::read(tun.as_raw_fd(), packet.as_mut_ptr().cast(), packet.len()) };
+    if n <= 0 {
+        return None;
+    }
+    Some(packet[..n as usize].to_vec())
 }
 
 fn bound_device(fd: std::os::fd::RawFd) -> String {
@@ -247,20 +312,23 @@ fn bound_device(fd: std::os::fd::RawFd) -> String {
     String::from_utf8_lossy(&name[..n]).into_owned()
 }
 
-fn spawn_capture(namespace: Option<&str>, device: &str) -> Child {
+fn spawn_capture(device: &str) -> Child {
     let file = format!("/tmp/vfawn023-{device}.pcap");
+    let err = format!("/tmp/vfawn023-{device}.err");
     let _ = std::fs::remove_file(&file);
-    let mut cmd = if namespace.is_some() {
-        in_ns(&[
-            "tcpdump", "-i", device, "-nn", "-w", &file, "-c", "8", "udp",
-        ])
-    } else {
-        let mut c = Command::new("tcpdump");
-        c.args(["-i", device, "-nn", "-U", "-w", &file, "-c", "8", "udp"]);
-        c
-    };
-    cmd.stdout(Stdio::null()).stderr(Stdio::null());
+    let _ = std::fs::remove_file(&err);
+    // Packet-buffered writes so a hard stop still leaves the capture
+    // readable; stderr lands in a file for failure diagnostics.
+    let mut cmd = Command::new("tcpdump");
+    cmd.args(["-i", device, "-nn", "-U", "-w", &file, "-c", "8", "udp"]);
+    cmd.stdout(Stdio::null())
+        .stderr(std::fs::File::create(&err).expect("stderr sink"));
     cmd.spawn().expect("spawn tcpdump")
+}
+
+fn capture_stderr(device: &str) -> String {
+    std::fs::read_to_string(format!("/tmp/vfawn023-{device}.err"))
+        .unwrap_or_else(|_| "(no diagnostics)".into())
 }
 
 fn stop_capture(mut child: Child) {
