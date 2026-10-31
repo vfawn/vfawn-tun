@@ -18,3 +18,7 @@ async-trait = "0.1"
 [features]
 default = ["backend-ipstack"]
 backend-ipstack = ["dep:vfawn-stack-user", "vfawn-stack-user/backend-ipstack"]
+
+[dev-dependencies]
+vfawn-testsuite = { path = "../vfawn-testsuite" }
+bytes.workspace = true

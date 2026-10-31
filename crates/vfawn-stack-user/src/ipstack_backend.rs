@@ -77,22 +77,37 @@ impl StackBackend for IpstackBackend {
         std::thread::Builder::new()
             .name("ipstack-runtime".into())
             .spawn(move || {
-                let rt = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .expect("ipstack runtime");
-                rt.block_on(async move {
-                    let mut stack = IpStack::new(config, io);
-                    loop {
-                        if stop.is_stopped() {
-                            break;
+                // A panic in the runtime (a misbehaving handler, a stack
+                // bug) must not take the process down; the stop flag still
+                // works from outside, so shutdown remains reachable.
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let rt = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .expect("ipstack runtime");
+                    rt.block_on(async move {
+                        let mut stack = IpStack::new(config, io);
+                        loop {
+                            if stop.is_stopped() {
+                                break;
+                            }
+                            match stack.accept().await {
+                                Ok(stream) => dispatch(stream, &handler).await,
+                                Err(_) => break,
+                            }
                         }
-                        match stack.accept().await {
-                            Ok(stream) => dispatch(stream, &handler).await,
-                            Err(_) => break,
-                        }
-                    }
-                });
+                    });
+                }));
+                if let Err(panic) = outcome {
+                    eprintln!(
+                        "ipstack runtime contained a panic: {}",
+                        panic
+                            .downcast_ref::<&str>()
+                            .copied()
+                            .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
+                            .unwrap_or("unknown")
+                    );
+                }
             })?;
 
         Ok(handle)

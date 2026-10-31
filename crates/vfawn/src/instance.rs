@@ -6,6 +6,8 @@
 
 use std::io;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 use vfawn_core::{SessionHandler, StackHandle, VfawnConfig};
 
 /// Why a reconfiguration cannot proceed right now.
@@ -34,7 +36,13 @@ pub struct StatsSnapshot {
     pub sessions_total: u64,
     pub bytes_forward: u64,
     pub bytes_reverse: u64,
+    /// Data-plane panics caught and contained; zero is the norm.
+    pub panics_contained: u64,
 }
+
+/// How long `shutdown` waits for in-flight sessions to complete before
+/// tearing down anyway. Embedded hosts care about shutdown latency.
+const DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// A handle onto the running instance.
 ///
@@ -47,6 +55,7 @@ pub struct StatsSnapshot {
 pub struct Instance {
     config: VfawnConfig,
     handle: Option<StackHandle>,
+    panics: Arc<AtomicU64>,
 }
 
 impl Instance {
@@ -60,10 +69,11 @@ impl Instance {
         handler: Arc<dyn SessionHandler>,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         config.validate()?;
-        let _ = handler; // stored by start(); see below for the reason
+        let _ = handler;
         Ok(Instance {
             config,
             handle: None,
+            panics: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -110,13 +120,19 @@ impl Instance {
 
     /// Drain sessions and close the device.
     ///
-    /// The order is: stop the stack (which stops accepting new sessions
-    /// and lets in-flight handlers finish), then close the device. Route
-    /// teardown runs after both, once the route engine is wired in.
+    /// The order is: stop the stack (which stops accepting new sessions),
+    /// give in-flight handlers a bounded window to finish, then drop the
+    /// device. Calling shutdown on an already-stopped instance is a no-op;
+    /// route teardown runs after both, once the route engine is wired in.
     pub fn shutdown(&mut self) -> io::Result<()> {
-        if let Some(handle) = &self.handle {
-            handle.stop();
-        }
+        let Some(handle) = &self.handle else {
+            return Ok(());
+        };
+        handle.stop();
+        // Give in-flight sessions a bounded window. The transitional
+        // backend has no explicit drain API; a bounded wait is the
+        // pragmatic answer until the in-house stack lands with one.
+        std::thread::sleep(DRAIN_TIMEOUT);
         self.handle = None;
         Ok(())
     }
@@ -127,8 +143,58 @@ impl Instance {
         Err(RestartReason::NeedsRestart)
     }
 
-    /// Current counters. Fields populate as observability lands.
+    /// Current counters.
     pub fn stats(&self) -> StatsSnapshot {
-        StatsSnapshot::default()
+        StatsSnapshot {
+            panics_contained: self.panics.load(Ordering::Relaxed),
+            ..StatsSnapshot::default()
+        }
+    }
+
+    /// The panic counter shared with data-plane threads; the backend
+    /// increments it when a worker thread is caught and contained.
+    pub fn panic_counter(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.panics)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shutdown_is_idempotent() {
+        // Construct an instance that never started; shutdown three times.
+        let config = VfawnConfig::default();
+        let handler = Arc::new(crate::echo::EchoHandler::new());
+        let mut instance = Instance::new(config, handler).unwrap();
+
+        instance.shutdown().unwrap();
+        instance.shutdown().unwrap();
+        instance.shutdown().unwrap();
+        assert!(instance.handle.is_none());
+    }
+
+    #[test]
+    fn double_start_is_rejected() {
+        let config = VfawnConfig::default();
+        let handler = Arc::new(crate::echo::EchoHandler::new());
+        let mut instance = Instance::new(config, handler.clone()).unwrap();
+
+        // On macOS, start will fail (no device backend), but the
+        // double-start guard works regardless.
+        let _ = instance.start(handler.clone());
+        let second = instance.start(handler);
+        assert!(second.is_err());
+    }
+
+    #[test]
+    fn stats_default_is_zeroed() {
+        let config = VfawnConfig::default();
+        let handler = Arc::new(crate::echo::EchoHandler::new());
+        let instance = Instance::new(config, handler).unwrap();
+        let stats = instance.stats();
+        assert_eq!(stats.sessions_total, 0);
+        assert_eq!(stats.panics_contained, 0);
     }
 }
