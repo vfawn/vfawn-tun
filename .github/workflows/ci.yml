@@ -27,7 +27,7 @@ jobs:
       # Needed by the rule-backend contract tests.
       - name: Install nftables
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y nftables
+        run: sudo apt-get update && sudo apt-get install -y nftables iproute2
 
       - name: fmt
         run: cargo fmt --all --check
