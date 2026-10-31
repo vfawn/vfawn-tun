@@ -71,13 +71,11 @@ fn observe_all(device: &mut PcapDevice) -> Vec<Observed> {
                         tcp = (h.flags.bits(), h.seq, h.ack);
                     }
                 }
-                IpProtocol::Udp => {
-                    if payload.len() >= 4 {
-                        ports = (
-                            u16::from_be_bytes([payload[0], payload[1]]),
-                            u16::from_be_bytes([payload[2], payload[3]]),
-                        );
-                    }
+                IpProtocol::Udp if payload.len() >= 4 => {
+                    ports = (
+                        u16::from_be_bytes([payload[0], payload[1]]),
+                        u16::from_be_bytes([payload[2], payload[3]]),
+                    );
                 }
                 _ => {}
             }
