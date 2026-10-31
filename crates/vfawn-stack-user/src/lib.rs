@@ -8,8 +8,9 @@
 //! compiled in:
 //!
 //! * `backend-ipstack`: drives the ipstack crate as the termination engine;
-//! * `backend-native`: the in-tree stack derived from smoltcp's TCP core,
-//!   reshaped around an accept queue and batched device I/O.
+//! * `backend-native`: the in-house TCP implementation, written from the
+//!   RFCs on the shard model: an accept queue with cookies, batched device
+//!   I/O as the native unit, and congestion control as a pluggable module.
 //!
 //! Neither backend talks to the routing engine; stacks terminate flows, the
 //! route engine owns the kernel state around them.
