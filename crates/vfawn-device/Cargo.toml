@@ -10,3 +10,7 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+vfawn-core = { path = "../vfawn-core" }
+bytes.workspace = true
+ipnet.workspace = true
+tun-rs.workspace = true

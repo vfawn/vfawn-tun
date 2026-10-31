@@ -38,6 +38,12 @@ jobs:
       - name: test
         run: cargo test --workspace
 
+      # Device round-trip tests need root to create a TUN interface; they
+      # are #[ignore]d so plain `cargo test` skips them everywhere else.
+      - name: device tests (root)
+        if: runner.os == 'Linux'
+        run: sudo -E env "PATH=$PATH" cargo test -p vfawn-device -- --ignored --nocapture
+
       - name: license gate
         uses: taiki-e/install-action@v2
         with:
