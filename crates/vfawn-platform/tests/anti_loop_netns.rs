@@ -142,10 +142,26 @@ fn policy_capture_loops_and_bound_sockets_escape() {
         "control must route into the TUN, got: {text}"
     );
 
-    // Both veth peers get a capture outside the namespace; the TUN side
-    // needs none, the body reads the loop straight off the device fd.
-    let v0_capture = spawn_capture("v0b");
+    // Captures on both ends of the first veth and on the second peer;
+    // the TUN side needs none, the body reads the loop off the fd.
+    let v0_out = spawn_capture("v0b");
     let v1_capture = spawn_capture("v1b");
+    let v0_in = in_ns(&[
+        "tcpdump",
+        "-i",
+        "v0a",
+        "-nn",
+        "-U",
+        "-w",
+        "/tmp/vfawn023-v0a.pcap",
+        "-c",
+        "24",
+        "udp or arp",
+    ])
+    .stdout(Stdio::null())
+    .stderr(std::fs::File::create("/tmp/vfawn023-v0a.err").expect("stderr sink"))
+    .spawn()
+    .expect("spawn inside capture");
     std::thread::sleep(std::time::Duration::from_secs(1));
 
     // Re-run this very test inside the namespace.
@@ -168,19 +184,26 @@ fn policy_capture_loops_and_bound_sockets_escape() {
         "namespace body failed (see stderr above)"
     );
 
-    stop_capture(v0_capture);
+    stop_capture(v0_out);
     stop_capture(v1_capture);
+    stop_capture(v0_in);
 
     let on_v0 = captured_packets("/tmp/vfawn023-v0.pcap");
     let on_v1 = captured_packets("/tmp/vfawn023-v1.pcap");
+    let inside_v0 = captured_packets("/tmp/vfawn023-v0a.pcap");
 
     run(ip(&["netns", "del", NS]));
     let _ = std::fs::remove_file("/tmp/vfawn023-v0.pcap");
+    let _ = std::fs::remove_file("/tmp/vfawn023-v0a.pcap");
     let _ = std::fs::remove_file("/tmp/vfawn023-v1.pcap");
 
     assert!(
         on_v0 >= 1,
-        "the protected socket escaped through v0 (tcpdump said: {})",
+        "the protected socket escaped through v0: {} marker packets left v0a inside, \
+         {} arrived at v0b; inside tcpdump said: {}; outside said: {}",
+        inside_v0,
+        on_v0,
+        capture_stderr("v0a"),
         capture_stderr("v0b")
     );
     assert!(
