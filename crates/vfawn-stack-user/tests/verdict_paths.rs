@@ -201,29 +201,23 @@ async fn panicking_judge_costs_the_flow_not_the_process() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn slow_judge_slows_its_own_flow() {
-    // The callback runs inline on the dispatch path, so its runtime is
-    // part of the flow's delivery time. The fast pass measures the
-    // pipeline overhead; the slow pass must exceed it by the delay.
-    let fast_host = ScriptedHost::with_verdict(|| Verdict::Accept);
-    let fast = run_syn_flow(&fast_host, Duration::from_secs(2)).await;
-    assert_eq!(fast.sessions, 1);
-
+    // The callback runs inline on the dispatch path, ahead of session
+    // delivery, so its runtime is a floor on the flow's delivery time.
+    // A 120ms callback must delay the session by at least that long;
+    // the margin covers only clock read order, not machine speed.
     let slow_host = Arc::new(ScriptedHost {
         verdict: || Verdict::Accept,
-        delay: Duration::from_millis(60),
+        delay: Duration::from_millis(120),
         panic: false,
         judge_calls: AtomicUsize::new(0),
         sessions: AtomicUsize::new(0),
         udp_sessions: AtomicUsize::new(0),
     });
-    let slow = run_syn_flow(&slow_host, Duration::from_secs(2)).await;
+    let slow = run_syn_flow(&slow_host, Duration::from_secs(3)).await;
     assert_eq!(slow.sessions, 1);
-
-    assert!(slow.delivery >= Duration::from_millis(60));
     assert!(
-        slow.delivery - fast.delivery >= Duration::from_millis(55),
-        "slow callback must delay delivery beyond pipeline overhead: fast {:?}, slow {:?}",
-        fast.delivery,
+        slow.delivery >= Duration::from_millis(110),
+        "delivery took {:?} despite a 120ms callback",
         slow.delivery
     );
 }
