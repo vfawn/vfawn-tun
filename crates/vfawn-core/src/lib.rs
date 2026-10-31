@@ -19,6 +19,7 @@ pub mod device;
 pub mod monitor;
 pub mod session;
 pub mod stack;
+pub mod verdict;
 
 pub use config::{
     ConfigError, CongestionAlgo, DeviceConfig, DnsConfig, DnsMode, OffloadPolicy, OutboundFdHook,
@@ -32,3 +33,4 @@ pub use session::{
     TcpSession, TcpTransport, UdpSession, UdpTransport, Verdict,
 };
 pub use stack::{StackBackend, StackHandle};
+pub use verdict::{CountingTracker, VerdictAction, execute};

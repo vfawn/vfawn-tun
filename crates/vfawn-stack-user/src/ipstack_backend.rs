@@ -27,8 +27,8 @@ use async_trait::async_trait;
 use ipstack::{IpStack, IpStackConfig, IpStackStream, IpStackTcpStream, IpStackUdpStream};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use vfawn_core::{
-    FlowInfo, IcmpPacket, Network, PacketDevice, SessionHandler, StackBackend, StackHandle,
-    TcpSession, TcpTransport, UdpSession, UdpTransport,
+    FlowInfo, FlowTrackerHook, IcmpPacket, Network, PacketDevice, SessionHandler, StackBackend,
+    StackHandle, TcpSession, TcpTransport, UdpSession, UdpTransport,
 };
 
 use crate::ipstack_bridge;
@@ -128,17 +128,27 @@ async fn dispatch(stream: IpStackStream, handler: &Arc<dyn SessionHandler>) {
             // A SYN carries no payload; the handler sees an empty first
             // packet, which matches the contract.
             let verdict = handler.judge_flow(&flow, &[]);
-            match verdict {
-                vfawn_core::Verdict::Accept | vfawn_core::Verdict::Bypass => {
+            let action = vfawn_core::verdict::execute(verdict, &flow);
+            match action {
+                vfawn_core::VerdictAction::CreateSession { tracker, .. } => {
                     let transport = Box::new(TcpIo { stream: tcp });
-                    let session = TcpSession::new(flow, transport, None);
+                    let tracker = tracker.map(|t| t as Arc<dyn FlowTrackerHook>);
+                    let session = TcpSession::new(flow, transport, tracker);
                     handler.on_tcp(session).await;
                 }
-                _ => {
-                    // Reject and Drop both fall through: the stream is
-                    // dropped, which closes the connection from ipstack's
-                    // side. Fine-grained wire responses arrive with the
+                vfawn_core::VerdictAction::Drop => {
+                    // Silently discard: dropping the stream closes the
+                    // connection without a wire response.
+                }
+                vfawn_core::VerdictAction::Reset => {
+                    // Reject: dropping the stream causes ipstack to send
+                    // its own close; a crafted RST arrives with the
                     // in-house stack.
+                }
+                vfawn_core::VerdictAction::RedirectTo(_) => {
+                    // Destination rewriting is not possible inside the
+                    // transitional ipstack backend; the in-house stack
+                    // will handle it.
                 }
             }
         }
@@ -151,13 +161,18 @@ async fn dispatch(stream: IpStackStream, handler: &Arc<dyn SessionHandler>) {
                 destination: peer,
             };
             let verdict = handler.judge_flow(&flow, &[]);
-            match verdict {
-                vfawn_core::Verdict::Accept | vfawn_core::Verdict::Bypass => {
+            let action = vfawn_core::verdict::execute(verdict, &flow);
+            match action {
+                vfawn_core::VerdictAction::CreateSession { tracker, .. } => {
                     let transport = Box::new(UdpIo { stream: udp });
-                    let session = UdpSession::new(flow, transport, None);
+                    let tracker = tracker.map(|t| t as Arc<dyn FlowTrackerHook>);
+                    let session = UdpSession::new(flow, transport, tracker);
                     handler.on_udp(session).await;
                 }
-                _ => {}
+                _ => {
+                    // Drop, Reset, and Redirect all discard the stream in
+                    // the transitional backend.
+                }
             }
         }
         IpStackStream::UnknownTransport(unknown) => {
