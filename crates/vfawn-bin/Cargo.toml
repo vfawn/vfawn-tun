@@ -10,3 +10,11 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+vfawn = { path = "../vfawn" }
+vfawn-core = { path = "../vfawn-core" }
+async-trait = "0.1"
+tokio = { workspace = true, features = ["rt", "signal", "macros"] }
+ipnet.workspace = true
+
+[dev-dependencies]
+vfawn-testsuite = { path = "../vfawn-testsuite" }

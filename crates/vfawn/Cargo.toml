@@ -10,3 +10,11 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+vfawn-core = { path = "../vfawn-core" }
+vfawn-device = { path = "../vfawn-device" }
+vfawn-stack-user = { path = "../vfawn-stack-user", optional = true }
+async-trait = "0.1"
+
+[features]
+default = ["backend-ipstack"]
+backend-ipstack = ["dep:vfawn-stack-user", "vfawn-stack-user/backend-ipstack"]
