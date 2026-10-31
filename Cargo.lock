@@ -1314,6 +1314,7 @@ dependencies = [
  "rtnetlink",
  "serde",
  "tokio",
+ "vfawn-core",
  "vfawn-route",
 ]
 

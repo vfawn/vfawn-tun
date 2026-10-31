@@ -13,6 +13,7 @@ ipnet.workspace = true
 serde.workspace = true
 tokio.workspace = true
 futures = "0.3"
+vfawn-core = { path = "../vfawn-core" }
 vfawn-route = { path = "../vfawn-route" }
 
 [lints]
