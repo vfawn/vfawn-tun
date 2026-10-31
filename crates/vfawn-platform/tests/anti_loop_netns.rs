@@ -259,7 +259,8 @@ fn attach_tun(name: &str) -> std::fs::File {
     }
     let mut request = Ifreq {
         name: [0; 16],
-        flags: 0x0001, // IFF_TUN
+        // IFF_TUN | IFF_NO_PI: raw IP at offset zero, no info header.
+        flags: 0x1001,
     };
     request.name[..name.len()].copy_from_slice(name.as_bytes());
     // Safety: a fixed-layout struct passed to one ioctl by pointer.
