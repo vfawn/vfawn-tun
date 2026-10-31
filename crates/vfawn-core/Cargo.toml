@@ -11,6 +11,7 @@ workspace = true
 
 [dependencies]
 bytes.workspace = true
+socket2 = { workspace = true, features = ["all"] }
 ipnet.workspace = true
 serde.workspace = true
 async-trait.workspace = true

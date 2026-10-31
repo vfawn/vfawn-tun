@@ -16,7 +16,8 @@ futures = "0.3"
 vfawn-core = { path = "../vfawn-core" }
 vfawn-route = { path = "../vfawn-route" }
 
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+libc = "0.2"
+
 [lints]
 workspace = true
-
-[dependencies]

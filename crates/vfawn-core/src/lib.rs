@@ -17,6 +17,7 @@
 pub mod config;
 pub mod device;
 pub mod monitor;
+pub mod outbound;
 pub mod session;
 pub mod stack;
 pub mod udp_nat;
@@ -29,6 +30,7 @@ pub use config::{
 };
 pub use device::{DeviceCaps, PacketDevice};
 pub use monitor::{MonitorEvent, StackKind};
+pub use outbound::apply;
 pub use session::{
     Action, CloseReason, FlowInfo, FlowTrackerHook, IcmpPacket, Network, SessionHandler,
     TcpSession, TcpTransport, UdpSession, UdpTransport, Verdict,

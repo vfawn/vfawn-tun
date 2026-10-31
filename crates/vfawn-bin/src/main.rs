@@ -19,7 +19,8 @@ fn main() -> ExitCode {
         }
         _ => {
             eprintln!("usage: vfawn-bin <up|bench|cleanup> [options]");
-            eprintln!("  up <address/len> [mtu]   create a TUN and echo sessions");
+            eprintln!("  up <address/len> [mtu] [--bind-default-iface]");
+            eprintln!("                           create a TUN and echo sessions");
             eprintln!("  bench                    packet-processing throughput");
             eprintln!("  cleanup                  remove stale route rules (placeholder)");
             ExitCode::from(2)
@@ -28,24 +29,31 @@ fn main() -> ExitCode {
 }
 
 fn up_command(args: &[String]) -> ExitCode {
-    let address: String = args
+    let bind_default_iface = args.iter().any(|a| a == "--bind-default-iface");
+    let positional: Vec<&String> = args.iter().filter(|a| !a.starts_with("--")).collect();
+    let address: String = positional
         .first()
-        .cloned()
+        .map(|s| s.to_string())
         .unwrap_or_else(|| "198.18.0.1/15".to_string());
-    let mtu: u32 = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(1500);
+    let mtu: u32 = positional
+        .get(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1500);
 
     // Run `up` on a dedicated thread; the main thread handles signals and
     // unparks it when it is time to stop. The address is owned because
     // the spawned closure must outlive the caller's frame.
     let worker = std::thread::Builder::new()
         .name("vfawn-up".into())
-        .spawn(move || match vfawn_bin::up::run(&address, mtu) {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(e) => {
-                eprintln!("up: {e}");
-                ExitCode::FAILURE
-            }
-        })
+        .spawn(
+            move || match vfawn_bin::up::run(&address, mtu, bind_default_iface) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("up: {e}");
+                    ExitCode::FAILURE
+                }
+            },
+        )
         .expect("spawn worker thread");
 
     // Wait for Ctrl-C, then wake the worker so it runs its shutdown chain.
