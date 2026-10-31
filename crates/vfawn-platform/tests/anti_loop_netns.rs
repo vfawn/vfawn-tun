@@ -241,7 +241,7 @@ fn body() {
     let looped = read_packet(&tun, 3000).expect("a packet queued on the TUN");
     assert_eq!(looped[0] >> 4, 4, "IPv4");
     assert_eq!(looped[9], 17, "UDP");
-    assert_eq!(&looped[12..16], &[203, 0, 113, 10], "captured destination");
+    assert_eq!(&looped[16..20], &[203, 0, 113, 10], "captured destination");
 }
 
 /// Attach to an existing TUN device and return the fd holding it open.
