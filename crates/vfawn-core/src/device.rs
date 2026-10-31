@@ -55,4 +55,12 @@ pub trait PacketDevice: Send {
     /// Wake any blocked reader. Idempotent; safe to call from another
     /// thread while a read is in flight.
     fn shutdown(&self) -> io::Result<()>;
+
+    /// Produce a second handle to the same underlying device, so one thread
+    /// can block in [`PacketDevice::read_batch`] while another writes.
+    ///
+    /// The duplicate shares the shutdown signal: stopping either handle
+    /// wakes both. On a real device this is a duplicate of the file
+    /// descriptor; on in-memory devices it is a clone of the queues.
+    fn duplicate(&self) -> io::Result<Box<dyn PacketDevice>>;
 }

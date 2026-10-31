@@ -14,3 +14,11 @@
 //!
 //! Neither backend talks to the routing engine; stacks terminate flows, the
 //! route engine owns the kernel state around them.
+
+#[cfg(feature = "backend-ipstack")]
+pub mod ipstack_backend;
+#[cfg(feature = "backend-ipstack")]
+pub mod ipstack_bridge;
+
+#[cfg(feature = "backend-ipstack")]
+pub use ipstack_backend::IpstackBackend;

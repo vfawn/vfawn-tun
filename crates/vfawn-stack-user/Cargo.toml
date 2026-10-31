@@ -9,10 +9,32 @@ publish.workspace = true
 [lints]
 workspace = true
 
-[dependencies]
-
 [features]
 # Termination engine compiled into this crate. Exactly the same contract
 # either way; dependencies attach when each engine lands.
-backend-ipstack = []
+backend-ipstack = ["dep:ipstack", "dep:tokio", "dep:bytes", "dep:async-trait"]
 backend-native = []
+
+[dependencies]
+vfawn-core = { path = "../vfawn-core" }
+
+[dependencies.ipstack]
+version = "1.0"
+optional = true
+
+[dependencies.tokio]
+workspace = true
+optional = true
+features = ["rt", "sync", "time", "io-util", "macros"]
+
+[dependencies.async-trait]
+workspace = true
+optional = true
+
+[dependencies.bytes]
+workspace = true
+optional = true
+
+[dev-dependencies]
+vfawn-testsuite = { path = "../vfawn-testsuite" }
+bytes.workspace = true

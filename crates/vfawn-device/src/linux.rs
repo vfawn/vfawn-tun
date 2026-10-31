@@ -193,6 +193,19 @@ impl PacketDevice for TunDevice {
         }
         .shutdown()
     }
+
+    fn duplicate(&self) -> io::Result<Box<dyn PacketDevice>> {
+        let cloned = self.device.try_clone()?;
+        Ok(Box::new(TunDevice {
+            device: cloned,
+            event: Arc::clone(&self.event),
+            sizes: vec![0; 8],
+            original: vec![0; self.mtu + 64],
+            mtu: self.mtu,
+            caps: self.caps,
+            stopped: Arc::clone(&self.stopped),
+        }))
+    }
 }
 
 #[cfg(test)]

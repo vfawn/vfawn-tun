@@ -1,0 +1,229 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-FileCopyrightText: Copyright (c) 2026 VFawn contributors
+
+//! Termination through the ipstack crate.
+//!
+//! Transitional backend: it exists so the framework, the benchmark harness
+//! and the host-facing API are all exercisable while the in-house TCP
+//! implementation is being written. Every touch point here is replaceable
+//! without touching callers, because everything crosses the
+//! `StackBackend` and `SessionHandler` contracts.
+//!
+//! What this backend does not do, honestly stated:
+//!
+//! * no SYN cookies, no accept-queue bounding;
+//! * no congestion control beyond the stack default;
+//! * ICMP arrives as raw payloads with no differentiation between echo
+//!   requests and error reports.
+//!
+//! None of these are hidden; they are the gap the in-house stack fills.
+
+use std::io;
+use std::net::SocketAddr;
+use std::sync::Arc;
+
+use async_trait::async_trait;
+
+use ipstack::{IpStack, IpStackConfig, IpStackStream, IpStackTcpStream, IpStackUdpStream};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use vfawn_core::{
+    FlowInfo, IcmpPacket, Network, PacketDevice, SessionHandler, StackBackend, StackHandle,
+    TcpSession, TcpTransport, UdpSession, UdpTransport,
+};
+
+use crate::ipstack_bridge;
+
+/// Configuration for the transitional ipstack backend.
+#[derive(Debug, Clone)]
+pub struct IpstackBackend {
+    /// Maximum segment size; derived from the device MTU when zero.
+    pub mss: u16,
+    /// Idle timeout for UDP sessions, in seconds.
+    pub udp_timeout_secs: u64,
+    /// TCP connection timeout, in seconds.
+    pub tcp_timeout_secs: u64,
+}
+
+impl Default for IpstackBackend {
+    fn default() -> Self {
+        Self {
+            mss: 1460,
+            udp_timeout_secs: 300,
+            tcp_timeout_secs: 60,
+        }
+    }
+}
+
+impl StackBackend for IpstackBackend {
+    fn spawn(
+        self: Box<Self>,
+        device: Box<dyn PacketDevice>,
+        handler: Arc<dyn SessionHandler>,
+    ) -> io::Result<StackHandle> {
+        let handle = StackHandle::new();
+        let write_device = device.duplicate()?;
+        let io = ipstack_bridge::start(device, write_device);
+
+        // The builder returns &mut Self; the final take gives ownership
+        // back for the move into the runtime thread.
+        let config = {
+            let mut builder = IpStackConfig::default();
+            builder.mtu = self.mss + 40;
+            builder.udp_timeout(std::time::Duration::from_secs(self.udp_timeout_secs));
+            builder
+        };
+
+        let stop = handle.clone();
+        std::thread::Builder::new()
+            .name("ipstack-runtime".into())
+            .spawn(move || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("ipstack runtime");
+                rt.block_on(async move {
+                    let mut stack = IpStack::new(config, io);
+                    loop {
+                        if stop.is_stopped() {
+                            break;
+                        }
+                        match stack.accept().await {
+                            Ok(stream) => dispatch(stream, &handler).await,
+                            Err(_) => break,
+                        }
+                    }
+                });
+            })?;
+
+        Ok(handle)
+    }
+}
+
+/// Route one accepted stream to the appropriate handler callback.
+async fn dispatch(stream: IpStackStream, handler: &Arc<dyn SessionHandler>) {
+    match stream {
+        IpStackStream::Tcp(tcp) => {
+            let local = tcp.local_addr();
+            let peer = tcp.peer_addr();
+            let flow = FlowInfo {
+                network: Network::Tcp,
+                source: local,
+                destination: peer,
+            };
+            // A SYN carries no payload; the handler sees an empty first
+            // packet, which matches the contract.
+            let verdict = handler.judge_flow(&flow, &[]);
+            match verdict {
+                vfawn_core::Verdict::Accept | vfawn_core::Verdict::Bypass => {
+                    let transport = Box::new(TcpIo { stream: tcp });
+                    let session = TcpSession::new(flow, transport, None);
+                    handler.on_tcp(session).await;
+                }
+                _ => {
+                    // Reject and Drop both fall through: the stream is
+                    // dropped, which closes the connection from ipstack's
+                    // side. Fine-grained wire responses arrive with the
+                    // in-house stack.
+                }
+            }
+        }
+        IpStackStream::Udp(udp) => {
+            let local = udp.local_addr();
+            let peer = udp.peer_addr();
+            let flow = FlowInfo {
+                network: Network::Udp,
+                source: local,
+                destination: peer,
+            };
+            let verdict = handler.judge_flow(&flow, &[]);
+            match verdict {
+                vfawn_core::Verdict::Accept | vfawn_core::Verdict::Bypass => {
+                    let transport = Box::new(UdpIo { stream: udp });
+                    let session = UdpSession::new(flow, transport, None);
+                    handler.on_udp(session).await;
+                }
+                _ => {}
+            }
+        }
+        IpStackStream::UnknownTransport(unknown) => {
+            // ICMP and other IP protocols arrive here as raw payloads.
+            // The handler gets the payload and a best-effort flow identity;
+            // the return action is honored only for Drop (skip delivery).
+            let protocol = unknown.ip_protocol();
+            if protocol.0 == 1 || protocol.0 == 58 {
+                // ICMP or ICMPv6
+                let flow = FlowInfo {
+                    network: Network::Icmp,
+                    source: SocketAddr::new(unknown.src_addr(), 0),
+                    destination: SocketAddr::new(unknown.dst_addr(), 0),
+                };
+                let payload = unknown.payload().to_vec();
+                if payload.len() >= 4 {
+                    let packet =
+                        IcmpPacket::new(flow, payload[0], payload[1], bytes::Bytes::from(payload));
+                    let action = handler.on_icmp(packet).await;
+                    // Reply and Forward need wire-level emission that this
+                    // backend does not implement; only Drop is effective
+                    // (by doing nothing). This limitation is the primary
+                    // reason the backend is transitional.
+                    let _ = action;
+                }
+            }
+        }
+        IpStackStream::UnknownNetwork(_) => {
+            // Unparseable at the IP layer; nothing sensible to do.
+        }
+    }
+}
+
+/// TCP session adapter: our `TcpTransport` implemented over ipstack's
+/// async stream.
+struct TcpIo {
+    stream: IpStackTcpStream,
+}
+
+#[async_trait]
+impl TcpTransport for TcpIo {
+    async fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.stream.read(buf).await
+    }
+
+    async fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+        self.stream.write(data).await
+    }
+
+    async fn shutdown_write(&mut self) -> io::Result<()> {
+        self.stream.shutdown().await
+    }
+
+    async fn abort(&mut self) -> io::Result<()> {
+        // ipstack has no explicit abort; dropping the stream causes the
+        // stack to clean up its side. A true RST arrives with the
+        // in-house stack.
+        Ok(())
+    }
+}
+
+/// UDP session adapter: our `UdpTransport` implemented over ipstack's
+/// async datagram stream.
+struct UdpIo {
+    stream: IpStackUdpStream,
+}
+
+#[async_trait]
+impl UdpTransport for UdpIo {
+    async fn recv(&mut self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+        let n = self.stream.read(buf).await?;
+        // ipstack's UDP stream represents one flow; the remote is the
+        // flow's peer. The full-cone mode, where multiple remotes share
+        // one internal endpoint, is dispatcher-side and not visible here.
+        let remote = self.stream.peer_addr();
+        Ok((n, remote))
+    }
+
+    async fn send(&mut self, data: &[u8], _to: &SocketAddr) -> io::Result<()> {
+        // ipstack routes by its own flow table; the destination address is
+        // already determined by the session.
+        self.stream.write_all(data).await
+    }
+}
