@@ -3,6 +3,9 @@ name: ci
 on:
   push:
   pull_request:
+  schedule:
+    # Nightly long fuzz, 19:00 UTC.
+    - cron: '0 19 * * *'
 
 env:
   CARGO_TERM_COLOR: always
@@ -71,8 +74,10 @@ jobs:
 
   fuzz:
     # cargo-fuzz requires nightly and its dependency set must not leak into
-    # the product workspace resolution, so it lives in its own job.
-    name: fuzz-smoke
+    # the product workspace resolution, so it lives in its own job. Pushes
+    # get a short pass per target from the committed corpus; the nightly
+    # schedule gets a long one.
+    name: fuzz
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -82,13 +87,18 @@ jobs:
         uses: taiki-e/install-action@v2
         with:
           tool: cargo-fuzz
-      - name: Smoke-run targets
+      - name: Fuzz each target
         run: |
-          if [ -f fuzz/Cargo.toml ]; then
-            for t in fuzz/fuzz_targets/*.rs; do
-              [ -e "$t" ] || continue
-              cargo fuzz run "$(basename "${t%.rs}")" -s none -- -runs=1
-            done
-          else
-            echo "no fuzz crate yet, skipping"
-          fi
+          for t in fuzz/fuzz_targets/*.rs; do
+            [ -e "$t" ] || continue
+            name="$(basename "${t%.rs}")"
+            if [ "$GITHUB_EVENT_NAME" = "schedule" ]; then
+              cargo fuzz run "$name" -s none -- -max_total_time=900
+            else
+              cargo fuzz run "$name" -s none -- -max_total_time=60
+            fi
+          done
+      - name: Report crashes
+        if: failure()
+        run: |
+          ls -la fuzz/artifacts/ 2>/dev/null || true

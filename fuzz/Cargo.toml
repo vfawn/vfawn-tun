@@ -1,0 +1,62 @@
+[package]
+name = "vfawn-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+vfawn-wire = { path = "../crates/vfawn-wire" }
+vfawn-core = { path = "../crates/vfawn-core" }
+serde_json = "1"
+async-trait = "0.1"
+
+[[bin]]
+name = "fuzz_parse_ip"
+path = "fuzz_targets/fuzz_parse_ip.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_parse_tcp"
+path = "fuzz_targets/fuzz_parse_tcp.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_parse_udp"
+path = "fuzz_targets/fuzz_parse_udp.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_parse_ipv6"
+path = "fuzz_targets/fuzz_parse_ipv6.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_config_json"
+path = "fuzz_targets/fuzz_config_json.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_judge_flow"
+path = "fuzz_targets/fuzz_judge_flow.rs"
+test = false
+doc = false
+bench = false
+
+# Standalone crate: the product workspace excludes this directory, and
+# its own empty workspace keeps nightly-only fuzz dependencies out of
+# the product dependency resolution.
+[workspace]
