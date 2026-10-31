@@ -10,7 +10,7 @@ fn main() -> ExitCode {
     match args.get(1).map(String::as_str) {
         Some("up") => up_command(&args[2..]),
         Some("bench") => {
-            vfawn_bin::bench();
+            vfawn_bin::bench::run();
             ExitCode::SUCCESS
         }
         Some("cleanup") => {
@@ -20,7 +20,7 @@ fn main() -> ExitCode {
         _ => {
             eprintln!("usage: vfawn-bin <up|bench|cleanup> [options]");
             eprintln!("  up <address/len> [mtu]   create a TUN and echo sessions");
-            eprintln!("  bench                    run the benchmark harness (placeholder)");
+            eprintln!("  bench                    packet-processing throughput");
             eprintln!("  cleanup                  remove stale route rules (placeholder)");
             ExitCode::from(2)
         }

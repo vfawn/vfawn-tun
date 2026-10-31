@@ -7,12 +7,8 @@
 //! examples can drive them without spawning a process; `main.rs` is a thin
 //! argument parser on top.
 
+pub mod bench;
 pub mod up;
-
-/// Placeholder for the benchmark harness.
-pub fn bench() {
-    println!("bench: not implemented yet; arrives with the first benchmark round");
-}
 
 /// Placeholder for the rule cleanup tool.
 pub fn cleanup() {
