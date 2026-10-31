@@ -256,7 +256,7 @@ fn spawn_capture(namespace: Option<&str>, device: &str) -> Child {
         ])
     } else {
         let mut c = Command::new("tcpdump");
-        c.args(["-i", device, "-nn", "-w", &file, "-c", "8", "udp"]);
+        c.args(["-i", device, "-nn", "-U", "-w", &file, "-c", "8", "udp"]);
         c
     };
     cmd.stdout(Stdio::null()).stderr(Stdio::null());
