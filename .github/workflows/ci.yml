@@ -42,7 +42,7 @@ jobs:
       # are #[ignore]d so plain `cargo test` skips them everywhere else.
       - name: device tests (root)
         if: runner.os == 'Linux'
-        run: sudo -E env "PATH=$PATH" cargo test -p vfawn-device -- --ignored --nocapture
+        run: sudo -E env "PATH=$PATH" cargo test -p vfawn-device -- --ignored --test-threads=1 --nocapture
 
       - name: license gate
         uses: taiki-e/install-action@v2

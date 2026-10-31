@@ -21,14 +21,17 @@
 use bytes::BytesMut;
 use std::process::Command;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use vfawn_core::{DeviceConfig, PacketDevice};
 use vfawn_device::TunDevice;
 
-fn loop_config() -> DeviceConfig {
+/// Each test gets its own /24 so parallel kernel traffic for one device
+/// never lands in another: the on-link route of the newest interface would
+/// otherwise capture a sibling test's probes.
+fn subnet_config(index: u8) -> DeviceConfig {
     DeviceConfig {
         mtu: 1500,
-        inet4_address: vec!["198.18.0.1/15".parse().unwrap()],
+        inet4_address: vec![format!("198.18.{index}.1/24").parse().unwrap()],
         ..DeviceConfig::default()
     }
 }
@@ -36,7 +39,7 @@ fn loop_config() -> DeviceConfig {
 #[test]
 #[ignore]
 fn reads_kernel_traffic_writes_back_and_stops_cleanly() {
-    let mut device = TunDevice::create(&loop_config()).expect("create device");
+    let mut device = TunDevice::create(&subnet_config(0)).expect("create device");
     let caps = device.capabilities();
     assert_eq!(caps.queues, 1);
     assert!(!caps.gro && !caps.gso);
@@ -47,23 +50,25 @@ fn reads_kernel_traffic_writes_back_and_stops_cleanly() {
             .output()
     });
 
+    // Count only echo probes; a shared runner emits unrelated traffic into
+    // any captured prefix, and the read path should pass it through
+    // untouched rather than the test caring what it is.
     let mut seen = 0usize;
     let mut sample: Option<Vec<u8>> = None;
     let mut bufs = vec![BytesMut::new(); 8];
-    while seen < 4 {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while seen < 4 && Instant::now() < deadline {
         let count = device.read_batch(&mut bufs).expect("read batch");
         if count == 0 {
             break;
         }
         for buf in bufs.iter().take(count) {
-            // Every probe is an IPv4 ICMP echo request toward the on-link
-            // address.
-            assert_eq!(buf[0] >> 4, 4);
-            assert_eq!(buf[9], 1);
-            if sample.is_none() {
-                sample = Some(buf.to_vec());
+            if buf.len() >= 10 && buf[0] >> 4 == 4 && buf[9] == 1 {
+                if sample.is_none() {
+                    sample = Some(buf.to_vec());
+                }
+                seen += 1;
             }
-            seen += 1;
         }
     }
     assert!(seen >= 4, "expected at least four probes, saw {seen}");
@@ -85,7 +90,9 @@ fn reads_kernel_traffic_writes_back_and_stops_cleanly() {
 #[test]
 #[ignore]
 fn shutdown_wakes_a_blocked_reader_from_another_thread() {
-    let mut device = TunDevice::create(&loop_config()).expect("create device");
+    // Nothing generates traffic for this prefix, so the reader stays parked
+    // inside the kernel until the interrupt arrives.
+    let mut device = TunDevice::create(&subnet_config(1)).expect("create device");
     let handle = device.shutdown_handle();
     let reader = thread::spawn(move || {
         let mut bufs = vec![BytesMut::new(); 4];
@@ -101,11 +108,11 @@ fn shutdown_wakes_a_blocked_reader_from_another_thread() {
 fn duplicate_name_is_refused() {
     let first = DeviceConfig {
         name: Some("vfawntest0".into()),
-        ..loop_config()
+        ..subnet_config(2)
     };
     let second = DeviceConfig {
         name: Some("vfawntest0".into()),
-        ..loop_config()
+        ..subnet_config(2)
     };
 
     let one = TunDevice::create(&first).expect("first create");
