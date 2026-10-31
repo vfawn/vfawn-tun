@@ -12,3 +12,5 @@ workspace = true
 [dependencies]
 vfawn-core = { path = "../vfawn-core" }
 bytes.workspace = true
+pcap-file.workspace = true
+vfawn-wire = { path = "../vfawn-wire" }

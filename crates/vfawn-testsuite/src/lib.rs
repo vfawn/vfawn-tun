@@ -7,6 +7,10 @@
 //! assertion helpers used across the integration suites. Consumed as a
 //! dev-dependency so none of this code reaches the product dependency tree.
 
+pub mod clock;
 pub mod mock_device;
+pub mod pcap_device;
 
+pub use clock::{VirtualClock, WALL_CLOCK_TOLERANCE};
 pub use mock_device::MockDevice;
+pub use pcap_device::PcapDevice;
