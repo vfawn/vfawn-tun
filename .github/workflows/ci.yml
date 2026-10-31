@@ -30,7 +30,7 @@ jobs:
       # Needed by the rule-backend contract tests.
       - name: Install nftables
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y nftables iproute2 tcpdump
+        run: sudo apt-get update && sudo apt-get install -y nftables iproute2 tcpdump dnsutils
 
       - name: fmt
         run: cargo fmt --all --check
@@ -56,6 +56,14 @@ jobs:
       - name: nftables backend tests (root)
         if: runner.os == 'Linux'
         run: sudo -E env "PATH=$PATH" cargo test -p vfawn-platform --test linux_nftables -- --ignored --test-threads=1 --nocapture
+
+      # Phase-one end-to-end acceptance: the full instance inside a
+      # namespace, asserted with dig, probes and kernel state.
+      - name: e2e acceptance (root)
+        if: runner.os == 'Linux'
+        run: |
+          cargo build -p vfawn-bin
+          sudo -E env "PATH=$PATH" cargo test -p vfawn --test e2e_linux -- --ignored --exact --test-threads=1 --nocapture
 
       - name: license gate
         uses: taiki-e/install-action@v2

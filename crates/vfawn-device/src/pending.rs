@@ -19,6 +19,12 @@ impl TunDevice {
             "no device backend for this target yet",
         ))
     }
+
+    /// The interface name; creation already failed on these targets, so
+    /// the same failure carries through.
+    pub fn name(&self) -> io::Result<String> {
+        Err(unsupported())
+    }
 }
 
 /// Every method reports the same error, so callers can compile against

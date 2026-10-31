@@ -78,6 +78,15 @@ impl TunDevice {
         Self::wrap(device, mtu as usize, caps)
     }
 
+    /// The interface name the kernel knows this device by.
+    ///
+    /// Route orchestration needs the real name: with no configured name
+    /// the driver assigns one, and rules and addresses must reference
+    /// exactly that.
+    pub fn name(&self) -> io::Result<String> {
+        self.device.name()
+    }
+
     /// Adopt a device fd supplied by the host, as VPN services and network
     /// extensions do. An adopted fd carries no offload by nature, so the
     /// capability floor applies regardless of what created it.

@@ -10,11 +10,15 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+async-trait = "0.1"
+ipnet.workspace = true
 vfawn-core = { path = "../vfawn-core" }
 vfawn-device = { path = "../vfawn-device" }
 vfawn-stack-user = { path = "../vfawn-stack-user", optional = true }
 vfawn-route = { path = "../vfawn-route" }
-async-trait = "0.1"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+vfawn-platform = { path = "../vfawn-platform" }
 
 [features]
 default = ["backend-ipstack"]

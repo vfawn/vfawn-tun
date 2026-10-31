@@ -30,6 +30,9 @@
 pub mod echo;
 pub mod instance;
 
+#[cfg(target_os = "linux")]
+pub mod route_orchestration;
+
 pub use instance::{Instance, RestartReason, StatsSnapshot};
 pub use vfawn_core::{
     Action, CloseReason, ConfigError, DeviceCaps, DeviceConfig, DnsConfig, DnsMode, FlowInfo,

@@ -1263,8 +1263,10 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "bytes",
+ "ipnet",
  "vfawn-core",
  "vfawn-device",
+ "vfawn-platform",
  "vfawn-route",
  "vfawn-stack-user",
  "vfawn-testsuite",

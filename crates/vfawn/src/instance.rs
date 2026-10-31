@@ -58,6 +58,8 @@ pub struct Instance {
     handle: Option<StackHandle>,
     panics: Arc<AtomicU64>,
     reconciler: Option<Reconciler>,
+    #[cfg(target_os = "linux")]
+    orchestration: Option<crate::route_orchestration::RouteOrchestration>,
 }
 
 impl Instance {
@@ -77,6 +79,8 @@ impl Instance {
             handle: None,
             panics: Arc::new(AtomicU64::new(0)),
             reconciler: None,
+            #[cfg(target_os = "linux")]
+            orchestration: None,
         })
     }
 
@@ -115,6 +119,27 @@ impl Instance {
             udp_timeout_secs: self.config.stack.udp_timeout.as_secs(),
             tcp_timeout_secs: 60,
         });
+        // Route orchestration installs after the device exists (rules
+        // and addresses reference its real name) and before traffic
+        // flows (the capture must already own the routing table).
+        #[cfg(target_os = "linux")]
+        if self.config.route.auto_route {
+            let interface = device.name()?;
+            let addresses: Vec<ipnet::IpNet> = self
+                .config
+                .device
+                .inet4_address
+                .iter()
+                .map(|n| (*n).into())
+                .chain(self.config.device.inet6_address.iter().map(|n| (*n).into()))
+                .collect();
+            self.orchestration = Some(crate::route_orchestration::RouteOrchestration::install(
+                &self.config,
+                &interface,
+                &addresses,
+            )?);
+        }
+
         use vfawn_core::StackBackend;
         let handle = backend.spawn(Box::new(device), handler)?;
         self.handle = Some(handle);
@@ -145,6 +170,14 @@ impl Instance {
         // pragmatic answer until the in-house stack lands with one.
         std::thread::sleep(DRAIN_TIMEOUT);
         self.handle = None;
+        // Routing rules outlive a process crash by design (018); they
+        // must not outlive an orderly shutdown.
+        #[cfg(target_os = "linux")]
+        if let Some(mut orchestration) = self.orchestration.take() {
+            orchestration
+                .remove()
+                .map_err(|e| io::Error::other(e.to_string()))?;
+        }
         Ok(())
     }
 
@@ -171,6 +204,24 @@ impl Instance {
         });
         if let Some(reason) = needs_restart_desired(&self.config, config) {
             return Err(ApplyError::NeedsRestart(reason));
+        }
+        #[cfg(target_os = "linux")]
+        if let Some(ref orchestration) = self.orchestration {
+            let addresses: Vec<ipnet::IpNet> = self
+                .config
+                .device
+                .inet4_address
+                .iter()
+                .map(|n| (*n).into())
+                .chain(self.config.device.inet6_address.iter().map(|n| (*n).into()))
+                .collect();
+            return orchestration
+                .update(
+                    config,
+                    &config.device.name.clone().unwrap_or_default(),
+                    &addresses,
+                )
+                .map_err(ApplyError::Reconcile);
         }
         let Some(ref re) = self.reconciler else {
             return Err(ApplyError::NoRouteEngine);
