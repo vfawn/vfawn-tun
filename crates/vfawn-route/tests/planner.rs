@@ -44,6 +44,7 @@ fn rule(prio: u32, tag: &str) -> PolicyRule {
             destination: None,
             incoming_interface: None,
             suppress_prefixlen: None,
+            dport: None,
         },
         action: RuleAction::Lookup(2022),
         tag: tag.to_string(),

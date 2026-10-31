@@ -404,6 +404,7 @@ fn parse_rule(msg: &RuleMessage) -> Option<PolicyRule> {
             destination,
             incoming_interface: None,
             suppress_prefixlen: None,
+            dport: None,
         },
         action: RuleAction::Lookup(table),
         tag: String::new(),

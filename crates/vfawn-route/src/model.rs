@@ -62,6 +62,9 @@ pub struct RuleSelector {
     /// Suppress routes with a prefix length >= this value (suppresses
     /// the default route when 0).
     pub suppress_prefixlen: Option<u8>,
+    /// Destination port (UDP); None matches any port. Only the nftables
+    /// backend can express this; rtnetlink policy rules ignore it.
+    pub dport: Option<u16>,
 }
 
 /// One policy rule: a priority-ordered match/action pair.

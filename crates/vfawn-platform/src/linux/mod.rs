@@ -5,5 +5,7 @@
 //! netlink event feed that drives route reconciliation.
 
 pub mod netlink;
+pub mod nftables;
 
 pub use netlink::NetlinkBackend;
+pub use nftables::NftablesBackend;

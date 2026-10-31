@@ -135,6 +135,7 @@ fn rule_add_remove_by_priority() {
             destination: Some("172.16.0.0/12".parse().unwrap()),
             incoming_interface: None,
             suppress_prefixlen: None,
+            dport: None,
         },
         action: RuleAction::Lookup(254),
         tag: "vfawn-test".to_string(),

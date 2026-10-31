@@ -49,6 +49,11 @@ jobs:
         if: runner.os == 'Linux'
         run: sudo -E env "PATH=$PATH" cargo test -p vfawn-platform -- --ignored --test-threads=1 --nocapture
 
+      # Nftables backend tests need root for table/chain manipulation.
+      - name: nftables backend tests (root)
+        if: runner.os == 'Linux'
+        run: sudo -E env "PATH=$PATH" cargo test -p vfawn-platform --test linux_nftables -- --ignored --test-threads=1 --nocapture
+
       - name: license gate
         uses: taiki-e/install-action@v2
         with:
