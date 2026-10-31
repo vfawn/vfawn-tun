@@ -76,12 +76,13 @@ fn checksum_with_carry(carry: u32, data: &[u8]) -> u16 {
 
 fn sum_words(data: &[u8]) -> u32 {
     let mut sum = 0u32;
-    let mut chunks = data.chunks_exact(2);
-    for chunk in &mut chunks {
-        sum += u16::from_be_bytes([chunk[0], chunk[1]]) as u32;
+    let mut index = 0;
+    while index + 1 < data.len() {
+        sum += u16::from_be_bytes([data[index], data[index + 1]]) as u32;
+        index += 2;
     }
-    if let [byte] = chunks.remainder() {
-        sum += (*byte as u32) << 8;
+    if index < data.len() {
+        sum += (data[index] as u32) << 8;
     }
     sum
 }
