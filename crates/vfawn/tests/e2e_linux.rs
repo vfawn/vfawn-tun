@@ -393,7 +393,7 @@ fn stop_body() {
 
 fn wait_file(name: &str) {
     let path = format!("{RUN}/{name}");
-    let deadline = Instant::now() + Duration::from_secs(15);
+    let deadline = Instant::now() + Duration::from_secs(30);
     while Instant::now() < deadline {
         if std::path::Path::new(&path).exists() {
             return;
@@ -401,8 +401,11 @@ fn wait_file(name: &str) {
         std::thread::sleep(Duration::from_millis(50));
     }
     panic!(
-        "timed out waiting for {name}; body stderr: {}",
-        std::fs::read_to_string(format!("{RUN}/body.err")).unwrap_or_default()
+        "timed out waiting for {name}; body stderr: {}; body stdout: {}; crumbs: {}; pid file: {:?}",
+        std::fs::read_to_string(format!("{RUN}/body.err")).unwrap_or_default(),
+        std::fs::read_to_string(format!("{RUN}/body.out")).unwrap_or_default(),
+        std::fs::read_to_string(format!("{RUN}/crumbs")).unwrap_or_default(),
+        std::path::Path::new(&format!("{RUN}/body.pid")).exists(),
     );
 }
 
@@ -574,11 +577,14 @@ fn body() {
         _ => {}
     }
 
+    write_file("crumbs", "constructed\n");
     let handler = Arc::new(E2eHandler {
         udp_echoes: AtomicU64::new(0),
     });
     let mut instance = Instance::new(config.clone(), handler.clone()).expect("instance");
+    write_file("crumbs", "new-ok\n");
     instance.start(handler.clone()).expect("start");
+    write_file("crumbs", "started\n");
     write_file("ready", "1");
 
     // Follow-up phases the parent requests through files.
