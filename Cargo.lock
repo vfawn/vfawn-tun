@@ -1095,9 +1095,11 @@ name = "vfawn"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "bytes",
  "vfawn-core",
  "vfawn-device",
  "vfawn-stack-user",
+ "vfawn-testsuite",
 ]
 
 [[package]]
