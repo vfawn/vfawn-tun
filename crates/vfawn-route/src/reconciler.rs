@@ -108,7 +108,7 @@ impl Reconciler {
                 }
                 Err(e) => {
                     self.log("apply", op, &format!("error:{e}"));
-                    return self.rollback(applied, e.to_string());
+                    return self.rollback(applied, format!("{}: {e}", op.describe()));
                 }
             }
         }

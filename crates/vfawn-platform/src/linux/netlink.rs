@@ -21,7 +21,7 @@ use netlink_packet_route::{
     AddressFamily,
     address::{AddressAttribute, AddressMessage},
     route::{RouteAttribute, RouteMessage},
-    rule::{RuleAttribute, RuleMessage},
+    rule::{RuleAction as WireAction, RuleAttribute, RuleMessage},
 };
 use rtnetlink::{Handle, IpVersion, new_connection};
 
@@ -219,9 +219,13 @@ impl NetlinkBackend {
     }
 
     async fn add_rule(&self, rule: &PolicyRule) -> io::Result<()> {
-        let table = match rule.action {
-            RuleAction::Lookup(t) => t,
-            _ => 0,
+        // The action is not cosmetic: a rule installed without one
+        // matches traffic and then does nothing legal with it, and the
+        // kernel answers route lookups with EINVAL.
+        let (table, action) = match rule.action {
+            RuleAction::Lookup(t) => (t, WireAction::ToTable),
+            RuleAction::Nop => (0, WireAction::Nop),
+            RuleAction::Unreachable => (0, WireAction::Unreachable),
         };
         let prio = rule.priority;
         let (dest, plen) = rule
@@ -237,6 +241,7 @@ impl NetlinkBackend {
                     .add()
                     .v4()
                     .priority(prio)
+                    .action(action)
                     .table_id(table)
                     .destination_prefix(d, plen)
                     .execute()
@@ -248,6 +253,7 @@ impl NetlinkBackend {
                     .add()
                     .v6()
                     .priority(prio)
+                    .action(action)
                     .table_id(table)
                     .destination_prefix(d, plen)
                     .execute()
@@ -259,14 +265,22 @@ impl NetlinkBackend {
 
     async fn remove_rule(&self, rule: &PolicyRule) -> io::Result<()> {
         let mut msg = RuleMessage::default();
-        let table = match rule.action {
-            RuleAction::Lookup(t) => t,
-            _ => 0,
+        // The action takes part in rule identity; deleting without it
+        // can miss the installed rule.
+        let (table, action) = match rule.action {
+            RuleAction::Lookup(t) => (t, WireAction::ToTable),
+            RuleAction::Nop => (0, WireAction::Nop),
+            RuleAction::Unreachable => (0, WireAction::Unreachable),
         };
-        msg.header.table = table as u8;
+        msg.header.action = action;
+        // The table rides in its attribute: the header byte is eight
+        // bits and truncates dedicated tables past 255.
+        msg.attributes.push(RuleAttribute::Table(table));
+        // The family must mirror the add side: a rule without a
+        // destination is the catch-all, which the add built as IPv4.
         msg.header.family = match rule.selector.destination.map(|d| d.addr()) {
-            Some(IpAddr::V6(_)) | None => AddressFamily::Inet6,
-            Some(IpAddr::V4(_)) => AddressFamily::Inet,
+            Some(IpAddr::V6(_)) => AddressFamily::Inet6,
+            Some(IpAddr::V4(_)) | None => AddressFamily::Inet,
         };
         msg.attributes.push(RuleAttribute::Priority(rule.priority));
         if let Some(dest) = &rule.selector.destination {
@@ -324,7 +338,13 @@ fn parse_address(msg: &AddressMessage) -> Option<InterfaceAddress> {
         IpAddr::V4(a) => IpNet::V4(ipnet::Ipv4Net::new(a, prefix_len).ok()?),
         IpAddr::V6(a) => IpNet::V6(ipnet::Ipv6Net::new(a, prefix_len).ok()?),
     };
-    let name = label.unwrap_or_else(|| format!("if{}", msg.header.index));
+    // The kernel labels few addresses; resolving the interface index
+    // through sysfs gives the real name, which address identity
+    // compares against. The fallback keeps unresolvable indexes
+    // visible instead of silently matching nothing.
+    let name = interface_name_of(msg.header.index)
+        .or(label)
+        .unwrap_or_else(|| format!("if{}", msg.header.index));
     Some(InterfaceAddress {
         interface: name,
         prefix,
@@ -335,10 +355,12 @@ fn parse_route(msg: &RouteMessage) -> Option<RouteEntry> {
     let mut table = msg.header.table.into();
     let mut dest_ip: Option<IpAddr> = None;
     let mut gateway: Option<IpAddr> = None;
+    let mut oif: Option<u32> = None;
 
     for attr in &msg.attributes {
         match attr {
             RouteAttribute::Table(t) => table = *t,
+            RouteAttribute::Oif(index) => oif = Some(*index),
             RouteAttribute::Destination(addr) => {
                 dest_ip = match addr {
                     netlink_packet_route::route::RouteAddress::Inet(a) => Some(IpAddr::V4(*a)),
@@ -369,23 +391,59 @@ fn parse_route(msg: &RouteMessage) -> Option<RouteEntry> {
         IpAddr::V6(a) => IpNet::V6(ipnet::Ipv6Net::new(a, plen).ok()?),
     };
 
+    // A route without its interface name never equals the desired
+    // entry, and the planner would re-add a route the kernel already
+    // holds, which the kernel answers with EEXIST.
     Some(RouteEntry {
         table,
         destination: prefix,
         gateway,
-        interface: None,
+        interface: oif.and_then(interface_name_of),
         metric: 0,
     })
 }
 
+/// Resolve an interface index to its name through sysfs; route identity
+/// compares names, and the netlink dump only carries the index.
+fn interface_name_of(index: u32) -> Option<String> {
+    let entries = std::fs::read_dir("/sys/class/net").ok()?;
+    for entry in entries.flatten() {
+        let Ok(content) = std::fs::read_to_string(entry.path().join("ifindex")) else {
+            continue;
+        };
+        if content.trim().parse::<u32>().ok() == Some(index) {
+            return Some(entry.file_name().to_string_lossy().into_owned());
+        }
+    }
+    None
+}
+
 fn parse_rule(msg: &RuleMessage) -> Option<PolicyRule> {
-    let table = msg.header.table.into();
+    // The kernel reports dedicated-table rules through the FRA_TABLE
+    // attribute: the header byte is eight bits and table 2022 does not
+    // fit. Reading the header alone misparses every rule we install,
+    // which makes re-application think its own rules are missing and
+    // fight them with EEXIST.
+    let mut table = u32::from(msg.header.table);
     let mut priority = 0u32;
     let mut destination = None;
+    let mut source = None;
+    let mut suppress_prefixlen = None;
 
     for attr in &msg.attributes {
         match attr {
             RuleAttribute::Priority(p) => priority = *p,
+            RuleAttribute::Table(t) => table = *t,
+            RuleAttribute::SuppressPrefixLen(len) => {
+                suppress_prefixlen = Some((*len).min(u8::MAX as u32) as u8)
+            }
+            RuleAttribute::Source(ip) => {
+                let plen = msg.header.src_len;
+                source = Some(match *ip {
+                    IpAddr::V4(a) => IpNet::V4(ipnet::Ipv4Net::new(a, plen).ok()?),
+                    IpAddr::V6(a) => IpNet::V6(ipnet::Ipv6Net::new(a, plen).ok()?),
+                });
+            }
             RuleAttribute::Destination(ip) => {
                 let plen = msg.header.dst_len;
                 destination = Some(match *ip {
@@ -397,16 +455,25 @@ fn parse_rule(msg: &RuleMessage) -> Option<PolicyRule> {
         }
     }
 
+    let action = match msg.header.action {
+        WireAction::Nop => RuleAction::Nop,
+        WireAction::Unreachable => RuleAction::Unreachable,
+        _ => RuleAction::Lookup(table),
+    };
+
+    // Ownership is not the parser's call: the kernel stores no tag, and
+    // which rules are ours depends on the desired state's table and
+    // priority window. Every rule is reported; the planner decides.
     Some(PolicyRule {
         priority,
         selector: RuleSelector {
-            source: None,
+            source,
             destination,
             incoming_interface: None,
-            suppress_prefixlen: None,
+            suppress_prefixlen,
             dport: None,
         },
-        action: RuleAction::Lookup(table),
+        action,
         tag: String::new(),
     })
 }

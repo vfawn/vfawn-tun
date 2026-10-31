@@ -1306,6 +1306,7 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "ipnet",
+ "libc",
  "tun-rs",
  "vfawn-core",
 ]

@@ -22,10 +22,36 @@ use bytes::BytesMut;
 use std::io;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::mpsc;
 use vfawn_core::{DnsHijack, PacketDevice};
+
+/// The async device that ipstack sees, plus the flag that ends the
+/// bridge threads underneath it.
+///
+/// Stopping is not the channel's job: with no traffic the reader would
+/// wait on a channel whose receiver lives inside a future that is
+/// itself waiting for packets, so the loop closes on its own terms.
+pub struct Bridge {
+    pub io: PacketIo,
+    stop: Arc<AtomicBool>,
+}
+
+impl Bridge {
+    /// Signal both bridge threads to exit and release their device
+    /// handles. Idempotent.
+    pub fn stop(&self) {
+        self.stop.store(true, Ordering::Release);
+    }
+
+    /// A shareable handle to the same signal, for tasks that outlive
+    /// this object's ownership of the packet io.
+    pub fn stop_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.stop)
+    }
+}
 
 /// The async device that ipstack sees.
 pub struct PacketIo {
@@ -86,14 +112,16 @@ pub fn start(
     mut read_device: Box<dyn PacketDevice>,
     write_device: Box<dyn PacketDevice>,
     dns: Option<Arc<DnsHijack>>,
-) -> PacketIo {
+) -> Bridge {
     let (rx_tx, rx_rx) = mpsc::channel::<BytesMut>(128);
     let (tx_tx, tx_rx) = mpsc::unbounded_channel::<BytesMut>();
+    let stop = Arc::new(AtomicBool::new(false));
 
     // Reader: blocks in read_batch, pushes one packet per channel send.
     // blocking_send stalls when the bounded channel fills up, which is the
     // intended backpressure.
     let reader_dns = dns.clone();
+    let reader_stop = Arc::clone(&stop);
     std::thread::Builder::new()
         .name("ipstack-device-reader".into())
         .spawn(move || {
@@ -106,6 +134,12 @@ pub fn start(
                     // up, so keep polling; the channel send provides the
                     // exit when the runtime drops its end.
                     Ok(0) => {
+                        // A stopped device answers zero forever, and the
+                        // channel only closes once the runtime stops
+                        // reading; the flag is this thread's own way out.
+                        if reader_stop.load(Ordering::Acquire) || rx_tx.is_closed() {
+                            return;
+                        }
                         std::thread::sleep(std::time::Duration::from_millis(1));
                     }
                     Ok(count) => {
@@ -113,7 +147,7 @@ pub fn start(
                             if let Some(engine) = reader_dns.as_ref() {
                                 engine.hijack(buf);
                             }
-                            if rx_tx.blocking_send(buf.clone()).is_err() {
+                            if rx_tx.is_closed() || rx_tx.blocking_send(buf.clone()).is_err() {
                                 return;
                             }
                         }
@@ -125,12 +159,16 @@ pub fn start(
         .expect("spawn reader thread");
 
     // Writer: pulls one packet at a time from the unbounded channel.
+    let writer_stop = Arc::clone(&stop);
     std::thread::Builder::new()
         .name("ipstack-device-writer".into())
         .spawn(move || {
             let mut tx_rx = tx_rx;
             let mut write_device = write_device;
             while let Some(mut packet) = tx_rx.blocking_recv() {
+                if writer_stop.load(Ordering::Acquire) {
+                    return;
+                }
                 if let Some(engine) = dns.as_ref() {
                     engine.restore(&mut packet);
                 }
@@ -139,11 +177,15 @@ pub fn start(
                     return;
                 }
             }
+            eprintln!("bridge writer: channel closed, exiting");
         })
         .expect("spawn writer thread");
 
-    PacketIo {
-        rx: rx_rx,
-        tx: tx_tx,
+    Bridge {
+        io: PacketIo {
+            rx: rx_rx,
+            tx: tx_tx,
+        },
+        stop,
     }
 }

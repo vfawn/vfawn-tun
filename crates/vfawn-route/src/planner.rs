@@ -33,7 +33,7 @@ pub fn plan(desired: &DesiredState, observed: &ObservedState) -> Plan {
 
     // --- Rules: remove stale first, add new last ---
     for rule in &observed.rules {
-        if rule.tag.starts_with("vfawn-") && !desired.rules.contains(rule) {
+        if rule_belongs_to_capture(rule, desired) && !desired.rules.contains(rule) {
             operations.push(RouteOp::RemoveRule(rule.clone()));
         }
     }
@@ -102,6 +102,22 @@ pub fn plan(desired: &DesiredState, observed: &ObservedState) -> Plan {
 /// Simulate applying a plan to an observed state; used by tests to
 /// verify completeness and by dry-run to show what the outcome looks
 /// like.
+/// Whether an observed rule is this capture's to manage. The kernel
+/// keeps no tags, so ownership is what the install shape implies. That
+/// means our priority window plus either the dedicated table or an
+/// exclusion nop; anything else in the window stays untouched.
+fn rule_belongs_to_capture(rule: &PolicyRule, desired: &DesiredState) -> bool {
+    let in_window = rule.priority >= desired.rule_index
+        && rule.priority < desired.rule_index.saturating_add(64);
+    let ours_shape = match rule.action {
+        // The capture table and the main-table exclusions are the two
+        // shapes the install creates; the window keeps both ours.
+        RuleAction::Lookup(table) => table == desired.table_index || table == 254,
+        RuleAction::Nop | RuleAction::Unreachable => true,
+    };
+    in_window && ours_shape
+}
+
 pub fn simulate_apply(plan: &Plan, observed: &mut ObservedState) {
     for op in &plan.operations {
         match op {
@@ -205,7 +221,10 @@ pub fn desired_from_config(params: &RouteParams<'_>) -> DesiredState {
                 suppress_prefixlen: None,
                 dport: None,
             },
-            action: RuleAction::Nop,
+            // The main table, not "continue": a nop rule falls through
+            // to the capture rule right below it, and the exclusion
+            // would capture exactly what it exists to spare.
+            action: RuleAction::Lookup(254),
             tag: tag.clone(),
         });
         priority += 1;

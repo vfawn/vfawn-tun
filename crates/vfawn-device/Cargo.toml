@@ -14,3 +14,6 @@ vfawn-core = { path = "../vfawn-core" }
 bytes.workspace = true
 ipnet.workspace = true
 tun-rs.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"

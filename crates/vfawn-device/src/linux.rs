@@ -203,8 +203,23 @@ impl PacketDevice for TunDevice {
         .shutdown()
     }
 
+    // A dup of the descriptor, not a second queue: the crate's own
+    // clone attaches another multi-queue handle, which single-queue
+    // devices reject and which would spread flows across readers even
+    // where it works. A split read/write bridge wants one shared queue
+    // with one reader; a duplicated descriptor gives exactly that.
+    #[allow(unsafe_code)]
     fn duplicate(&self) -> io::Result<Box<dyn PacketDevice>> {
-        let cloned = self.device.try_clone()?;
+        use std::os::fd::AsRawFd;
+        // SAFETY: dup returns a fresh owned descriptor of a live fd; the
+        // device below adopts it and nothing else touches it.
+        let twin = unsafe { libc::dup(self.device.as_raw_fd()) };
+        if twin < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: the fd came from dup above, is valid, and ownership
+        // transfers into the device object.
+        let cloned = unsafe { tun_rs::SyncDevice::from_fd(twin)? };
         Ok(Box::new(TunDevice {
             device: cloned,
             event: Arc::clone(&self.event),

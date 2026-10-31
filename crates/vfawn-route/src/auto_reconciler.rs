@@ -66,7 +66,7 @@ impl AutoReconciler {
                         match reconciler.apply(&snapshot) {
                             Ok(()) => {}
                             Err(e) => {
-                                eprintln!("auto-reconcile: {e}");
+                                eprintln!("auto-reconcile failed: {e:?}");
                             }
                         }
                         counter.fetch_add(1, Ordering::Relaxed);

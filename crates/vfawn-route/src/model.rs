@@ -68,7 +68,7 @@ pub struct RuleSelector {
 }
 
 /// One policy rule: a priority-ordered match/action pair.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Eq)]
 pub struct PolicyRule {
     /// Lower numbers evaluate first.
     pub priority: u32,
@@ -77,6 +77,18 @@ pub struct PolicyRule {
     /// Tags identifying which instance created this rule; used for
     /// orphan detection on restart.
     pub tag: String,
+}
+
+/// Rule identity is priority, selector and action; the tag records who
+/// created a rule for humans and scanners, and the kernel side of a
+/// snapshot has no way to know it. Comparing tags would make every
+/// observed rule unequal to its desired twin.
+impl PartialEq for PolicyRule {
+    fn eq(&self, other: &Self) -> bool {
+        self.priority == other.priority
+            && self.selector == other.selector
+            && self.action == other.action
+    }
 }
 
 /// What the host wants the kernel to look like.

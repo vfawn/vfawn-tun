@@ -84,7 +84,7 @@ fn applying_plan_makes_second_plan_empty() {
     // Start with some stale state.
     observed.addresses.push(addr("tun0", "10.99.99.1/24"));
     observed.routes.push(route(2022, "10.99.99.0/24", "tun0"));
-    observed.rules.push(rule(9999, "vfawn-stale"));
+    observed.rules.push(rule(9050, "vfawn-stale"));
 
     let p = plan(&desired, &observed);
     assert!(!p.is_empty());
@@ -209,7 +209,7 @@ fn route_in_main_table_is_untouched() {
 fn stale_tagged_rule_is_removed() {
     let desired = test_desired();
     let mut observed = ObservedState::default();
-    observed.rules.push(rule(9999, "vfawn-old"));
+    observed.rules.push(rule(9050, "vfawn-old"));
     let p = plan(&desired, &observed);
     assert!(
         p.operations
@@ -352,7 +352,7 @@ fn empty_plan_describes_nothing() {
 fn rules_removed_before_addresses_added() {
     let desired = test_desired();
     let mut observed = ObservedState::default();
-    observed.rules.push(rule(9999, "vfawn-stale"));
+    observed.rules.push(rule(9050, "vfawn-stale"));
     observed.addresses.push(addr("tun0", "10.99.99.1/24"));
 
     let p = plan(&desired, &observed);
