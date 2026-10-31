@@ -12,6 +12,7 @@ workspace = true
 [dependencies]
 bytes.workspace = true
 socket2 = { workspace = true, features = ["all"] }
+vfawn-wire.workspace = true
 ipnet.workspace = true
 serde.workspace = true
 async-trait.workspace = true

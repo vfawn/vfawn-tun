@@ -36,5 +36,6 @@ workspace = true
 optional = true
 
 [dev-dependencies]
+vfawn-wire.workspace = true
 vfawn-testsuite = { path = "../vfawn-testsuite" }
 bytes.workspace = true

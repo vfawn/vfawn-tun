@@ -27,9 +27,9 @@ use async_trait::async_trait;
 use ipstack::{IpStack, IpStackConfig, IpStackStream, IpStackTcpStream, IpStackUdpStream};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use vfawn_core::{
-    FlowInfo, FlowTrackerHook, IcmpPacket, Network, PacketDevice, SessionHandler, StackBackend,
-    StackHandle, TcpSession, TcpTransport, UdpNat, UdpSession, UdpSessionMode, UdpTransport,
-    Verdict,
+    DnsHijack, FlowInfo, FlowTrackerHook, IcmpPacket, Network, PacketDevice, SessionHandler,
+    StackBackend, StackHandle, TcpSession, TcpTransport, UdpNat, UdpSession, UdpSessionMode,
+    UdpTransport, Verdict,
 };
 
 use crate::ipstack_bridge;
@@ -43,6 +43,9 @@ pub struct IpstackBackend {
     /// runtime's sweep task, which expires idle mappings and reports
     /// their close to the flow trackers.
     pub udp_nat: Arc<UdpNat>,
+    /// The DNS rewrite engine carried by the device bridge. An engine
+    /// with no virtual addresses leaves every packet alone.
+    pub dns: Arc<DnsHijack>,
     /// Idle timeout for UDP sessions, in seconds.
     pub udp_timeout_secs: u64,
     /// TCP connection timeout, in seconds.
@@ -58,6 +61,7 @@ impl Default for IpstackBackend {
                 std::time::Duration::from_secs(300),
                 0,
             )),
+            dns: Arc::new(DnsHijack::new(None, None)),
             udp_timeout_secs: 300,
             tcp_timeout_secs: 60,
         }
@@ -72,7 +76,7 @@ impl StackBackend for IpstackBackend {
     ) -> io::Result<StackHandle> {
         let handle = StackHandle::new();
         let write_device = device.duplicate()?;
-        let io = ipstack_bridge::start(device, write_device);
+        let io = ipstack_bridge::start(device, write_device, Some(Arc::clone(&self.dns)));
 
         // The builder returns &mut Self; the final take gives ownership
         // back for the move into the runtime thread.

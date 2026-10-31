@@ -89,6 +89,27 @@ pub fn verify_transport_v4(
     fold(sum) == 0xffff
 }
 
+/// Adjust a checksum for one rewritten field, without recomputing the
+/// whole sum: RFC 1624's incremental update, `HC' = ~(~HC + m + ~m')`,
+/// generalized to a field of any even length.
+///
+/// This is the surgery a destination rewrite needs: the rest of the
+/// packet already contributed its words to the old checksum, so only
+/// the replaced field's delta has to be applied. A zero fold becomes
+/// `0xffff`, the encoding a receiver expects; UDP callers that must
+/// preserve an absent checksum skip the call instead.
+pub fn adjust(checksum: u16, old_field: &[u8], new_field: &[u8]) -> u16 {
+    debug_assert_eq!(old_field.len(), new_field.len());
+    let delta_old = fold(sum_words(old_field)) as u32;
+    let delta_new = fold(sum_words(new_field)) as u32;
+    // Ones-complement arithmetic in a 32-bit accumulator: one extra
+    // 0xffff before the subtraction keeps the value positive, and the
+    // two zero representations collapse inside the fold.
+    let sum = (!checksum) as u32 + 0xffff - delta_old + delta_new;
+    let folded = fold(sum);
+    if folded == 0 { 0xffff } else { !folded }
+}
+
 /// Verify a TCP or UDP checksum over the given segment for IPv6.
 pub fn verify_transport_v6(
     src: Ipv6Addr,

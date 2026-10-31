@@ -16,6 +16,7 @@
 
 pub mod config;
 pub mod device;
+pub mod dns_hijack;
 pub mod monitor;
 pub mod outbound;
 pub mod session;
@@ -29,6 +30,7 @@ pub use config::{
     VfawnConfig,
 };
 pub use device::{DeviceCaps, PacketDevice};
+pub use dns_hijack::{DnsHijack, HijackOutcome, derive_virtual_v4};
 pub use monitor::{MonitorEvent, StackKind};
 pub use outbound::apply;
 pub use session::{

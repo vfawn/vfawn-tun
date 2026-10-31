@@ -21,10 +21,11 @@
 use bytes::BytesMut;
 use std::io;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::mpsc;
-use vfawn_core::PacketDevice;
+use vfawn_core::{DnsHijack, PacketDevice};
 
 /// The async device that ipstack sees.
 pub struct PacketIo {
@@ -84,6 +85,7 @@ impl AsyncWrite for PacketIo {
 pub fn start(
     mut read_device: Box<dyn PacketDevice>,
     write_device: Box<dyn PacketDevice>,
+    dns: Option<Arc<DnsHijack>>,
 ) -> PacketIo {
     let (rx_tx, rx_rx) = mpsc::channel::<BytesMut>(128);
     let (tx_tx, tx_rx) = mpsc::unbounded_channel::<BytesMut>();
@@ -91,6 +93,7 @@ pub fn start(
     // Reader: blocks in read_batch, pushes one packet per channel send.
     // blocking_send stalls when the bounded channel fills up, which is the
     // intended backpressure.
+    let reader_dns = dns.clone();
     std::thread::Builder::new()
         .name("ipstack-device-reader".into())
         .spawn(move || {
@@ -106,7 +109,10 @@ pub fn start(
                         std::thread::sleep(std::time::Duration::from_millis(1));
                     }
                     Ok(count) => {
-                        for buf in bufs.iter().take(count) {
+                        for buf in bufs.iter_mut().take(count) {
+                            if let Some(engine) = reader_dns.as_ref() {
+                                engine.hijack(buf);
+                            }
                             if rx_tx.blocking_send(buf.clone()).is_err() {
                                 return;
                             }
@@ -124,7 +130,10 @@ pub fn start(
         .spawn(move || {
             let mut tx_rx = tx_rx;
             let mut write_device = write_device;
-            while let Some(packet) = tx_rx.blocking_recv() {
+            while let Some(mut packet) = tx_rx.blocking_recv() {
+                if let Some(engine) = dns.as_ref() {
+                    engine.restore(&mut packet);
+                }
                 let batch = [packet];
                 if write_device.write_batch(&batch).is_err() {
                     return;

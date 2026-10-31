@@ -1295,6 +1295,7 @@ dependencies = [
  "serde",
  "serde_json",
  "socket2 0.5.10",
+ "vfawn-wire",
 ]
 
 [[package]]
@@ -1358,6 +1359,7 @@ dependencies = [
  "tokio",
  "vfawn-core",
  "vfawn-testsuite",
+ "vfawn-wire",
 ]
 
 [[package]]

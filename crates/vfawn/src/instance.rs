@@ -108,6 +108,10 @@ impl Instance {
                 &self.config.stack.udp_nat,
                 self.config.stack.udp_timeout,
             )),
+            dns: std::sync::Arc::new(vfawn_core::DnsHijack::from_config(
+                &self.config.dns,
+                &self.config.device.inet4_address,
+            )),
             udp_timeout_secs: self.config.stack.udp_timeout.as_secs(),
             tcp_timeout_secs: 60,
         });
