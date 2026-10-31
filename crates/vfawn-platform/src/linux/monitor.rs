@@ -151,19 +151,47 @@ fn list_up_interfaces() -> Vec<String> {
 }
 
 /// Read the default IPv4 route's outgoing interface from /proc/net/route.
-/// The kernel writes "destination\tgateway\t...\tiface" lines; the default
+/// The kernel writes "iface\tdestination\tgateway\t..." lines; the default
 /// route has destination 00000000.
 pub(crate) fn read_default_interface() -> Option<String> {
     let content = std::fs::read_to_string("/proc/net/route").ok()?;
+    default_interface_from(&content)
+}
+
+/// The table parser, split out so its column reading is testable against
+/// a captured sample instead of whatever machine runs the tests.
+fn default_interface_from(content: &str) -> Option<String> {
     for line in content.lines().skip(1) {
         let fields: Vec<&str> = line.split_whitespace().collect();
-        if fields.len() < 5 {
+        if fields.len() < 2 {
             continue;
         }
-        // Field 0: destination (hex), field 4: interface name.
-        if fields[0] == "00000000" {
-            return Some(fields[4].to_string());
+        // Field 0: interface name, field 1: destination in hex.
+        if fields[1] == "00000000" {
+            return Some(fields[0].to_string());
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::default_interface_from;
+
+    #[test]
+    fn default_route_names_its_interface() {
+        // Captured column order from a real table: iface first,
+        // destination second.
+        let table = "Iface\tDestination\tGateway\tFlags\tRefCnt\tUse\tMetric\tMask\n\
+                     wlp3s0\t0001A8C0\t00000000\t0001\t0\t0\t0\t00FFFFFF\n\
+                     wlp3s0\t00000000\t0100A8C0\t0003\t0\t0\t600\t00000000\n";
+        assert_eq!(default_interface_from(table), Some("wlp3s0".to_string()));
+    }
+
+    #[test]
+    fn table_without_a_default_yields_none() {
+        let table = "Iface\tDestination\tGateway\tFlags\tRefCnt\tUse\tMetric\tMask\n\
+                     tun0\t010212C6\t00000000\t0001\t0\t0\t0\t00FFFFFF\n";
+        assert_eq!(default_interface_from(table), None);
+    }
 }
