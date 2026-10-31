@@ -76,6 +76,14 @@ fn policy_capture_loops_and_bound_sockets_escape() {
     let _ = ip(&["link", "del", "v1b"]).output();
 
     run(ip(&["netns", "add", NS]));
+    // IPv6 link management (MLD reports on interface up) would land in
+    // the TUN queue as noise; this test is an IPv4 story.
+    run(in_ns(&[
+        "sysctl",
+        "-q",
+        "-w",
+        "net.ipv6.conf.all.disable_ipv6=1",
+    ]));
     run(ip(&[
         "link", "add", "v0a", "type", "veth", "peer", "name", "v0b",
     ]));
@@ -245,10 +253,17 @@ fn body() {
 
     // The plain send from step 1 is waiting in the TUN queue: the
     // datagram the rule captured back, read off the device itself.
-    let looped = read_packet(&tun, 3000).expect("a packet queued on the TUN");
-    assert_eq!(looped[0] >> 4, 4, "IPv4");
-    assert_eq!(looped[9], 17, "UDP");
-    assert_eq!(&looped[16..20], &[203, 0, 113, 10], "captured destination");
+    // Scan rather than assume: interface bring-up may have queued
+    // management packets ahead of it.
+    let mut looped = None;
+    for _ in 0..8 {
+        let candidate = read_packet(&tun, 1000).expect("packets queued on the TUN");
+        if candidate[0] >> 4 == 4 && candidate[9] == 17 && candidate[16..20] == [203, 0, 113, 10] {
+            looped = Some(candidate);
+            break;
+        }
+    }
+    assert!(looped.is_some(), "the plain datagram never reached the TUN");
 
     // Diagnostics for the escape assertions outside: how much of the
     // probe traffic also landed in the TUN, and what the constrained
