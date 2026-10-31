@@ -10,3 +10,10 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+bytes.workspace = true
+ipnet.workspace = true
+serde.workspace = true
+async-trait.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
