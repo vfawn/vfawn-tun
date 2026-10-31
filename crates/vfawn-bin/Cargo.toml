@@ -16,6 +16,7 @@ async-trait = "0.1"
 tokio = { workspace = true, features = ["rt", "signal", "macros"] }
 ipnet.workspace = true
 vfawn-wire = { path = "../vfawn-wire" }
+vfawn-platform = { path = "../vfawn-platform" }
 
 [dev-dependencies]
 criterion = "0.5"

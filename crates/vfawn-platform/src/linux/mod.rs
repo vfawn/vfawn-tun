@@ -6,6 +6,8 @@
 
 pub mod netlink;
 pub mod nftables;
+pub mod orphan;
 
 pub use netlink::NetlinkBackend;
 pub use nftables::NftablesBackend;
+pub use orphan::{CleanupReport, cleanup_nftables, ssh_session_sources};

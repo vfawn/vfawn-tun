@@ -10,6 +10,7 @@ publish.workspace = true
 rtnetlink.workspace = true
 netlink-packet-route.workspace = true
 ipnet.workspace = true
+serde.workspace = true
 tokio.workspace = true
 futures = "0.3"
 vfawn-route = { path = "../vfawn-route" }

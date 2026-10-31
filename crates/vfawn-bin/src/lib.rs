@@ -10,7 +10,6 @@
 pub mod bench;
 pub mod up;
 
-/// Placeholder for the rule cleanup tool.
-pub fn cleanup() {
-    println!("cleanup: not implemented yet; arrives with the route engine");
-}
+pub mod cleanup;
+
+pub use cleanup::run_cleanup;

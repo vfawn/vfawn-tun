@@ -14,7 +14,7 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Some("cleanup") => {
-            vfawn_bin::cleanup();
+            let _ = vfawn_bin::cleanup::run_cleanup(true);
             ExitCode::SUCCESS
         }
         _ => {
