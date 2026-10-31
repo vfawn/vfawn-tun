@@ -30,6 +30,8 @@ fn main() -> ExitCode {
 
 fn up_command(args: &[String]) -> ExitCode {
     let bind_default_iface = args.iter().any(|a| a == "--bind-default-iface");
+    let relay = args.iter().any(|a| a == "--relay");
+    let auto_route = args.iter().any(|a| a == "--auto-route");
     let positional: Vec<&String> = args.iter().filter(|a| !a.starts_with("--")).collect();
     let address: String = positional
         .first()
@@ -45,15 +47,15 @@ fn up_command(args: &[String]) -> ExitCode {
     // the spawned closure must outlive the caller's frame.
     let worker = std::thread::Builder::new()
         .name("vfawn-up".into())
-        .spawn(
-            move || match vfawn_bin::up::run(&address, mtu, bind_default_iface) {
+        .spawn(move || {
+            match vfawn_bin::up::run(&address, mtu, bind_default_iface, relay, auto_route) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => {
                     eprintln!("up: {e}");
                     ExitCode::FAILURE
                 }
-            },
-        )
+            }
+        })
         .expect("spawn worker thread");
 
     // Wait for Ctrl-C, then wake the worker so it runs its shutdown chain.

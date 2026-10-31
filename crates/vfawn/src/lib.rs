@@ -29,11 +29,13 @@
 
 pub mod echo;
 pub mod instance;
+pub mod relay;
 
 #[cfg(target_os = "linux")]
 pub mod route_orchestration;
 
 pub use instance::{Instance, RestartReason, StatsSnapshot};
+pub use relay::{Protect, RelayHandler};
 pub use vfawn_core::{
     Action, CloseReason, ConfigError, DeviceCaps, DeviceConfig, DnsConfig, DnsMode, FlowInfo,
     FlowTrackerHook, IcmpPacket, MonitorEvent, Network, PacketDevice, SessionHandler, StackBackend,

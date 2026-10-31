@@ -11,6 +11,7 @@ workspace = true
 
 [dependencies]
 async-trait = "0.1"
+tokio = { version = "1", features = ["net", "io-util", "rt-multi-thread", "macros", "time"] }
 ipnet.workspace = true
 vfawn-core = { path = "../vfawn-core" }
 vfawn-device = { path = "../vfawn-device" }
