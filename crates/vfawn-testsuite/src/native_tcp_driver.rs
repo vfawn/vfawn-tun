@@ -38,6 +38,14 @@ pub struct NativeTcpDriver {
     /// How many times the SYN-ACK has been retransmitted; drives the
     /// exponential backoff.
     synack_retries: u32,
+    /// Sent-but-unacknowledged data in flight: (seq, bytes) chunks in
+    /// order. The peer's ACKs prune the front; the RTO resends the
+    /// earliest chunk (RFC 6298 §3).
+    in_flight: VecDeque<(u32, Vec<u8>)>,
+    /// When the earliest in-flight chunk was (re)sent, and how many
+    /// retries have happened (the timeout doubles per retry, §5).
+    data_sent_at: Option<u64>,
+    data_retries: u32,
     /// The scenario's endpoints, for emitting wire bytes.
     server: std::net::SocketAddrV4,
     client: std::net::SocketAddrV4,
@@ -56,6 +64,9 @@ impl NativeTcpDriver {
             connection: NativeTcpConnection::new(listen_isn, DEFAULT_MSS),
             synack_at: None,
             synack_retries: 0,
+            in_flight: VecDeque::new(),
+            data_sent_at: None,
+            data_retries: 0,
             server: std::net::SocketAddrV4::new(std::net::Ipv4Addr::UNSPECIFIED, 0),
             client: std::net::SocketAddrV4::new(std::net::Ipv4Addr::UNSPECIFIED, 0),
             echo_backlog: VecDeque::new(),
@@ -83,6 +94,9 @@ impl StackDriver for NativeTcpDriver {
         self.echo_backlog.clear();
         self.synack_at = None;
         self.synack_retries = 0;
+        self.in_flight.clear();
+        self.data_sent_at = None;
+        self.data_retries = 0;
         self.now_ms = 0;
     }
 
@@ -95,7 +109,9 @@ impl StackDriver for NativeTcpDriver {
             }
             Step::Wait { delay_ms } => {
                 self.now_ms += delay_ms;
-                self.timer_fired()
+                let mut records = self.timer_fired();
+                records.extend(self.data_retransmit_fired());
+                records
             }
         }
     }
@@ -131,6 +147,53 @@ impl NativeTcpDriver {
         self.record_of(&frame).into_iter().collect()
     }
 
+    /// Data retransmission on the RTO (RFC 6298 §3): when unacked
+    /// data exists and the timeout elapsed, the earliest outstanding
+    /// bytes go out again. One second initial, doubling per retry
+    /// (§5), matching the oracle's visible behavior.
+    fn data_retransmit_fired(&mut self) -> Vec<SegmentRecord> {
+        let Some((seq, chunk)) = self.in_flight.front().cloned() else {
+            self.data_sent_at = None;
+            self.data_retries = 0;
+            return Vec::new();
+        };
+        let Some(sent_at) = self.data_sent_at else {
+            self.data_sent_at = Some(self.now_ms);
+            return Vec::new();
+        };
+        let threshold = 1000u64 << self.data_retries;
+        if self.now_ms.saturating_sub(sent_at) < threshold {
+            return Vec::new();
+        }
+        self.data_retries += 1;
+        self.data_sent_at = Some(self.now_ms);
+
+        // Resend the earliest chunk, MSS-sized like the original.
+        let mut records = Vec::new();
+        let mut remaining = chunk.as_slice();
+        let mut cursor = seq;
+        while !remaining.is_empty() {
+            let take = remaining
+                .len()
+                .min(self.connection.connection.mss() as usize);
+            let more_after = remaining.len() > take;
+            let reaction = Reaction {
+                seq: cursor,
+                ack: self.connection.connection.recv_nxt(),
+                flags: if more_after { 0x10 } else { 0x18 },
+                window: 65535,
+                delivered: Vec::new(),
+            };
+            let frame = emit_v4(self.server, self.client, &reaction, &remaining[..take]);
+            if let Some(record) = self.record_of(&frame) {
+                records.push(record);
+            }
+            cursor = cursor.wrapping_add(take as u32);
+            remaining = &remaining[take..];
+        }
+        records
+    }
+
     /// Mirror the oracle's post-scenario drain: late timers speak
     /// before the comparison is judged.
     pub fn finish_drain(&mut self) -> Vec<SegmentRecord> {
@@ -138,6 +201,7 @@ impl NativeTcpDriver {
         for _ in 0..4 {
             self.now_ms += 250;
             records.extend(self.timer_fired());
+            records.extend(self.data_retransmit_fired());
         }
         records
     }
@@ -156,6 +220,25 @@ impl NativeTcpDriver {
         };
         let inbound = Inbound::parse(&header, segment_payload);
         let reaction = self.connection.connection.on_segment(&inbound);
+        // Prune by what the connection actually accepted (SND.UNA),
+        // never by the raw ACK field: an acknowledgment beyond what was
+        // sent moves nothing (RFC 9293 §3.3.6), and honoring it would
+        // drop data the wire still owes.
+        let una = self.connection.connection.send_una();
+        while let Some((seq, chunk)) = self.in_flight.front().cloned() {
+            let end = seq.wrapping_add(chunk.len() as u32);
+            let acked_past_end = una.wrapping_sub(end) < u32::MAX / 2;
+            let acked_exactly = una == end;
+            if acked_past_end || acked_exactly {
+                self.in_flight.pop_front();
+            } else {
+                break;
+            }
+        }
+        if self.in_flight.is_empty() {
+            self.data_sent_at = None;
+            self.data_retries = 0;
+        }
         if reaction.flags & 0x12 == 0x12 && reaction.delivered.is_empty() {
             self.synack_at = Some(self.now_ms);
         }
@@ -213,6 +296,12 @@ impl NativeTcpDriver {
                 if let Some(record) = self.record_of(&frame) {
                     records.push(record);
                 }
+                // The sender remembers what is outstanding until the
+                // peer acknowledges past it (RFC 6298 §2: the RTO is
+                // over the earliest unacked byte).
+                self.in_flight.push_back((send.seq, data.to_vec()));
+                self.data_sent_at = Some(self.now_ms);
+                self.data_retries = 0;
                 self.connection.connection.send_advance(take as u32);
                 remaining = &remaining[take..];
             }

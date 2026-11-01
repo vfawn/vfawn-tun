@@ -152,6 +152,34 @@ pub struct ServerConnection {
     /// the peer closes first (passive close).
     fin_received: bool,
     fin_sent: bool,
+    /// Segments that arrived above RCV.NXT and wait for the gap
+    /// (RFC 9293 §3.3.5 SEG.SACK): (seq, bytes). Kept sorted by
+    /// sequence and merged on overlap, capped so a hostile flow cannot
+    /// grow it without bound.
+    out_of_order: Vec<(u32, Vec<u8>)>,
+    /// How many out-of-order bytes the queue may hold; the excess is
+    /// dropped and later retransmission recovers it.
+    ooo_budget: usize,
+    /// Duplicate ACK count (RFC 9293 §3.3.6): consecutive segments
+    /// that deliver nothing and restate the same acknowledgment.
+    dup_acks: u32,
+    /// Retransmission state (RFC 6298 §3-5): the byte range still
+    /// unacknowledged, when it was (re)sent, and the current timeout.
+    retransmit: Option<RetransmitState>,
+    /// The zero-window probe state: whether the last advertisement was
+    /// zero and a probe is owed (RFC 9293 §3.8.2, persist timer in
+    /// volume two's timer module; the flag drives the driver).
+    peer_window_zero: bool,
+}
+
+/// What the sender owes the wire again when the timer fires
+/// (RFC 6298 §3: retransmit the earliest unacknowledged data). The
+/// connection tracks whether data is outstanding; the backoff count
+/// rides with the driver's timer until the shard timer module owns
+/// it whole.
+struct RetransmitState {
+    #[allow(dead_code)]
+    retries: u32,
 }
 
 impl ServerConnection {
@@ -170,6 +198,11 @@ impl ServerConnection {
             mss,
             fin_received: false,
             fin_sent: false,
+            out_of_order: Vec::new(),
+            ooo_budget: 64 * 1024,
+            dup_acks: 0,
+            retransmit: None,
+            peer_window_zero: false,
         }
     }
 
@@ -269,27 +302,46 @@ impl ServerConnection {
             // unacceptable ACKs in ESTABLISHED).
             return Reaction::silent();
         }
+        let mut reaction = Reaction::silent();
+        let mut delivered_any = false;
+
         if inbound.has(ctl::ACK) {
-            self.send.una = inbound.ack.max(self.send.una);
+            // RFC 6298 §5.3: new acknowledgment clears the
+            // retransmission count; the sender starts fresh.
+            if self.ack_advances(inbound.ack) {
+                self.send.una = inbound.ack;
+                self.retransmit = None;
+                self.dup_acks = 0;
+            } else if inbound.payload.is_empty() && !inbound.has(ctl::FIN) {
+                // Same acknowledgment again with no text: a duplicate
+                // ACK (RFC 9293 §3.3.6), counted for fast detection.
+                self.dup_acks += 1;
+            }
         }
 
-        let mut reaction = Reaction::silent();
-
-        // Segment text (RFC 9293 §3.3.7): in-window payload moves to
-        // the receive queue and RCV.NXT advances by its length.
+        // Segment text (RFC 9293 §3.3.7): in-order payload delivers
+        // immediately; a gap opens the out-of-order queue, and the
+        // fill of a gap delivers what the queue now makes contiguous.
         if !inbound.payload.is_empty() {
             let offset = inbound.seq.wrapping_sub(self.recv.nxt) as usize;
-            let payload = if offset == 0 {
-                inbound.payload
-            } else {
-                // A retransmission overlapping already-delivered bytes:
-                // keep only the new tail (RFC 9293 §3.3.5 SEQ.SKIP).
-                &inbound.payload[offset.min(inbound.payload.len())..]
-            };
-            if !payload.is_empty() {
-                reaction.delivered = payload.to_vec();
-                self.recv.nxt = self.recv.nxt.wrapping_add(payload.len() as u32);
+            if offset == 0 {
+                reaction.delivered = inbound.payload.to_vec();
+                self.recv.nxt = self.recv.nxt.wrapping_add(payload_len_u32(inbound));
+                delivered_any = true;
+                // Data-carrying segments are not duplicate ACKs by
+                // definition (RFC 9293 §3.3.6), whatever their ACK
+                // field says.
+                self.dup_acks = 0;
+                self.collapse_ooo(&mut reaction);
+            } else if offset < usize::from(self.recv.window)
+                && self.ooo_usage() + inbound.payload.len() <= self.ooo_budget
+            {
+                // Above the gap and within budget: hold it
+                // (RFC 9293 §3.3.5 SEG.SACK holds instead of
+                // discarding; discarding only wastes bandwidth).
+                self.queue_ooo(inbound.seq, inbound.payload);
             }
+            // Below RCV.NXT entirely: pure duplicate, nothing to hold.
         }
 
         // FIN processing (RFC 9293 §3.3.7): FIN consumes one sequence
@@ -303,7 +355,17 @@ impl ServerConnection {
         // not already know: an ACK of an ACK carries no information,
         // and the oracle stays quiet exactly here, so staying quiet is
         // both correct etiquette and record parity.
-        if reaction.delivered.is_empty() && !self.fin_received && !inbound.has(ctl::FIN) {
+        // A reply carries information for the peer when it delivered
+        // data to acknowledge, answered a FIN, or holds out-of-order
+        // segments worth a duplicate ACK. An ACK that only moved our
+        // own una tells the peer nothing it does not know, and the
+        // oracle stays quiet exactly there.
+        let held_segment = !self.out_of_order.is_empty() && !delivered_any;
+        if reaction.delivered.is_empty()
+            && !self.fin_received
+            && !inbound.has(ctl::FIN)
+            && !held_segment
+        {
             return Reaction::silent();
         }
 
@@ -344,9 +406,130 @@ impl ServerConnection {
         lower <= upper
     }
 
+    /// Whether SEG.ACK moves SND.UNA forward (RFC 9293 §3.3.6's
+    /// SND.UNA < SEG.ACK test, wrapping form; equal is not forward).
+    fn ack_advances(&self, ack: u32) -> bool {
+        let forward = ack.wrapping_sub(self.send.una);
+        let limit = self.send.nxt.wrapping_sub(self.send.una);
+        forward >= 1 && forward <= limit
+    }
+
+    /// Bytes currently held above the gap.
+    fn ooo_usage(&self) -> usize {
+        self.out_of_order.iter().map(|(_, b)| b.len()).sum()
+    }
+
+    /// Hold a segment above the gap, sorted and merged with any
+    /// neighbor it overlaps (RFC 9293 §3.3.5: overlap merges, never
+    /// duplicates). Sequence comparisons use signed distances from
+    /// RCV.NXT so wrapping arithmetic stays honest.
+    fn queue_ooo(&mut self, seq: u32, payload: &[u8]) {
+        let as_offset = |value: u32| -> i64 {
+            let diff = value.wrapping_sub(self.recv.nxt);
+            if diff <= u32::MAX / 2 {
+                i64::from(diff)
+            } else {
+                i64::from(diff) - i64::from(u32::MAX) - 1
+            }
+        };
+        let mut ranges: Vec<(i64, Vec<u8>)> = self
+            .out_of_order
+            .drain(..)
+            .map(|(seq, bytes)| {
+                let start = as_offset(seq);
+                let padded = vec![0u8; usize::try_from(start).unwrap_or(0)];
+                let mut absolute = padded;
+                absolute.extend_from_slice(&bytes);
+                (start, absolute)
+            })
+            .collect();
+        let new_start = as_offset(seq);
+        let mut new_bytes = vec![0u8; usize::try_from(new_start).unwrap_or(0)];
+        new_bytes.extend_from_slice(payload);
+        ranges.push((new_start, new_bytes));
+        ranges.sort_by_key(|(start, _)| *start);
+
+        // Merge overlapping or adjacent ranges in one pass.
+        let mut merged: Vec<(i64, Vec<u8>)> = Vec::with_capacity(ranges.len());
+        for (start, bytes) in ranges {
+            match merged.last_mut() {
+                Some((last_start, last_bytes))
+                    if start <= *last_start + last_bytes.len() as i64 =>
+                {
+                    let overlap = (*last_start + last_bytes.len() as i64 - start) as usize;
+                    let skip = overlap.min(bytes.len());
+                    last_bytes.extend_from_slice(&bytes[skip..]);
+                }
+                _ => merged.push((start, bytes)),
+            }
+        }
+
+        // Store back as (seq, contiguous bytes) with the leading pad
+        // removed; the queue stays sorted and disjoint.
+        self.out_of_order = merged
+            .into_iter()
+            .map(|(start, bytes)| {
+                let seq = self.recv.nxt.wrapping_add(start as u32);
+                let pad = usize::try_from(start).unwrap_or(0);
+                let tail = if pad < bytes.len() {
+                    bytes[pad..].to_vec()
+                } else {
+                    Vec::new()
+                };
+                (seq, tail)
+            })
+            .filter(|(_, bytes)| !bytes.is_empty())
+            .collect();
+    }
+
+    /// A gap filled: deliver everything the queue now makes
+    /// contiguous, in order (RFC 9293 §3.3.7).
+    fn collapse_ooo(&mut self, reaction: &mut Reaction) {
+        while let Some((seq, held)) = self.out_of_order.first() {
+            if seq.wrapping_sub(self.recv.nxt) != 0 {
+                break;
+            }
+            let held = held.clone();
+            self.recv.nxt = self.recv.nxt.wrapping_add(held.len() as u32);
+            reaction.delivered.extend_from_slice(&held);
+            self.out_of_order.remove(0);
+        }
+    }
+
+    /// The SACK blocks to advertise (RFC 6675 §3: the segments the
+    /// receiver holds, newest first, at most three, in the option
+    /// layout [left, right] edge pairs relative to RCV.NXT).
+    pub fn sack_blocks(&self) -> [(u32, u32); 3] {
+        let mut blocks = [(0u32, 0u32); 3];
+        for (slot, (seq, held)) in self.out_of_order.iter().rev().take(3).enumerate() {
+            blocks[slot] = (
+                seq.wrapping_sub(self.recv.nxt),
+                seq.wrapping_add(held.len() as u32)
+                    .wrapping_sub(self.recv.nxt),
+            );
+        }
+        blocks
+    }
+
+    /// Whether the peer advertised a zero window on its latest ACK.
+    pub fn peer_window_zero(&self) -> bool {
+        self.peer_window_zero
+    }
+
+    /// Duplicate ACKs since the last advance (RFC 9293 §3.3.6).
+    pub fn duplicate_acks(&self) -> u32 {
+        self.dup_acks
+    }
+
     /// The MSS this connection advertises (RFC 9293 §3.7.1).
     pub fn mss(&self) -> u16 {
         self.mss
+    }
+
+    /// Oldest unacknowledged sequence number (SND.UNA): what the
+    /// sender's retransmission timer is armed over.
+    pub fn send_una(&self) -> u32 {
+        self.send.una
     }
 
     /// Mark the host's FIN as sent; the emitter calls this once the
@@ -468,4 +651,113 @@ impl NativeTcpConnection {
 /// Re-export for callers that inspect flags on reactions.
 pub fn flags_of(reaction: &Reaction) -> u8 {
     reaction.flags
+}
+
+fn payload_len_u32(inbound: &Inbound<'_>) -> u32 {
+    inbound.payload.len() as u32
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Drive one data segment into a fresh established connection.
+    fn established() -> ServerConnection {
+        let mut connection = ServerConnection::new(1000, 536);
+        let syn = Inbound {
+            seq: 5000,
+            ack: 0,
+            flags: ctl::SYN,
+            payload: &[],
+        };
+        let _ = connection.on_segment(&syn);
+        // The emitter books the SYN's sequence consumption; the unit
+        // test plays that role by hand.
+        connection.send_advance(1);
+        let ack = Inbound {
+            seq: 5001,
+            ack: 1001,
+            flags: ctl::ACK,
+            payload: &[],
+        };
+        let _ = connection.on_segment(&ack);
+        assert_eq!(connection.state(), TcpState::Established);
+        connection
+    }
+
+    fn data<'a>(seq: u32, bytes: &'a [u8]) -> Inbound<'a> {
+        Inbound {
+            seq,
+            ack: 1001,
+            flags: ctl::ACK,
+            payload: bytes,
+        }
+    }
+
+    #[test]
+    fn gap_holds_then_collapse_in_order() {
+        let mut connection = established();
+        // Segment 2 arrives first: held above the gap.
+        let held = connection.on_segment(&data(5006, b"BBBBB"));
+        assert!(held.delivered.is_empty(), "nothing delivers out of order");
+        assert_eq!(connection.ooo_usage(), 5);
+
+        // Segment 1 fills the gap: both deliver in order.
+        let filled = connection.on_segment(&data(5001, b"AAAAA"));
+        assert_eq!(filled.delivered, b"AAAAABBBBB");
+        assert_eq!(connection.ooo_usage(), 0);
+        assert_eq!(connection.recv_nxt(), 5011);
+    }
+
+    #[test]
+    fn overlapping_out_of_order_segments_merge() {
+        let mut connection = established();
+        connection.on_segment(&data(5006, b"BBBBB"));
+        connection.on_segment(&data(5008, b"CCC"));
+        // One merged range, not two stacked copies of the overlap.
+        assert_eq!(connection.out_of_order.len(), 1);
+        let (seq, bytes) = &connection.out_of_order[0];
+        assert_eq!(*seq, 5006);
+        assert_eq!(bytes.as_slice(), b"BBBBBCC");
+    }
+
+    #[test]
+    fn duplicate_below_window_delivers_nothing() {
+        let mut connection = established();
+        let first = connection.on_segment(&data(5001, b"AAAAA"));
+        assert_eq!(first.delivered, b"AAAAA");
+        let again = connection.on_segment(&data(5001, b"AAAAA"));
+        assert!(
+            again.delivered.is_empty(),
+            "retransmission of delivered bytes"
+        );
+        assert_eq!(
+            connection.duplicate_acks(),
+            0,
+            "data-carrying, not a dup ACK"
+        );
+    }
+
+    #[test]
+    fn pure_duplicate_acks_are_counted() {
+        let mut connection = established();
+        for _ in 0..3 {
+            connection.on_segment(&data(5001, b""));
+        }
+        assert_eq!(connection.duplicate_acks(), 3);
+        // A real advance clears the count (RFC 6298 §5.3 spirit).
+        connection.on_segment(&data(5001, b"X"));
+        assert_eq!(connection.duplicate_acks(), 0);
+    }
+
+    #[test]
+    fn sack_blocks_describe_held_ranges() {
+        let mut connection = established();
+        connection.on_segment(&data(5101, b"DDDD"));
+        connection.on_segment(&data(5006, b"BBBB"));
+        let blocks = connection.sack_blocks();
+        // Newest first, edges relative to RCV.NXT (5001).
+        assert_eq!(blocks[0], (100, 104));
+        assert_eq!(blocks[1], (5, 9));
+    }
 }

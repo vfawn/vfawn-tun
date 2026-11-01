@@ -227,6 +227,16 @@ fn wait_scenario(name: &str, variant: u8, segments: usize, segment_len: usize) -
         builder.data(client_seq, server_ack_base, segment_len, 0x42),
     );
     scenario.wait(200);
+    // Acknowledge the full echo so the scenario ends with empty flight
+    // on both sides: the tail-gap recovery data included.
+    let delivered_bytes = segments * segment_len;
+    scenario.inject(
+        10,
+        builder.ack(
+            client_seq + segment_len as u32,
+            server_ack_base + delivered_bytes as u32,
+        ),
+    );
     scenario
 }
 
@@ -615,6 +625,61 @@ fn pcap_replay_dual_stack() {
     };
     assert_eq!(left, rerun);
     let _ = right;
+}
+
+#[test]
+#[ignore = "038 convergence in flight: chaos family"]
+fn native_vs_oracle_chaos() {
+    // Loss, reorder, duplicates, timers: volume two's debt. The bar is
+    // progress-tracked here while the ordered family stays strict.
+    let isn = probe_oracle_isn();
+    SERVER_ISN.store(isn, std::sync::atomic::Ordering::Relaxed);
+    let (_ordered, chaos) = split_corpus();
+    let mut oracle = SmoltcpDriver::new();
+    let mut native = NativeTcpDriver::with_listen_isn(isn);
+    let passed = assert_batch(&chaos, &mut oracle, &mut native, CompareMask::LENIENT);
+    println!("chaos family: {passed}/{}", chaos.len());
+}
+
+#[test]
+#[ignore = "038 debugging: batch-order repro for one scenario"]
+fn batch_state_repro() {
+    // Same driver reuse as the batch: if a scenario passes here but
+    // fails in the batch, state leaks across scenarios.
+    let name = std::env::var("SHAPE").unwrap_or_else(|_| "bulk-1x1-v0".into());
+    let isn = probe_oracle_isn();
+    SERVER_ISN.store(isn, std::sync::atomic::Ordering::Relaxed);
+    let (ordered, _) = split_corpus();
+    let mut oracle = SmoltcpDriver::new();
+    let mut native = NativeTcpDriver::with_listen_isn(isn);
+    let mut before_passed = 0;
+    for scenario in &ordered {
+        if scenario.name == name {
+            println!("reached {name} with {before_passed} prior passes on reused drivers");
+            let outcome =
+                diff::run_differential(scenario, &mut oracle, &mut native, CompareMask::LENIENT);
+            println!("{outcome}");
+            let dump = |driver: &mut dyn StackDriver| {
+                driver.reset(scenario);
+                let mut records = Vec::new();
+                for step in &scenario.steps {
+                    records.extend(driver.step(step));
+                }
+                records.extend(driver.finish());
+                records
+            };
+            println!("oracle-after: {:#?}", dump(&mut oracle));
+            println!("native-after: {:#?}", dump(&mut native));
+            return;
+        }
+        if matches!(
+            diff::run_differential(scenario, &mut oracle, &mut native, CompareMask::LENIENT),
+            diff::DiffOutcome::Identical { .. }
+        ) {
+            before_passed += 1;
+        }
+    }
+    panic!("scenario {name} not in the ordered family");
 }
 
 #[test]
