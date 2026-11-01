@@ -87,7 +87,7 @@ impl PacketDevice for ChaoticDevice {
         }
         mangle(&mut staged, &mut self.rng.lock().expect("rng lock"));
         let delivered = staged.len().min(bufs.len());
-        for (slot, packet) in bufs.iter_mut().zip(staged.into_iter()) {
+        for (slot, packet) in bufs.iter_mut().zip(staged) {
             *slot = packet;
         }
         Ok(delivered)
