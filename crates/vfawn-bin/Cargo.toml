@@ -20,4 +20,10 @@ vfawn-platform = { path = "../vfawn-platform" }
 
 [dev-dependencies]
 criterion = "0.5"
+bytes.workspace = true
+vfawn-stack-user = { path = "../vfawn-stack-user", features = ["backend-native"] }
 vfawn-testsuite = { path = "../vfawn-testsuite" }
+
+[[bench]]
+name = "dispatch"
+harness = false
