@@ -628,17 +628,16 @@ fn pcap_replay_dual_stack() {
 }
 
 #[test]
-#[ignore = "038 convergence in flight: chaos family"]
 fn native_vs_oracle_chaos() {
-    // Loss, reorder, duplicates, timers: volume two's debt. The bar is
-    // progress-tracked here while the ordered family stays strict.
+    // Loss, reorder, duplicates, timers: the chaos family must match
+    // whole, the same bar as the ordered one.
     let isn = probe_oracle_isn();
     SERVER_ISN.store(isn, std::sync::atomic::Ordering::Relaxed);
     let (_ordered, chaos) = split_corpus();
     let mut oracle = SmoltcpDriver::new();
     let mut native = NativeTcpDriver::with_listen_isn(isn);
     let passed = assert_batch(&chaos, &mut oracle, &mut native, CompareMask::LENIENT);
-    println!("chaos family: {passed}/{}", chaos.len());
+    assert_eq!(passed, chaos.len(), "the chaos family must match whole");
 }
 
 #[test]

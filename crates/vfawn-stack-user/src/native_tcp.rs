@@ -112,6 +112,14 @@ pub struct Reaction {
     pub window: u16,
     /// Bytes handed to the application, in order.
     pub delivered: Vec<u8>,
+    /// The segment was held above a receive gap: the reply is a
+    /// duplicate acknowledgment, and the sender wants it immediately,
+    /// not folded into whatever data is waiting to leave.
+    pub held: bool,
+    /// This delivery collapsed segments held above a gap: the
+    /// acknowledgment advances past held data, which is news worth its
+    /// own segment before any application data rides out.
+    pub gap_filled: bool,
 }
 
 impl Reaction {
@@ -122,6 +130,8 @@ impl Reaction {
             flags: 0,
             window: 0,
             delivered: Vec::new(),
+            held: false,
+            gap_filled: false,
         }
     }
 
@@ -132,6 +142,8 @@ impl Reaction {
             flags,
             window,
             delivered: Vec::new(),
+            held: false,
+            gap_filled: false,
         }
     }
 }
@@ -295,11 +307,21 @@ impl ServerConnection {
         if !self.acceptable(inbound.seq, length) {
             // RFC 9293 §3.3.5: an unacceptable segment draws an ACK
             // restating the current window so the peer resynchronizes.
-            return Reaction::segment(self.send.nxt, self.recv.nxt, ctl::ACK, self.recv.window);
+            let mut reply =
+                Reaction::segment(self.send.nxt, self.recv.nxt, ctl::ACK, self.recv.window);
+            reply.held = !self.out_of_order.is_empty();
+            return reply;
         }
         if inbound.has(ctl::ACK) && !self.ack_acceptable(inbound.ack) {
-            // Old duplicate ACK: nothing to do (RFC 9293 §3.3.6,
-            // unacceptable ACKs in ESTABLISHED).
+            // Split by direction (RFC 9293 §3.3.6 and §3.6.2's
+            // challenge-ACK practice): an ACK below SND.UNA is an old
+            // duplicate worth silence; an ACK beyond SND.NXT credits
+            // data never sent, and the answer restates both ends of
+            // our sequence space so the peer resynchronizes.
+            let beyond_sent = inbound.ack.wrapping_sub(self.send.nxt) < u32::MAX / 2;
+            if beyond_sent {
+                return Reaction::segment(self.send.nxt, self.recv.nxt, ctl::ACK, self.recv.window);
+            }
             return Reaction::silent();
         }
         let mut reaction = Reaction::silent();
@@ -318,6 +340,8 @@ impl ServerConnection {
                 self.dup_acks += 1;
             }
         }
+
+        let held_before = !self.out_of_order.is_empty();
 
         // Segment text (RFC 9293 §3.3.7): in-order payload delivers
         // immediately; a gap opens the out-of-order queue, and the
@@ -373,6 +397,7 @@ impl ServerConnection {
         // with FIN+ACK so teardown scenarios complete in one volume;
         // RFC 9293 §3.5 prescribes the same bytes.
         let answer_fin = self.fin_received && !self.fin_sent && self.state == TcpState::Established;
+        let held_now = !self.out_of_order.is_empty() && !delivered_any;
         reaction.seq = self.send.nxt;
         reaction.ack = self.recv.nxt;
         reaction.flags = if answer_fin {
@@ -383,6 +408,8 @@ impl ServerConnection {
             ctl::ACK
         };
         reaction.window = self.recv.window;
+        reaction.held = held_now;
+        reaction.gap_filled = held_before && delivered_any;
         reaction
     }
 

@@ -189,6 +189,8 @@ impl NativeTcpDriver {
                 flags: if more_after { 0x10 } else { 0x18 },
                 window: 65535,
                 delivered: Vec::new(),
+                held: false,
+                gap_filled: false,
             };
             let frame = emit_v4(
                 self.server,
@@ -270,7 +272,11 @@ impl NativeTcpDriver {
         let send = reaction;
         let echo_pending = !self.echo_backlog.is_empty();
         let bare_ack_only = ctl_ack_only(send.flags);
-        if send.flags != 0 && !(echo_pending && bare_ack_only) {
+        // A duplicate acknowledgment for a held segment is a signal the
+        // sender retransmit now; delaying it behind queued data would
+        // stall the gap fill, so it never folds.
+        let immediate = (send.held || send.gap_filled) && bare_ack_only;
+        if send.flags != 0 && (immediate || !(echo_pending && bare_ack_only)) {
             let frame = emit_v4(self.server, self.client, &send, &[]);
             if let Some(record) = self.record_of(&frame) {
                 records.push(record);
@@ -300,6 +306,8 @@ impl NativeTcpDriver {
                     flags: if more_after { 0x10 } else { 0x18 },
                     window: 65535,
                     delivered: Vec::new(),
+                    held: false,
+                    gap_filled: false,
                 };
                 let frame = emit_v4(self.server, self.client, &send, data);
                 if let Some(record) = self.record_of(&frame) {

@@ -137,6 +137,8 @@ impl TcpSlot {
                     flags: if more_after { 0x10 } else { 0x18 },
                     window: 65535,
                     delivered: Vec::new(),
+                    held: false,
+                    gap_filled: false,
                 };
                 let frame = emit_v4(self.server, self.client, &reaction, &remaining[..take]);
                 out.push_back(BytesMut::from(&frame[..]));
