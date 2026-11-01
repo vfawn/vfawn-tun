@@ -38,10 +38,13 @@ pub struct NativeTcpDriver {
     /// How many times the SYN-ACK has been retransmitted; drives the
     /// exponential backoff.
     synack_retries: u32,
-    /// Sent-but-unacknowledged data in flight: (seq, bytes) chunks in
-    /// order. The peer's ACKs prune the front; the RTO resends the
-    /// earliest chunk (RFC 6298 §3).
-    in_flight: VecDeque<(u32, Vec<u8>)>,
+    /// The send buffer as one contiguous stream from `flight_base`
+    /// (the send sequence space of RFC 9293 §3.3.4): application
+    /// writes append, acknowledgments prune the front, and the RTO
+    /// resends MSS-sized pieces from the base, exactly how a socket
+    /// send buffer behaves.
+    flight: Vec<u8>,
+    flight_base: u32,
     /// When the earliest in-flight chunk was (re)sent, and how many
     /// retries have happened (the timeout doubles per retry, §5).
     data_sent_at: Option<u64>,
@@ -64,7 +67,8 @@ impl NativeTcpDriver {
             connection: NativeTcpConnection::new(listen_isn, DEFAULT_MSS),
             synack_at: None,
             synack_retries: 0,
-            in_flight: VecDeque::new(),
+            flight: Vec::new(),
+            flight_base: 0,
             data_sent_at: None,
             data_retries: 0,
             server: std::net::SocketAddrV4::new(std::net::Ipv4Addr::UNSPECIFIED, 0),
@@ -94,7 +98,8 @@ impl StackDriver for NativeTcpDriver {
         self.echo_backlog.clear();
         self.synack_at = None;
         self.synack_retries = 0;
-        self.in_flight.clear();
+        self.flight.clear();
+        self.flight_base = 0;
         self.data_sent_at = None;
         self.data_retries = 0;
         self.now_ms = 0;
@@ -152,11 +157,11 @@ impl NativeTcpDriver {
     /// bytes go out again. One second initial, doubling per retry
     /// (§5), matching the oracle's visible behavior.
     fn data_retransmit_fired(&mut self) -> Vec<SegmentRecord> {
-        let Some((seq, chunk)) = self.in_flight.front().cloned() else {
+        if self.flight.is_empty() {
             self.data_sent_at = None;
             self.data_retries = 0;
             return Vec::new();
-        };
+        }
         let Some(sent_at) = self.data_sent_at else {
             self.data_sent_at = Some(self.now_ms);
             return Vec::new();
@@ -168,28 +173,33 @@ impl NativeTcpDriver {
         self.data_retries += 1;
         self.data_sent_at = Some(self.now_ms);
 
-        // Resend the earliest chunk, MSS-sized like the original.
+        // Resend from the earliest unacknowledged byte in MSS-sized
+        // pieces (RFC 6298 §3 over the byte stream, not per write):
+        // application writes that arrived between segments have
+        // coalesced here, exactly like the oracle's socket buffer.
         let mut records = Vec::new();
-        let mut remaining = chunk.as_slice();
-        let mut cursor = seq;
-        while !remaining.is_empty() {
-            let take = remaining
-                .len()
-                .min(self.connection.connection.mss() as usize);
-            let more_after = remaining.len() > take;
+        let mss = self.connection.connection.mss() as usize;
+        let mut offset = 0usize;
+        while offset < self.flight.len() {
+            let take = (self.flight.len() - offset).min(mss);
+            let more_after = offset + take < self.flight.len();
             let reaction = Reaction {
-                seq: cursor,
+                seq: self.flight_base.wrapping_add(offset as u32),
                 ack: self.connection.connection.recv_nxt(),
                 flags: if more_after { 0x10 } else { 0x18 },
                 window: 65535,
                 delivered: Vec::new(),
             };
-            let frame = emit_v4(self.server, self.client, &reaction, &remaining[..take]);
+            let frame = emit_v4(
+                self.server,
+                self.client,
+                &reaction,
+                &self.flight[offset..offset + take],
+            );
             if let Some(record) = self.record_of(&frame) {
                 records.push(record);
             }
-            cursor = cursor.wrapping_add(take as u32);
-            remaining = &remaining[take..];
+            offset += take;
         }
         records
     }
@@ -225,19 +235,18 @@ impl NativeTcpDriver {
         // sent moves nothing (RFC 9293 §3.3.6), and honoring it would
         // drop data the wire still owes.
         let una = self.connection.connection.send_una();
-        while let Some((seq, chunk)) = self.in_flight.front().cloned() {
-            let end = seq.wrapping_add(chunk.len() as u32);
-            let acked_past_end = una.wrapping_sub(end) < u32::MAX / 2;
-            let acked_exactly = una == end;
-            if acked_past_end || acked_exactly {
-                self.in_flight.pop_front();
-            } else {
-                break;
+        if !self.flight.is_empty() {
+            let end = self.flight_base.wrapping_add(self.flight.len() as u32);
+            let fully_acked = una == end || una.wrapping_sub(end) < u32::MAX / 2;
+            if fully_acked {
+                self.flight.clear();
+                self.data_sent_at = None;
+                self.data_retries = 0;
+            } else if una.wrapping_sub(self.flight_base) < u32::MAX / 2 {
+                let drop = (una.wrapping_sub(self.flight_base) as usize).min(self.flight.len());
+                self.flight.drain(..drop);
+                self.flight_base = una;
             }
-        }
-        if self.in_flight.is_empty() {
-            self.data_sent_at = None;
-            self.data_retries = 0;
         }
         if reaction.flags & 0x12 == 0x12 && reaction.delivered.is_empty() {
             self.synack_at = Some(self.now_ms);
@@ -296,10 +305,13 @@ impl NativeTcpDriver {
                 if let Some(record) = self.record_of(&frame) {
                     records.push(record);
                 }
-                // The sender remembers what is outstanding until the
-                // peer acknowledges past it (RFC 6298 §2: the RTO is
-                // over the earliest unacked byte).
-                self.in_flight.push_back((send.seq, data.to_vec()));
+                // The send buffer grows with what the application wrote;
+                // the RTO is armed over the earliest unacknowledged byte
+                // (RFC 6298 §2).
+                if self.flight.is_empty() {
+                    self.flight_base = send.seq;
+                }
+                self.flight.extend_from_slice(data);
                 self.data_sent_at = Some(self.now_ms);
                 self.data_retries = 0;
                 self.connection.connection.send_advance(take as u32);
