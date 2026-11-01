@@ -143,11 +143,17 @@ pub fn start(
                         std::thread::sleep(std::time::Duration::from_millis(1));
                     }
                     Ok(count) => {
+                        // The buffer moves into the channel: a clone here
+                        // was one full-packet copy per packet on the
+                        // hottest path in the process. The device refills
+                        // taken buffers on the next read.
                         for buf in bufs.iter_mut().take(count) {
                             if let Some(engine) = reader_dns.as_ref() {
                                 engine.hijack(buf);
                             }
-                            if rx_tx.is_closed() || rx_tx.blocking_send(buf.clone()).is_err() {
+                            if rx_tx.is_closed()
+                                || rx_tx.blocking_send(std::mem::take(buf)).is_err()
+                            {
                                 return;
                             }
                         }

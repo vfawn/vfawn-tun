@@ -111,9 +111,14 @@ impl StackBackend for IpstackBackend {
                 let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
                     // Multi-thread, not current-thread: ipstack stream
                     // teardown calls `block_in_place` on drop, which the
-                    // current-thread flavor rejects outright.
+                    // current-thread flavor rejects outright. Worker
+                    // count follows the machine: sessions are tasks and
+                    // two workers left a many-core box mostly idle.
+                    let workers = std::thread::available_parallelism()
+                        .map(|n| n.get())
+                        .unwrap_or(2);
                     let rt = tokio::runtime::Builder::new_multi_thread()
-                        .worker_threads(2)
+                        .worker_threads(workers)
                         .enable_all()
                         .build()
                         .expect("ipstack runtime");

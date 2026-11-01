@@ -54,6 +54,10 @@ pub struct DnsHijack {
     virtual_v6: Option<Ipv6Addr>,
     /// Client endpoint and protocol to the destination it really used.
     flows: Mutex<HashMap<FlowKey, IpAddr>>,
+    /// Mirror of the map's occupancy, maintained under the same lock and
+    /// read without one: with no captured flows there is nothing any
+    /// reply needs, and the per-packet parse in `restore` is pure cost.
+    occupied: std::sync::atomic::AtomicUsize,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -81,6 +85,7 @@ impl DnsHijack {
             virtual_v4,
             virtual_v6,
             flows: Mutex::new(HashMap::new()),
+            occupied: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -123,6 +128,11 @@ impl DnsHijack {
 
     /// Rewrite a packet leaving the stack back toward the client.
     pub fn restore(&self, packet: &mut [u8]) -> bool {
+        if self.occupied.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+            // No hijacked flow has ever asked for its address back, so
+            // no reply can need rewriting; skip the parse entirely.
+            return false;
+        }
         match packet.first().copied().map(|b| b >> 4) {
             Some(4) => self.restore_v4(packet),
             Some(6) => self.restore_v6(packet),
@@ -286,6 +296,8 @@ impl DnsHijack {
             flows.clear();
         }
         flows.insert(key, original);
+        self.occupied
+            .store(flows.len(), std::sync::atomic::Ordering::Relaxed);
     }
 
     fn lookup(&self, key: FlowKey) -> Option<IpAddr> {
