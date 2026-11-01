@@ -13,6 +13,7 @@ workspace = true
 async-trait = "0.1"
 tokio = { version = "1", features = ["net", "io-util", "rt-multi-thread", "macros", "time"] }
 ipnet.workspace = true
+socket2 = { workspace = true, features = ["all"] }
 vfawn-core = { path = "../vfawn-core" }
 vfawn-device = { path = "../vfawn-device" }
 vfawn-stack-user = { path = "../vfawn-stack-user", optional = true }

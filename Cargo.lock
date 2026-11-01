@@ -1264,6 +1264,8 @@ dependencies = [
  "async-trait",
  "bytes",
  "ipnet",
+ "socket2 0.5.10",
+ "tokio",
  "vfawn-core",
  "vfawn-device",
  "vfawn-platform",

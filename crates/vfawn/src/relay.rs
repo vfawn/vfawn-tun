@@ -23,6 +23,32 @@ use vfawn_core::{FlowInfo, IcmpPacket, Network, SessionHandler, TcpSession, UdpS
 /// device that spawned its session.
 pub type Protect = Arc<dyn Fn(RawFd) -> io::Result<()> + Send + Sync>;
 
+async fn dial_tcp(
+    protect: &Option<Protect>,
+    destination: std::net::SocketAddr,
+) -> io::Result<tokio::net::TcpStream> {
+    let domain = if destination.is_ipv4() {
+        socket2::Domain::IPV4
+    } else {
+        socket2::Domain::IPV6
+    };
+    let socket = socket2::Socket::new(domain, socket2::Type::STREAM, Some(socket2::Protocol::TCP))?;
+    if let Some(protect) = protect {
+        protect(socket.as_raw_fd())?;
+    }
+    // The blocking connect off the async workers: the socket keeps the
+    // device binding across it, and the result returns to async land.
+    let connected = tokio::task::spawn_blocking(move || -> io::Result<std::net::TcpStream> {
+        let address = socket2::SockAddr::from(destination);
+        socket.connect(&address)?;
+        socket.set_nonblocking(true)?;
+        Ok(std::net::TcpStream::from(socket))
+    })
+    .await
+    .map_err(|e| io::Error::other(e.to_string()))??;
+    tokio::net::TcpStream::from_std(connected)
+}
+
 /// A session handler that connects to whatever destination each flow
 /// carried and relays bytes.
 pub struct RelayHandler {
@@ -52,19 +78,12 @@ impl SessionHandler for RelayHandler {
     async fn on_tcp(&self, mut session: TcpSession) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let destination = session.flow().destination;
-        let mut outbound = match tokio::net::TcpStream::connect(destination).await {
+        let mut outbound = match dial_tcp(&self.protect, destination).await {
             Ok(stream) => stream,
-            Err(e) => {
-                eprintln!("relay: dial {destination}: {e}");
+            Err(_) => {
                 return;
             }
         };
-        if let Some(protect) = &self.protect
-            && let Err(e) = protect(outbound.as_raw_fd())
-        {
-            eprintln!("relay: protect the dial: {e}");
-            return;
-        }
 
         let mut up = [0u8; 16384];
         let mut down = [0u8; 16384];
@@ -101,9 +120,10 @@ impl SessionHandler for RelayHandler {
         {
             return;
         }
-        if socket.connect(peer).await.is_err() {
-            return;
-        }
+        // Deliberately not connected: the origin may answer from any of
+        // its addresses (the kernel picks one by route), and a connected
+        // socket would drop exactly those replies as source mismatches.
+        let _ = peer;
         let mut from_client = [0u8; 1500];
         let mut from_origin = [0u8; 1500];
         loop {
@@ -112,15 +132,15 @@ impl SessionHandler for RelayHandler {
                     Err(_) => break,
                     Ok((0, _)) => {}
                     Ok((n, _)) => {
-                        if socket.send(&from_client[..n]).await.is_err() {
+                        if socket.send_to(&from_client[..n], peer).await.is_err() {
                             break;
                         }
                     }
                 },
-                answered = socket.recv(&mut from_origin) => match answered {
+                answered = socket.recv_from(&mut from_origin) => match answered {
                     Err(_) => break,
-                    Ok(0) => {}
-                    Ok(n) => {
+                    Ok((0, _)) => {}
+                    Ok((n, _)) => {
                         let client = session.flow().source;
                         if session.send(&from_origin[..n], &client).await.is_err() {
                             break;
