@@ -16,6 +16,8 @@
 //! route engine owns the kernel state around them.
 
 #[cfg(feature = "backend-native")]
+pub mod native_tcp;
+#[cfg(feature = "backend-native")]
 pub mod shards;
 
 #[cfg(feature = "backend-ipstack")]
@@ -25,5 +27,7 @@ pub mod ipstack_bridge;
 
 #[cfg(feature = "backend-ipstack")]
 pub use ipstack_backend::IpstackBackend;
+#[cfg(feature = "backend-native")]
+pub use native_tcp::{Inbound, NativeTcpConnection, Reaction, ServerConnection, TcpState, emit_v4};
 #[cfg(feature = "backend-native")]
 pub use shards::{ShardConfig, Shards, SlotLogic, UdpEcho};

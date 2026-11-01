@@ -14,6 +14,7 @@ pub mod diff_smoltcp;
 pub mod fuzz_injector;
 pub mod loopback;
 pub mod mock_device;
+pub mod native_tcp_driver;
 pub mod pcap_device;
 pub mod pcap_writer;
 pub mod script;

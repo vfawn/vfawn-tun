@@ -11,6 +11,7 @@ workspace = true
 
 [dependencies]
 smoltcp.workspace = true
+vfawn-stack-user = { path = "../vfawn-stack-user", features = ["backend-native"] }
 vfawn-core = { path = "../vfawn-core" }
 bytes.workspace = true
 pcap-file.workspace = true

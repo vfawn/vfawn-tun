@@ -22,6 +22,7 @@ use vfawn_testsuite::diff::{
     self, CompareMask, Scenario, StackDriver, assert_batch, corpus_client, corpus_server,
 };
 use vfawn_testsuite::diff_smoltcp::SmoltcpDriver;
+use vfawn_testsuite::native_tcp_driver::NativeTcpDriver;
 use vfawn_testsuite::{PcapDevice, Script};
 
 /// Builds client-side packets for a scenario at a given variant.
@@ -96,14 +97,25 @@ fn recompute_tcp_checksum(packet: &mut [u8]) {
     packet[20 + 17] = fixed as u8;
 }
 
-/// Handshake completion: the server's ISN our scripts must acknowledge.
-/// The oracle's ISN is derived from its clock and address inputs; to
-/// keep scenarios independent of it, every data phase is built after a
-/// probe step that returns the server's SYN-ACK. To stay declarative
-/// here, scripts instead acknowledge a fixed server ISN (1000) because
-/// the oracle's Config carries random_seed 0, making ISNs deterministic.
+/// The server ISN the corpus scripts acknowledge: probed from the
+/// oracle's own first SYN-ACK once, before the corpus is built, so
+/// every client ACK lands in both stacks' acknowledgment space.
+static SERVER_ISN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1000);
+
 fn server_isn() -> u32 {
-    1000
+    SERVER_ISN.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// One oracle handshake, read the ISN off its SYN-ACK, pin it for the
+/// whole corpus. Deterministic under seed 0, so once is enough.
+fn probe_oracle_isn() -> u32 {
+    let mut oracle = SmoltcpDriver::new();
+    let probe = handshake_scenario("isn-probe", 0, 0);
+    oracle.reset(&probe);
+    for step in &probe.steps {
+        oracle.step(step);
+    }
+    oracle.listen_isn.expect("the oracle completed a handshake")
 }
 
 fn handshake_scenario(name: &str, variant: u8, syn_retransmits: u32) -> Scenario {
@@ -156,6 +168,15 @@ fn transfer_scenario(
         let delay = if position == 0 { 10 } else { 5 };
         scenario.inject(delay, packet);
     }
+
+    // Acknowledge the echo so both stacks end the scenario with empty
+    // flight: without it the oracle's retransmission timer fires during
+    // the final drain, which is 038's family, not this volume's.
+    let sent_bytes = segments * segment_len;
+    scenario.inject(
+        10,
+        builder.ack(client_seq, server_ack_base + sent_bytes as u32),
+    );
 
     match teardown {
         Teardown::None => {}
@@ -394,6 +415,48 @@ fn oracle_self_identity() {
     );
 }
 
+/// The scenario families, named for the volume that owes them:
+/// ordered traffic is 037's debt (handshake and in-window data),
+/// chaos (loss, reorder, duplicates, timers under stress) is 038's.
+fn split_corpus() -> (Vec<Scenario>, Vec<Scenario>) {
+    let all = corpus();
+    let mut ordered = Vec::new();
+    let mut chaos = Vec::new();
+    for scenario in all {
+        let name = &scenario.name;
+        let chaotic = name.contains("loss-")
+            || name.contains("reorder-")
+            || name.contains("rto-")
+            || name.contains("dup-")
+            || name.contains("window-zero");
+        if chaotic {
+            chaos.push(scenario);
+        } else {
+            ordered.push(scenario);
+        }
+    }
+    (ordered, chaos)
+}
+
+#[test]
+#[ignore = "037 convergence in flight: ordered family at 32/118"]
+fn native_vs_oracle_handshake_and_data() {
+    let isn = probe_oracle_isn();
+    SERVER_ISN.store(isn, std::sync::atomic::Ordering::Relaxed);
+    // The player takes the field: the same corpus, the same referee,
+    // the in-house stack on one side and the oracle on the other. The
+    // mask starts lenient (window policies mature after volume two);
+    // everything sequence-bearing is strict from day one.
+    let (ordered, _chaos) = split_corpus();
+    let mut oracle = SmoltcpDriver::new();
+    let mut native = NativeTcpDriver::with_listen_isn(isn);
+    let passed = assert_batch(&ordered, &mut oracle, &mut native, CompareMask::LENIENT);
+    println!(
+        "native vs oracle (ordered family): {passed}/{}",
+        ordered.len()
+    );
+}
+
 #[test]
 fn oracle_determinism_run_to_run() {
     // Determinism across whole-batch reruns: any nondeterminism in the
@@ -510,4 +573,61 @@ fn corpus_runs_fast() {
         passed as f64 / elapsed.as_secs_f64().max(0.000001)
     );
     assert!(elapsed.as_millis() < 1000, "corpus took {:?}", elapsed);
+}
+
+/// Dump both sides' records for one named scenario: the debugging
+/// companion while volume one converges.
+fn shape_of(name: &str) {
+    let isn = probe_oracle_isn();
+    SERVER_ISN.store(isn, std::sync::atomic::Ordering::Relaxed);
+    let scenarios = corpus();
+    let scenario = scenarios
+        .iter()
+        .find(|s| s.name == name)
+        .expect("scenario exists");
+    let run = |driver: &mut dyn StackDriver| {
+        driver.reset(scenario);
+        let mut records = Vec::new();
+        for step in &scenario.steps {
+            records.extend(driver.step(step));
+        }
+        records.extend(driver.finish());
+        records
+    };
+    let mut oracle = SmoltcpDriver::new();
+    let mut native = NativeTcpDriver::with_listen_isn(isn);
+    println!("oracle: {:#?}", run(&mut oracle));
+    println!("native: {:#?}", run(&mut native));
+}
+
+#[test]
+fn syn_only_probe_shapes() {
+    // What each side emits for a bare SYN: the shapes must meet before
+    // the corpus can say anything. Print, do not assert, for debugging
+    // volume one into agreement.
+    let isn = probe_oracle_isn();
+    SERVER_ISN.store(isn, std::sync::atomic::Ordering::Relaxed);
+    let scenario = handshake_scenario("probe", 0, 0);
+    let mut oracle = SmoltcpDriver::new();
+    oracle.reset(&scenario);
+    let mut left = Vec::new();
+    for step in &scenario.steps {
+        left.extend(oracle.step(step));
+    }
+    left.extend(oracle.finish());
+    let mut native = NativeTcpDriver::with_listen_isn(isn);
+    native.reset(&scenario);
+    let mut right = Vec::new();
+    for step in &scenario.steps {
+        right.extend(native.step(step));
+    }
+    right.extend(native.finish());
+    println!("oracle: {left:?}");
+    println!("native: {right:?}");
+}
+
+#[test]
+#[ignore = "debugging companion for 037; SHAPE=<scenario> selects"]
+fn bulk_shape_dump() {
+    shape_of(&std::env::var("SHAPE").unwrap_or_else(|_| "bulk-1x1-v0".into()));
 }

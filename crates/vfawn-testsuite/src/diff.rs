@@ -304,20 +304,26 @@ pub fn assert_batch(
 ) -> usize {
     let mut passed = 0;
     let mut first_failure: Option<String> = None;
+    let mut failures = 0usize;
     for scenario in scenarios {
         match run_differential(scenario, expected, actual, mask) {
             DiffOutcome::Identical { .. } => passed += 1,
             other => {
+                failures += 1;
+                // Only the first report is kept: appending every failure
+                // into one string made the report itself quadratic and
+                // the batch appear to hang.
                 if first_failure.is_none() {
                     first_failure = Some(format!("{other}"));
-                } else {
-                    first_failure = Some(format!("{first_failure:?}\n{other}"));
                 }
             }
         }
     }
     if let Some(report) = first_failure {
-        panic!("{passed}/{} passed\n{report}", scenarios.len());
+        panic!(
+            "{passed}/{} passed ({failures} failed)\n{report}",
+            scenarios.len()
+        );
     }
     passed
 }

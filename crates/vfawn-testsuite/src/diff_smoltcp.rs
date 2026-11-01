@@ -123,6 +123,10 @@ impl EchoApp {
 
 /// The smoltcp oracle driver.
 pub struct SmoltcpDriver {
+    /// The ISN the oracle drew for this scenario's connection, read off
+    /// its first SYN-ACK; the differential corpus needs the value both
+    /// sides acknowledge.
+    pub listen_isn: Option<u32>,
     device: LoopDevice,
     iface: Interface,
     sockets: SocketSet<'static>,
@@ -148,6 +152,7 @@ impl SmoltcpDriver {
         let mut sockets = SocketSet::new(vec![]);
         let tcp = sockets.add(socket);
         Self {
+            listen_isn: None,
             device,
             iface,
             sockets,
@@ -224,6 +229,7 @@ impl StackDriver for SmoltcpDriver {
         self.tcp = tcp;
         self.now_ms = 0;
         self.listen_port = scenario.server.port();
+        self.listen_isn = None;
         self.app = EchoApp::new();
     }
 
@@ -255,10 +261,17 @@ impl StackDriver for SmoltcpDriver {
 impl SmoltcpDriver {
     fn drain(&mut self) -> Vec<SegmentRecord> {
         let frames: Vec<Vec<u8>> = std::mem::take(&mut self.device.emitted);
-        frames
+        let records: Vec<SegmentRecord> = frames
             .iter()
             .filter_map(|frame| parse_record(frame, self.now_ms))
-            .collect()
+            .collect();
+        if self.listen_isn.is_none()
+            && let Some(record) = records.first()
+            && record.flags & 0x12 == 0x12
+        {
+            self.listen_isn = Some(record.seq);
+        }
+        records
     }
 }
 
