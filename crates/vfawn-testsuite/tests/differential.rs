@@ -243,7 +243,9 @@ fn window_scenario(name: &str, variant: u8, freeze: bool) -> Scenario {
         scenario.inject(5, builder.window0(client_seq, server_ack_base));
         scenario.wait(400);
     }
-    scenario.inject(5, builder.ack(client_seq, server_ack_base).clone());
+    // Acknowledge the echo so the ordered family carries no unacked
+    // flight into the final drain (retransmission is 038's family).
+    scenario.inject(5, builder.ack(client_seq, server_ack_base + 400));
     scenario.wait(100);
     scenario
 }
@@ -439,7 +441,6 @@ fn split_corpus() -> (Vec<Scenario>, Vec<Scenario>) {
 }
 
 #[test]
-#[ignore = "037 convergence in flight: ordered family at 32/118"]
 fn native_vs_oracle_handshake_and_data() {
     let isn = probe_oracle_isn();
     SERVER_ISN.store(isn, std::sync::atomic::Ordering::Relaxed);
@@ -575,6 +576,32 @@ fn corpus_runs_fast() {
     assert!(elapsed.as_millis() < 1000, "corpus took {:?}", elapsed);
 }
 
+/// Verify every injected packet's transport checksum: a scenario whose
+/// own packets fail verification would poison both sides differently
+/// and look like a stack bug.
+fn checksums_of(name: &str) {
+    let scenarios = corpus();
+    let scenario = scenarios
+        .iter()
+        .find(|s| s.name == name)
+        .expect("scenario exists");
+    for (index, step) in scenario.steps.iter().enumerate() {
+        if let vfawn_testsuite::diff::Step::Inject { packet, .. } = step {
+            let src = std::net::Ipv4Addr::new(packet[12], packet[13], packet[14], packet[15]);
+            let dst = std::net::Ipv4Addr::new(packet[16], packet[17], packet[18], packet[19]);
+            let verdict = vfawn_wire::checksum::verify_transport_v4(
+                src,
+                dst,
+                vfawn_wire::protocol::IpProtocol::Tcp,
+                &packet[20..],
+            );
+            let seq = u32::from_be_bytes([packet[24], packet[25], packet[26], packet[27]]);
+            let ack = u32::from_be_bytes([packet[28], packet[29], packet[30], packet[31]]);
+            println!("step {index}: seq={seq} ack={ack} checksum={verdict}");
+        }
+    }
+}
+
 /// Dump both sides' records for one named scenario: the debugging
 /// companion while volume one converges.
 fn shape_of(name: &str) {
@@ -630,4 +657,10 @@ fn syn_only_probe_shapes() {
 #[ignore = "debugging companion for 037; SHAPE=<scenario> selects"]
 fn bulk_shape_dump() {
     shape_of(&std::env::var("SHAPE").unwrap_or_else(|_| "bulk-1x1-v0".into()));
+}
+
+#[test]
+#[ignore = "debugging companion; SHAPE=<scenario> selects"]
+fn checksum_dump() {
+    checksums_of(&std::env::var("SHAPE").unwrap_or_else(|_| "bulk-2x100-v0".into()));
 }

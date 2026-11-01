@@ -220,6 +220,12 @@ impl StackDriver for SmoltcpDriver {
         socket
             .listen(scenario.server.port())
             .expect("oracle listen");
+        // Nagle off: the bed compares state machines, and volume-one
+        // native implements no Nagle. The algorithm arrives in 038 on
+        // both sides or neither; enabled only here it holds the
+        // oracle's small echoes and diverges every multi-segment
+        // record.
+        socket.set_nagle_enabled(false);
         let mut sockets = SocketSet::new(vec![]);
         let tcp = sockets.add(socket);
 

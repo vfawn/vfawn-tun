@@ -20,6 +20,11 @@ use vfawn_wire::tcp::TcpHeader;
 
 use crate::diff::{Scenario, SegmentRecord, StackDriver, Step};
 
+/// The default maximum segment size when the peer offers no MSS
+/// option (RFC 9293 §3.7.1: 536 octets for IPv4); the corpus SYNs
+/// carry no options, and the oracle chunks by the same default.
+pub const DEFAULT_MSS: u16 = 536;
+
 /// The listen ISN is a constructor input, not entropy: the differential
 /// bed probes the oracle's ISN once and hands the same value here, so
 /// both stacks live in one acknowledgment space. The shard integration
@@ -48,7 +53,7 @@ impl NativeTcpDriver {
 
     pub fn with_listen_isn(listen_isn: u32) -> Self {
         Self {
-            connection: NativeTcpConnection::new(listen_isn, 1460),
+            connection: NativeTcpConnection::new(listen_isn, DEFAULT_MSS),
             synack_at: None,
             synack_retries: 0,
             server: std::net::SocketAddrV4::new(std::net::Ipv4Addr::UNSPECIFIED, 0),
@@ -72,7 +77,7 @@ impl StackDriver for NativeTcpDriver {
 
     fn reset(&mut self, scenario: &Scenario) {
         let listen_isn = self.connection.server_isn;
-        self.connection = NativeTcpConnection::new(listen_isn, 1460);
+        self.connection = NativeTcpConnection::new(listen_isn, DEFAULT_MSS);
         self.server = scenario.server;
         self.client = scenario.client;
         self.echo_backlog.clear();
@@ -189,12 +194,18 @@ impl NativeTcpDriver {
         while let Some(chunk) = self.echo_backlog.pop_front() {
             let mut remaining = chunk.as_slice();
             while !remaining.is_empty() {
-                let take = remaining.len().min(1460);
+                let take = remaining
+                    .len()
+                    .min(self.connection.connection.mss() as usize);
                 let data = &remaining[..take];
+                // PSH rides the final chunk of the application write
+                // only (the oracle pushes once per write, not per
+                // segment); earlier chunks are plain data-carrying ACKs.
+                let more_after = remaining.len() > take || !self.echo_backlog.is_empty();
                 let send = Reaction {
                     seq: self.connection.connection.send_nxt(),
                     ack: self.connection.connection.recv_nxt(),
-                    flags: 0x18, // PSH|ACK: data the peer can hand up
+                    flags: if more_after { 0x10 } else { 0x18 },
                     window: 65535,
                     delivered: Vec::new(),
                 };

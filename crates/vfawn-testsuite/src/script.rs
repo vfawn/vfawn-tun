@@ -46,6 +46,13 @@ impl Script {
         packet.extend_from_slice(&[0x00, 0x00]); // checksum, fixed below
         packet.extend_from_slice(&[0x00, 0x00]); // urgent
 
+        // The payload joins the packet before any checksum runs: the
+        // transport checksum covers it, and computing it over the bare
+        // header happened to pass only for all-zero payloads, which is
+        // how the bug survived every zero-filled consumer until a stack
+        // that verifies checksums met a nonzero one.
+        packet.extend_from_slice(payload);
+
         let ipv4_sum = checksum(&packet[..20]);
         packet[10] = (ipv4_sum >> 8) as u8;
         packet[11] = ipv4_sum as u8;
@@ -59,8 +66,6 @@ impl Script {
         let segment_sum = checksum_with_carry(pseudo, &packet[20..]);
         packet[36] = (segment_sum >> 8) as u8;
         packet[37] = segment_sum as u8;
-
-        packet.extend_from_slice(payload);
         packet
     }
 
