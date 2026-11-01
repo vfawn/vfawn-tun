@@ -183,7 +183,8 @@ impl SmoltcpDriver {
 
     fn drain_emitted(&mut self) {
         PENDING_TX.with(|tx| {
-            self.device.emitted.extend(tx.borrow_mut().drain(..));
+            let pending = std::mem::take(&mut *tx.borrow_mut());
+            self.device.emitted.extend(pending);
         });
     }
 }
@@ -253,7 +254,7 @@ impl StackDriver for SmoltcpDriver {
 
 impl SmoltcpDriver {
     fn drain(&mut self) -> Vec<SegmentRecord> {
-        let frames: Vec<Vec<u8>> = self.device.emitted.drain(..).collect();
+        let frames: Vec<Vec<u8>> = std::mem::take(&mut self.device.emitted);
         frames
             .iter()
             .filter_map(|frame| parse_record(frame, self.now_ms))
