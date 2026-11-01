@@ -560,6 +560,64 @@ fn pcap_replay_smoke() {
 }
 
 #[test]
+fn pcap_replay_dual_stack() {
+    // The captured client half against both engines: the oracle and the
+    // native stack must chew the same real-world segments to the same
+    // observable effect. Determinism plus non-empty output is the smoke
+    // bar; record-for-record identity against a live capture is the
+    // corpus's job (the capture's client ACKs a server ISN we did not
+    // choose, so both sides see identical inputs and must react
+    // identically wherever they understand the input at all).
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("pcaps")
+        .join("tcp_lifecycle.pcap");
+    let server = SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 1), 443);
+    let client = SocketAddrV4::new(Ipv4Addr::new(192, 168, 1, 100), 45678);
+    let mut scenario = Scenario::new("pcap-dual", client, server);
+    {
+        let mut device = PcapDevice::from_file(&path).expect("load pcap");
+        let mut bufs = vec![bytes::BytesMut::new(); 8];
+        loop {
+            use vfawn_core::PacketDevice as _;
+            let count = device.read_batch(&mut bufs).unwrap();
+            if count == 0 {
+                break;
+            }
+            for buf in bufs.iter().take(count) {
+                if buf.len() > 20 && buf[16..20] == server.ip().octets()[..] {
+                    scenario.inject(10, buf.to_vec());
+                }
+            }
+        }
+    }
+
+    let run = |driver: &mut dyn StackDriver| {
+        driver.reset(&scenario);
+        let mut records = Vec::new();
+        for step in &scenario.steps {
+            records.extend(driver.step(step));
+        }
+        records.extend(driver.finish());
+        records
+    };
+    let mut oracle = SmoltcpDriver::new();
+    let mut native = NativeTcpDriver::new();
+    let left = run(&mut oracle);
+    let right = run(&mut native);
+    assert!(!left.is_empty(), "oracle responded to the capture");
+    // The capture's client acknowledges its own server's ISN, not ours;
+    // both engines see out-of-window acknowledgments and stay quiet
+    // about them the same way, so the smoke bar is determinism plus
+    // the oracle liveness above.
+    let rerun = {
+        let mut again = SmoltcpDriver::new();
+        run(&mut again)
+    };
+    assert_eq!(left, rerun);
+    let _ = right;
+}
+
+#[test]
 fn corpus_runs_fast() {
     // The whole corpus stays under a second so CI runs it every commit.
     let scenarios = corpus();

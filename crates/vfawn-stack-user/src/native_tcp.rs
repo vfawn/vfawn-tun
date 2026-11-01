@@ -349,6 +349,12 @@ impl ServerConnection {
         self.mss
     }
 
+    /// Mark the host's FIN as sent; the emitter calls this once the
+    /// FIN segment has left.
+    pub fn mark_fin_sent(&mut self) {
+        self.fin_sent = true;
+    }
+
     /// Next sequence number to send (SND.NXT): the emitter's cursor.
     pub fn send_nxt(&self) -> u32 {
         self.send.nxt
@@ -364,6 +370,22 @@ impl ServerConnection {
     /// sequence space).
     pub fn send_advance(&mut self, consumed: u32) {
         self.send.nxt = self.send.nxt.wrapping_add(consumed);
+    }
+
+    /// The FIN the host's shutdown triggers: sent at SND.NXT with the
+    /// current acknowledgment (RFC 9293 §3.5, active close's first
+    /// step). Volume one folds the peer-FIN answer into ESTABLISHED
+    /// handling; this is the host-initiated half.
+    pub fn fin_reaction(&self) -> Reaction {
+        if self.fin_sent || self.state != TcpState::Established {
+            return Reaction::silent();
+        }
+        Reaction::segment(
+            self.send.nxt,
+            self.recv.nxt,
+            ctl::FIN | ctl::ACK,
+            self.send.window,
+        )
     }
 
     /// The SYN-ACK to retransmit while the handshake waits for the

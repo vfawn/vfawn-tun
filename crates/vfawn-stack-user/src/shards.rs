@@ -215,6 +215,9 @@ pub struct Slot {
     pub logic: Box<dyn SlotLogic>,
 }
 
+/// The slot constructor a backend supplies: one call per new flow.
+pub type LogicFactory = Arc<dyn Fn(&vfawn_wire::flow::FlowKey) -> Box<dyn SlotLogic> + Send + Sync>;
+
 /// Per-slot behavior. The in-house TCP (037) is the real
 /// implementation; the UDP echo below proves the plumbing.
 pub trait SlotLogic: Send {
@@ -231,6 +234,11 @@ pub trait SlotLogic: Send {
 
     /// A timer this slot scheduled has fired.
     fn on_timer(&mut self, _out: &mut VecDeque<BytesMut>, _pool: &BufferPool) {}
+
+    /// A loop cycle with no inbound work. Sessions whose host wrote
+    /// since the last packet have no packet to ride on; this is their
+    /// turn.
+    fn on_idle(&mut self, _out: &mut VecDeque<BytesMut>) {}
 }
 
 /// One scheduled wake-up for a slot.
@@ -360,7 +368,7 @@ impl Shards {
         read_device: Box<dyn PacketDevice>,
         write_device: Box<dyn PacketDevice>,
         config: ShardConfig,
-        logic: Arc<dyn Fn() -> Box<dyn SlotLogic> + Send + Sync>,
+        logic: LogicFactory,
     ) -> Self {
         let shard_count = config.shards.max(1);
         let pool = Arc::new(BufferPool::new());
@@ -599,7 +607,7 @@ fn shard_loop(
     stopped: Arc<AtomicBool>,
     counter: Arc<AtomicU64>,
     pool: Arc<BufferPool>,
-    logic: Arc<dyn Fn() -> Box<dyn SlotLogic> + Send + Sync>,
+    logic: LogicFactory,
     config: ShardConfig,
 ) {
     let mut connections: HashMap<FlowKey, Slot> = HashMap::new();
@@ -620,9 +628,9 @@ fn shard_loop(
                 let Some(flow) = flow_key(packet) else {
                     continue;
                 };
-                let slot = connections.entry(flow).or_insert_with(|| Slot {
+                let slot = connections.entry(flow).or_insert_with_key(|flow| Slot {
                     bypass: false,
-                    logic: logic(),
+                    logic: logic(flow),
                 });
                 if slot.bypass {
                     // The fast-path hook: packets of a bypassed session
@@ -653,6 +661,18 @@ fn shard_loop(
             did_work = true;
             let mut outbox = outbox.lock().expect("outbox lock");
             outbox.extend(pending.drain(..));
+        }
+
+        if !did_work {
+            // Idle sweep: host writes that arrived without a packet to
+            // ride still deserve their turn on the wire.
+            for slot in connections.values_mut() {
+                slot.logic.on_idle(&mut pending);
+            }
+            if !pending.is_empty() {
+                let mut outbox = outbox.lock().expect("outbox lock");
+                outbox.extend(pending.drain(..));
+            }
         }
 
         if !did_work && !wake.load(Ordering::Acquire) {

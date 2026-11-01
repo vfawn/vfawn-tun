@@ -32,7 +32,7 @@ fn start(count: usize) -> (Shards, MockDevice) {
             mtu: 1500,
             ..ShardConfig::default()
         },
-        std::sync::Arc::new(|| Box::new(UdpEcho)),
+        std::sync::Arc::new(|_| Box::new(UdpEcho)),
     );
     (shards, device)
 }
