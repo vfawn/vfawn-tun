@@ -183,17 +183,28 @@ impl SlotLogic for TcpSlot {
                 .send_advance(u32::from(reaction.flags & 0x03 != 0));
         }
 
-        if self.connection.state() == TcpState::Closed {
-            let _ = self.to_host.send(HostEvent::Closed);
-        } else {
-            self.drain_writes(out);
+        // Half-close (RFC 9293 §3.5): the peer's FIN ends its
+        // direction; the host's read side sees EOF while its write
+        // lane stays open, so the write drain continues in
+        // CLOSE-WAIT. Full closure keeps the same event.
+        match self.connection.state() {
+            TcpState::CloseWait | TcpState::Closed => {
+                let _ = self.to_host.send(HostEvent::Closed);
+            }
+            _ => {
+                self.drain_writes(out);
+            }
         }
     }
 
     fn on_idle(&mut self, out: &mut VecDeque<BytesMut>) {
         // Host writes that arrived after the last packet: their only
-        // ride is this idle sweep.
-        if self.connection.state() == TcpState::Established {
+        // ride is this idle sweep; CLOSE-WAIT writes still leave
+        // (half-close: the answer direction stays ours).
+        if matches!(
+            self.connection.state(),
+            TcpState::Established | TcpState::CloseWait
+        ) {
             self.drain_writes(out);
         }
     }

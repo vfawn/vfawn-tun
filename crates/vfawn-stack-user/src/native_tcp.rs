@@ -393,20 +393,17 @@ impl ServerConnection {
             return Reaction::silent();
         }
 
-        // Acknowledge what just landed. The passive close answers FIN
-        // with FIN+ACK so teardown scenarios complete in one volume;
-        // RFC 9293 §3.5 prescribes the same bytes.
-        let answer_fin = self.fin_received && !self.fin_sent && self.state == TcpState::Established;
+        // Acknowledge what just landed. A peer FIN is acknowledged on
+        // its own and closes only the peer's direction (RFC 9293 §3.5:
+        // half-close is first-class); our FIN leaves when the host
+        // shuts down, not automatically.
+        if inbound.has(ctl::FIN) && self.state == TcpState::Established {
+            self.state = TcpState::CloseWait;
+        }
         let held_now = !self.out_of_order.is_empty() && !delivered_any;
         reaction.seq = self.send.nxt;
         reaction.ack = self.recv.nxt;
-        reaction.flags = if answer_fin {
-            self.fin_sent = true;
-            self.state = TcpState::LastAck;
-            ctl::FIN | ctl::ACK
-        } else {
-            ctl::ACK
-        };
+        reaction.flags = ctl::ACK;
         reaction.window = self.recv.window;
         reaction.held = held_now;
         reaction.gap_filled = held_before && delivered_any;
@@ -560,9 +557,14 @@ impl ServerConnection {
     }
 
     /// Mark the host's FIN as sent; the emitter calls this once the
-    /// FIN segment has left.
+    /// FIN segment has left. With the peer's FIN already in, the
+    /// connection enters LAST-ACK and waits only for its own
+    /// acknowledgment (RFC 9293 §3.5, the passive closer's exit).
     pub fn mark_fin_sent(&mut self) {
         self.fin_sent = true;
+        if self.state == TcpState::CloseWait {
+            self.state = TcpState::LastAck;
+        }
     }
 
     /// Next sequence number to send (SND.NXT): the emitter's cursor.
@@ -587,7 +589,7 @@ impl ServerConnection {
     /// step). Volume one folds the peer-FIN answer into ESTABLISHED
     /// handling; this is the host-initiated half.
     pub fn fin_reaction(&self) -> Reaction {
-        if self.fin_sent || self.state != TcpState::Established {
+        if self.fin_sent || !matches!(self.state, TcpState::Established | TcpState::CloseWait) {
             return Reaction::silent();
         }
         Reaction::segment(
