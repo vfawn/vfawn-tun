@@ -9,6 +9,8 @@
 //! code reaches the product dependency tree.
 
 pub mod clock;
+pub mod diff;
+pub mod diff_smoltcp;
 pub mod fuzz_injector;
 pub mod loopback;
 pub mod mock_device;

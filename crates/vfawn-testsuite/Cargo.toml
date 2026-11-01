@@ -10,6 +10,7 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+smoltcp.workspace = true
 vfawn-core = { path = "../vfawn-core" }
 bytes.workspace = true
 pcap-file.workspace = true
