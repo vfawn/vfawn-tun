@@ -61,6 +61,51 @@ pub struct TcpHeader {
     pub header_len: usize,
 }
 
+/// The SYN options this stack reads (RFC 9293 §3.7.1's MSS, RFC 7323
+/// §2.2's window scale). Everything else walks past unread.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SynOptions {
+    pub mss: Option<u16>,
+    pub wscale: Option<u8>,
+}
+
+/// Parse a TCP segment's option region (between the fixed header and
+/// the data-offset boundary). A malformed length ends the walk the way
+/// a receiving stack would: with what it found so far.
+pub fn syn_options(segment: &[u8]) -> SynOptions {
+    let mut options = SynOptions::default();
+    if segment.len() < MIN_HEADER {
+        return options;
+    }
+    let end = ((segment[12] >> 4) as usize) * 4;
+    if end > segment.len() {
+        return options;
+    }
+    let mut at = MIN_HEADER;
+    while at + 1 < end {
+        match segment[at] {
+            0 => break,
+            1 => at += 1,
+            kind => {
+                let Some(len) = segment.get(at + 1).copied() else {
+                    break;
+                };
+                let len = len as usize;
+                if len < 2 || at + len > end {
+                    break;
+                }
+                if kind == 2 && len == 4 {
+                    options.mss = Some(u16::from_be_bytes([segment[at + 2], segment[at + 3]]));
+                } else if kind == 3 && len == 3 {
+                    options.wscale = Some(segment[at + 2]);
+                }
+                at += len;
+            }
+        }
+    }
+    options
+}
+
 impl TcpHeader {
     /// Parse the header and return it with the segment payload.
     ///
@@ -100,5 +145,68 @@ impl TcpHeader {
             },
             &buf[header_len..],
         ))
+    }
+}
+
+#[cfg(test)]
+mod option_tests {
+    use super::*;
+
+    #[test]
+    fn syn_options_read_mss_wscale_and_walk_others() {
+        let segment = [
+            0u8,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            8 << 4,
+            0x02,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            2,
+            4,
+            0x05,
+            0x78, // MSS 1400
+            4,
+            2, // SACK permitted
+            3,
+            3,
+            7, // window scale 7
+            0, // end of list
+            1,
+            1, // padding
+        ];
+        let options = syn_options(&segment);
+        assert_eq!(options.mss, Some(1400));
+        assert_eq!(options.wscale, Some(7));
+    }
+
+    #[test]
+    fn syn_options_stop_at_malformed_length() {
+        let mut segment = [0u8; 24];
+        segment[12] = 6 << 4;
+        segment[20] = 2;
+        segment[21] = 8; // a lying MSS length
+        let options = syn_options(&segment);
+        assert_eq!(options, SynOptions::default());
+    }
+
+    #[test]
+    fn syn_options_absent_when_header_is_bare() {
+        let mut segment = [0u8; 20];
+        segment[12] = 5 << 4;
+        assert_eq!(syn_options(&segment), SynOptions::default());
     }
 }

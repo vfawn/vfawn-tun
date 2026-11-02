@@ -68,8 +68,6 @@ pub struct SendSpace {
     una: u32,
     /// Next sequence number to send (SND.NXT).
     nxt: u32,
-    /// The window we grant the peer in segments we emit.
-    window: u16,
 }
 
 /// The receive side: everything we accept must land inside
@@ -87,16 +85,24 @@ pub struct Inbound<'a> {
     /// The window the peer advertised on this segment (SND.WND's
     /// source, RFC 9293 §3.1).
     pub window: u16,
+    /// The SYN's offered options, parsed once for the handshake's
+    /// negotiation (MSS and window scale; the rest walked past).
+    pub options: vfawn_wire::tcp::SynOptions,
     pub payload: &'a [u8],
 }
 
 impl<'a> Inbound<'a> {
-    pub fn parse(header: &TcpHeader, payload: &'a [u8]) -> Self {
+    /// Parse an inbound segment from its whole TCP byte range: the
+    /// fixed header ends where the data offset says, the option region
+    /// before that feeds the handshake negotiation.
+    pub fn parse(header: &TcpHeader, segment: &'a [u8]) -> Self {
+        let payload = &segment[header.header_len..];
         Self {
             seq: header.seq,
             ack: header.ack,
             flags: header.flags.bits(),
             window: header.window,
+            options: vfawn_wire::tcp::syn_options(segment),
             payload,
         }
     }
@@ -192,7 +198,24 @@ pub struct ServerConnection {
     /// ignores it blasts past the receiver's buffer, and the excess is
     /// gone for good without retransmission.
     peer_window: u32,
+    /// Window scaling is active (RFC 7323 §2.2: both halves of the
+    /// handshake must have offered it).
+    scaled: bool,
+    /// The peer's shift, applied to every window it advertises after
+    /// the handshake.
+    peer_shift: u8,
 }
+
+/// The window-scale shift this stack offers (RFC 7323 §2.2): the
+/// receive window it commits to absorb is advertised right-shifted by
+/// this amount.
+const OUR_WSCALE: u8 = 7;
+
+/// The receive window this stack commits to absorb, in bytes: what the
+/// advertised field stands for once scaling is active. Delivery to the
+/// host is immediate, so the figure sizes the burst the pipeline may
+/// carry, not a buffer the connection holds.
+const RECEIVE_WINDOW: u32 = 1 << 20;
 
 /// What the sender owes the wire again when the timer fires
 /// (RFC 6298 §3: retransmit the earliest unacknowledged data). The
@@ -211,7 +234,6 @@ impl ServerConnection {
             send: SendSpace {
                 una: listen_isn,
                 nxt: listen_isn,
-                window: 65535,
             },
             recv: RecvSpace {
                 nxt: 0,
@@ -226,6 +248,8 @@ impl ServerConnection {
             retransmit: None,
             peer_window_zero: false,
             peer_window: u32::from(u16::MAX),
+            scaled: false,
+            peer_shift: 0,
         }
     }
 
@@ -255,7 +279,7 @@ impl ServerConnection {
         // The peer's window travels on every segment it sends (RFC 9293
         // §3.1); whoever is past the handshake refreshes the bound.
         if self.state != TcpState::Listen {
-            self.peer_window = u32::from(inbound.window);
+            self.peer_window = u32::from(inbound.window) << self.peer_shift;
             self.peer_window_zero = inbound.window == 0;
         }
         match self.state {
@@ -280,11 +304,21 @@ impl ServerConnection {
         // number, which the emitter books when the segment leaves.
         self.recv.nxt = inbound.seq.wrapping_add(1);
         self.state = TcpState::SynReceived;
+        // The handshake's negotiations: the smaller MSS wins (RFC 9293
+        // §3.7.1), and window scaling needs the peer to have offered
+        // it (RFC 7323 §2.2); the reply then carries our shift.
+        if let Some(offered) = inbound.options.mss {
+            self.mss = self.mss.min(offered);
+        }
+        if let Some(shift) = inbound.options.wscale {
+            self.scaled = true;
+            self.peer_shift = shift.min(14);
+        }
         Reaction::segment(
             self.send.nxt,
             self.recv.nxt,
             ctl::SYN | ctl::ACK,
-            self.send.window,
+            self.advertised_window(),
         )
     }
 
@@ -421,7 +455,7 @@ impl ServerConnection {
         reaction.seq = self.send.nxt;
         reaction.ack = self.recv.nxt;
         reaction.flags = ctl::ACK;
-        reaction.window = self.recv.window;
+        reaction.window = self.advertised_window();
         reaction.held = held_now;
         reaction.gap_filled = held_before && delivered_any;
         reaction
@@ -562,10 +596,32 @@ impl ServerConnection {
         self.dup_acks
     }
 
-    /// The window the peer last advertised (SND.WND): the send bound
-    /// beside the congestion window.
+    /// The window the peer last advertised (SND.WND), scaled when the
+    /// handshake agreed: the send bound beside the congestion window.
     pub fn peer_window(&self) -> u32 {
         self.peer_window
+    }
+
+    /// The 16-bit window field to advertise: right-shifted by our
+    /// offer when scaling is active (RFC 7323 §2.3), raw otherwise.
+    pub fn advertised_window(&self) -> u16 {
+        if self.scaled {
+            (RECEIVE_WINDOW >> OUR_WSCALE) as u16
+        } else {
+            self.recv.window
+        }
+    }
+
+    /// The option bytes the SYN-ACK carries: our MSS always, our
+    /// window-scale shift only when the peer offered scaling.
+    pub fn handshake_options(&self) -> Vec<u8> {
+        let mut options = Vec::with_capacity(8);
+        options.extend_from_slice(&[2, 4]);
+        options.extend_from_slice(&self.mss.to_be_bytes());
+        if self.scaled {
+            options.extend_from_slice(&[3, 3, OUR_WSCALE]);
+        }
+        options
     }
 
     /// The MSS this connection advertises (RFC 9293 §3.7.1).
@@ -619,7 +675,7 @@ impl ServerConnection {
             self.send.nxt,
             self.recv.nxt,
             ctl::FIN | ctl::ACK,
-            self.send.window,
+            self.advertised_window(),
         )
     }
 
@@ -633,7 +689,7 @@ impl ServerConnection {
                 self.send.una,
                 self.recv.nxt,
                 ctl::SYN | ctl::ACK,
-                self.send.window,
+                self.advertised_window(),
             )),
             _ => None,
         }
@@ -647,10 +703,14 @@ pub fn emit_v4(
     src: std::net::SocketAddrV4,
     dst: std::net::SocketAddrV4,
     reaction: &Reaction,
+    options: &[u8],
     payload: &[u8],
 ) -> Vec<u8> {
-    let mut packet = Vec::with_capacity(20 + 20 + payload.len());
-    let total = 20 + 20 + payload.len();
+    // The option region pads to whole words (RFC 9293 §3.1: the data
+    // offset counts them); no-operations are the filler.
+    let options_len = options.len().div_ceil(4) * 4;
+    let mut packet = Vec::with_capacity(20 + 20 + options_len + payload.len());
+    let total = 20 + 20 + options_len + payload.len();
     // IPv4 header (RFC 791): protocol 6, correct total length.
     packet.extend_from_slice(&[0x45, 0x00]);
     packet.extend_from_slice(&(total as u16).to_be_bytes());
@@ -662,18 +722,20 @@ pub fn emit_v4(
     packet.extend_from_slice(&dst.port().to_be_bytes());
     packet.extend_from_slice(&reaction.seq.to_be_bytes());
     packet.extend_from_slice(&reaction.ack.to_be_bytes());
-    packet.push(5 << 4); // data offset: no options in this volume
+    packet.push((((20 + options_len) / 4) as u8) << 4);
     packet.push(reaction.flags);
     packet.extend_from_slice(&reaction.window.to_be_bytes());
     packet.extend_from_slice(&[0, 0]); // checksum, fixed below
     packet.extend_from_slice(&[0, 0]); // urgent pointer
+    packet.extend_from_slice(options);
+    packet.extend(std::iter::repeat_n(1, options_len - options.len())); // NOP padding
     packet.extend_from_slice(payload);
 
     let sum = vfawn_wire::checksum::pseudo_header_v4(
         *src.ip(),
         *dst.ip(),
         IpProtocol::Tcp,
-        (20 + payload.len()) as u32,
+        (20 + options_len + payload.len()) as u32,
     ) + vfawn_wire::checksum::sum_words(&packet[20..]);
     let fixed = !vfawn_wire::checksum::fold(sum);
     packet[36..38].copy_from_slice(&fixed.to_be_bytes());
@@ -721,6 +783,7 @@ mod tests {
             ack: 0,
             flags: ctl::SYN,
             window: 65535,
+            options: Default::default(),
             payload: &[],
         };
         let _ = connection.on_segment(&syn);
@@ -732,6 +795,7 @@ mod tests {
             ack: 1001,
             flags: ctl::ACK,
             window: 65535,
+            options: Default::default(),
             payload: &[],
         };
         let _ = connection.on_segment(&ack);
@@ -745,6 +809,7 @@ mod tests {
             ack: 1001,
             flags: ctl::ACK,
             window: 65535,
+            options: Default::default(),
             payload: bytes,
         }
     }
@@ -774,6 +839,82 @@ mod tests {
         let (seq, bytes) = &connection.out_of_order[0];
         assert_eq!(*seq, 5006);
         assert_eq!(bytes.as_slice(), b"BBBBBCC");
+    }
+
+    #[test]
+    fn window_scaling_negotiates_both_directions() {
+        let mut connection = ServerConnection::new(1000, 1460);
+        let syn = Inbound {
+            seq: 5000,
+            ack: 0,
+            flags: ctl::SYN,
+            window: 64240,
+            options: vfawn_wire::tcp::SynOptions {
+                mss: Some(1200),
+                wscale: Some(7),
+            },
+            payload: &[],
+        };
+        connection.on_segment(&syn);
+        // The smaller MSS wins; the reply carries both offers.
+        assert_eq!(connection.mss(), 1200);
+        let options = connection.handshake_options();
+        assert!(
+            options
+                .windows(4)
+                .any(|w| w[0] == 2 && w[1] == 4 && w[2..4] == 1200u16.to_be_bytes())
+        );
+        assert!(
+            options
+                .windows(3)
+                .any(|w| w[0] == 3 && w[1] == 3 && w[2] == 7)
+        );
+        // The shifted commitment: 1 MiB >> 7.
+        assert_eq!(connection.advertised_window(), 8192);
+
+        // The peer's advertisements scale by its shift: a bare 64240
+        // field is 64240 << 7 bytes of receive room.
+        let ack = Inbound {
+            seq: 5001,
+            ack: 1001,
+            flags: ctl::ACK,
+            window: 64240,
+            options: Default::default(),
+            payload: &[],
+        };
+        connection.on_segment(&ack);
+        assert_eq!(
+            connection.peer_window(),
+            u32::from(64240u16) << 7,
+            "the peer's window applies its offered shift"
+        );
+    }
+
+    #[test]
+    fn without_an_offer_nothing_scales() {
+        let mut connection = ServerConnection::new(1000, 1460);
+        let syn = Inbound {
+            seq: 5000,
+            ack: 0,
+            flags: ctl::SYN,
+            window: 64240,
+            options: Default::default(),
+            payload: &[],
+        };
+        connection.on_segment(&syn);
+        assert_eq!(connection.mss(), 1460, "no MSS offer leaves ours");
+        assert!(!connection.handshake_options().contains(&3));
+        assert_eq!(connection.advertised_window(), 65535);
+        let ack = Inbound {
+            seq: 5001,
+            ack: 1001,
+            flags: ctl::ACK,
+            window: 64240,
+            options: Default::default(),
+            payload: &[],
+        };
+        connection.on_segment(&ack);
+        assert_eq!(connection.peer_window(), u32::from(64240u16));
     }
 
     #[test]

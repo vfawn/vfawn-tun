@@ -148,7 +148,7 @@ impl NativeTcpDriver {
         }
         self.synack_retries += 1;
         self.synack_at = Some(self.now_ms);
-        let frame = emit_v4(self.server, self.client, &reaction, &[]);
+        let frame = emit_v4(self.server, self.client, &reaction, &[], &[]);
         self.record_of(&frame).into_iter().collect()
     }
 
@@ -196,6 +196,7 @@ impl NativeTcpDriver {
                 self.server,
                 self.client,
                 &reaction,
+                &[],
                 &self.flight[offset..offset + take],
             );
             if let Some(record) = self.record_of(&frame) {
@@ -227,10 +228,10 @@ impl NativeTcpDriver {
         if ip.protocol != IpProtocol::Tcp {
             return Reaction::silent();
         }
-        let Ok((header, segment_payload)) = TcpHeader::parse(payload) else {
+        let Ok((header, _rest)) = TcpHeader::parse(payload) else {
             return Reaction::silent();
         };
-        let inbound = Inbound::parse(&header, segment_payload);
+        let inbound = Inbound::parse(&header, payload);
         let reaction = self.connection.connection.on_segment(&inbound);
         // Prune by what the connection actually accepted (SND.UNA),
         // never by the raw ACK field: an acknowledgment beyond what was
@@ -277,7 +278,7 @@ impl NativeTcpDriver {
         // stall the gap fill, so it never folds.
         let immediate = (send.held || send.gap_filled) && bare_ack_only;
         if send.flags != 0 && (immediate || !(echo_pending && bare_ack_only)) {
-            let frame = emit_v4(self.server, self.client, &send, &[]);
+            let frame = emit_v4(self.server, self.client, &send, &[], &[]);
             if let Some(record) = self.record_of(&frame) {
                 records.push(record);
             }
@@ -309,7 +310,7 @@ impl NativeTcpDriver {
                     held: false,
                     gap_filled: false,
                 };
-                let frame = emit_v4(self.server, self.client, &send, data);
+                let frame = emit_v4(self.server, self.client, &send, &[], data);
                 if let Some(record) = self.record_of(&frame) {
                     records.push(record);
                 }

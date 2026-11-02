@@ -197,7 +197,7 @@ impl TcpSlot {
                 drop(lane);
                 let reaction = self.connection.fin_reaction();
                 if reaction.flags != 0 {
-                    let frame = emit_v4(self.server, self.client, &reaction, &[]);
+                    let frame = emit_v4(self.server, self.client, &reaction, &[], &[]);
                     out.push_back(BytesMut::from(&frame[..]));
                     self.connection.mark_fin_sent();
                     self.connection
@@ -214,12 +214,12 @@ impl TcpSlot {
                 seq: self.connection.send_nxt(),
                 ack: self.connection.recv_nxt(),
                 flags: if more_after { 0x10 } else { 0x18 },
-                window: 65535,
+                window: self.connection.advertised_window(),
                 delivered: Vec::new(),
                 held: false,
                 gap_filled: false,
             };
-            let frame = emit_v4(self.server, self.client, &reaction, &write[..take]);
+            let frame = emit_v4(self.server, self.client, &reaction, &[], &write[..take]);
             out.push_back(BytesMut::from(&frame[..]));
             self.connection.send_advance(take as u32);
             let drained_dry = {
@@ -249,7 +249,7 @@ impl SlotLogic for TcpSlot {
         if ip.protocol != IpProtocol::Tcp {
             return;
         }
-        let Ok((header, segment_payload)) = TcpHeader::parse(payload) else {
+        let Ok((header, _segment_payload)) = TcpHeader::parse(payload) else {
             return;
         };
         if !self.judged {
@@ -258,7 +258,7 @@ impl SlotLogic for TcpSlot {
         if self.refused {
             return;
         }
-        let inbound = Inbound::parse(&header, segment_payload);
+        let inbound = Inbound::parse(&header, payload);
         let una_before = self.connection.send_una();
         let reaction = self.connection.on_segment(&inbound);
 
@@ -292,7 +292,14 @@ impl SlotLogic for TcpSlot {
         }
 
         if reaction.flags != 0 {
-            let frame = emit_v4(self.server, self.client, &reaction, &[]);
+            // Only the handshake's SYN-ACK carries options (the MSS
+            // and window-scale offers).
+            let options = if reaction.flags & 0x02 != 0 {
+                self.connection.handshake_options()
+            } else {
+                Vec::new()
+            };
+            let frame = emit_v4(self.server, self.client, &reaction, &options, &[]);
             out.push_back(BytesMut::from(&frame[..]));
             self.connection
                 .send_advance(u32::from(reaction.flags & 0x03 != 0));

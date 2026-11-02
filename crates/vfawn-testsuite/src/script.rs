@@ -23,6 +23,55 @@ impl Script {
     }
 
     /// A minimal IPv4+TCP packet with the given flags and payload.
+    /// A TCP segment carrying option bytes between the fixed header and
+    /// the payload (the handshake's offers): the same framing and
+    /// checksumming as [`Script::tcp`], with the data offset and the
+    /// option padding done right.
+    pub fn tcp_with_options(
+        &self,
+        seq: u32,
+        ack: u32,
+        flags: u8,
+        options: &[u8],
+        payload: &[u8],
+    ) -> Vec<u8> {
+        let padded = options.len().div_ceil(4) * 4;
+        let mut packet = Vec::with_capacity(40 + padded + payload.len());
+        packet.extend_from_slice(&[0x45, 0x00]);
+        packet.extend_from_slice(&((20 + 20 + padded + payload.len()) as u16).to_be_bytes());
+        packet.extend_from_slice(&[0x00, 0x01, 0x00, 0x00]);
+        packet.extend_from_slice(&[64, 0x06]);
+        packet.extend_from_slice(&[0x00, 0x00]);
+        packet.extend_from_slice(&self.client.ip().octets());
+        packet.extend_from_slice(&self.server.ip().octets());
+        packet.extend_from_slice(&self.client.port().to_be_bytes());
+        packet.extend_from_slice(&self.server.port().to_be_bytes());
+        packet.extend_from_slice(&seq.to_be_bytes());
+        packet.extend_from_slice(&ack.to_be_bytes());
+        packet.push((((20 + padded) / 4) as u8) << 4);
+        packet.push(flags);
+        packet.extend_from_slice(&0xffffu16.to_be_bytes());
+        packet.extend_from_slice(&[0x00, 0x00]);
+        packet.extend_from_slice(&[0x00, 0x00]);
+        packet.extend_from_slice(options);
+        packet.extend(std::iter::repeat_n(1, padded - options.len()));
+        packet.extend_from_slice(payload);
+        let ipv4_sum = checksum(&packet[..20]);
+        packet[10] = (ipv4_sum >> 8) as u8;
+        packet[11] = ipv4_sum as u8;
+        let pseudo = pseudo_header(
+            self.client.ip(),
+            self.server.ip(),
+            6,
+            (20 + padded + payload.len()) as u32,
+        );
+        let segment_sum = checksum_with_carry(pseudo, &packet[20..]);
+        let checksum_at = 20 + 16;
+        packet[checksum_at] = (segment_sum >> 8) as u8;
+        packet[checksum_at + 1] = segment_sum as u8;
+        packet
+    }
+
     pub fn tcp(&self, seq: u32, ack: u32, flags: u8, payload: &[u8]) -> Vec<u8> {
         let mut packet = Vec::with_capacity(20 + 20 + payload.len());
 
