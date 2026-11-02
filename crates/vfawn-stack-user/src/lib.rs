@@ -16,6 +16,10 @@
 //! route engine owns the kernel state around them.
 
 #[cfg(feature = "backend-native")]
+pub mod accept;
+#[cfg(feature = "backend-native")]
+pub mod congestion;
+#[cfg(feature = "backend-native")]
 pub mod native_backend;
 #[cfg(feature = "backend-native")]
 pub mod native_tcp;
@@ -27,11 +31,18 @@ pub mod ipstack_backend;
 #[cfg(feature = "backend-ipstack")]
 pub mod ipstack_bridge;
 
+#[cfg(feature = "backend-native")]
+#[cfg(feature = "backend-native")]
+pub use accept::{AcceptQueue, CookieSecret, FixedSecret};
+#[cfg(feature = "backend-native")]
+pub use congestion::{CongestionAlgo, Cubic, Reno, Signal};
 #[cfg(feature = "backend-ipstack")]
 pub use ipstack_backend::IpstackBackend;
 #[cfg(feature = "backend-native")]
 pub use native_backend::NativeBackend;
 #[cfg(feature = "backend-native")]
+#[cfg(feature = "backend-native")]
 pub use native_tcp::{Inbound, NativeTcpConnection, Reaction, ServerConnection, TcpState, emit_v4};
+#[cfg(feature = "backend-native")]
 #[cfg(feature = "backend-native")]
 pub use shards::{ShardConfig, Shards, SlotLogic, UdpEcho};

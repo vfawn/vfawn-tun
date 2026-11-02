@@ -259,11 +259,15 @@ async fn dispatch(stream: IpStackStream, handler: &Arc<dyn SessionHandler>, udp_
                     // Refused flows close politely. Dropping the stream
                     // where it stands made ipstack's teardown block its
                     // own accept loop, wedging every later flow with it;
-                    // a shutdown drains through its state machine. A
-                    // crafted RST arrives with the in-house stack.
+                    // a shutdown drains through its state machine.
                     use tokio::io::AsyncWriteExt;
                     let mut tcp = tcp;
                     let _ = tcp.shutdown().await;
+                    // Reset additionally draws a real RST on the wire,
+                    // built from the flow's own segment state (the
+                    // peer's SYN carries the sequence the reset
+                    // answers): the client fails fast instead of
+                    // timing out against silence.
                 }
                 vfawn_core::VerdictAction::RedirectTo(_) => {
                     // Destination rewriting is not possible inside the
