@@ -4,8 +4,8 @@
 //! The auto-reconciliation loop: when the network changes, drive the
 //! kernel back toward the desired state without human intervention.
 //!
-//! A dedicated thread receives events from the monitor (019), debounces
-//! them, and calls the reconciler (017). The single-flight pattern
+//! A dedicated thread receives events from the monitor, debounces
+//! them, and calls the reconciler. The single-flight pattern
 //! prevents storms: events arriving during an in-progress reconciliation
 //! coalesce into at most one follow-up pass.
 

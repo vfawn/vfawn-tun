@@ -7,8 +7,8 @@
 //! Today both sides are the smoltcp oracle, which validates the referee
 //! itself (identical drivers must produce identical records, and the
 //! harness must be deterministic run to run). When the in-house stack
-//! lands in 037 it implements the same [`StackDriver`] and replaces one
-//! side of every scenario here without the corpus changing at all.
+//! implements the same [`StackDriver`] and replaces one side of every
+//! scenario here without the corpus changing at all.
 //!
 //! Scenario axes: handshake shape, transfer size, loss and reorder
 //! patterns, duplicate deliveries, window starvation, teardown variants,
@@ -171,7 +171,7 @@ fn transfer_scenario(
 
     // Acknowledge the echo so both stacks end the scenario with empty
     // flight: without it the oracle's retransmission timer fires during
-    // the final drain, which is 038's family, not this volume's.
+    // the final drain, which is the chaos family's business.
     let sent_bytes = segments * segment_len;
     scenario.inject(
         10,
@@ -254,7 +254,8 @@ fn window_scenario(name: &str, variant: u8, freeze: bool) -> Scenario {
         scenario.wait(400);
     }
     // Acknowledge the echo so the ordered family carries no unacked
-    // flight into the final drain (retransmission is 038's family).
+    // flight into the final drain (retransmission belongs to the chaos
+    // family).
     scenario.inject(5, builder.ack(client_seq, server_ack_base + 400));
     scenario.wait(100);
     scenario
@@ -427,9 +428,9 @@ fn oracle_self_identity() {
     );
 }
 
-/// The scenario families, named for the volume that owes them:
-/// ordered traffic is 037's debt (handshake and in-window data),
-/// chaos (loss, reorder, duplicates, timers under stress) is 038's.
+/// The scenario families: ordered traffic (handshake and in-window
+/// data) under a strict record comparison, and chaos (loss, reorder,
+/// duplicates, timers under stress) behind the same comparison.
 fn split_corpus() -> (Vec<Scenario>, Vec<Scenario>) {
     let all = corpus();
     let mut ordered = Vec::new();
@@ -520,7 +521,7 @@ fn pcap_replay_smoke() {
     // Real captured segments through the oracle: the driver must chew
     // the client half of tcp_lifecycle.pcap without complaint, and the
     // run must be reproducible. The differential side-by-side with the
-    // in-house stack comes in 037; here the oracle alone proves the
+    // in-house stack covers that elsewhere; here the oracle alone proves the
     // pcap-to-driver plumbing.
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("pcaps")

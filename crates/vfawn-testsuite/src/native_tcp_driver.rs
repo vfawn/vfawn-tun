@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 VFawn contributors
 
 //! The player side: the in-house TCP driven through the same
-//! [`StackDriver`] contract the smoltcp oracle implements, so the 035
+//! [`StackDriver`] contract the smoltcp oracle implements, so the
 //! corpus runs against both without a single scenario changing.
 //!
 //! One connection per scenario (the corpus is single-flow), a fixed
@@ -27,8 +27,8 @@ pub const DEFAULT_MSS: u16 = 536;
 
 /// The listen ISN is a constructor input, not entropy: the differential
 /// bed probes the oracle's ISN once and hands the same value here, so
-/// both stacks live in one acknowledgment space. The shard integration
-/// (037's backend) injects its own policy when the time comes.
+/// both stacks live in one acknowledgment space. The backend injects
+/// its own policy when the time comes.
 pub const DEFAULT_LISTEN_ISN: u32 = 1000;
 
 pub struct NativeTcpDriver {

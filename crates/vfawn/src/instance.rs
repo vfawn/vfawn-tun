@@ -170,7 +170,7 @@ impl Instance {
         // pragmatic answer until the in-house stack lands with one.
         std::thread::sleep(DRAIN_TIMEOUT);
         self.handle = None;
-        // Routing rules outlive a process crash by design (018); they
+        // Routing rules outlive a process crash by design; they
         // must not outlive an orderly shutdown.
         #[cfg(target_os = "linux")]
         if let Some(mut orchestration) = self.orchestration.take() {

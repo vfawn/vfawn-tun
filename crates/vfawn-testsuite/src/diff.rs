@@ -9,7 +9,7 @@
 //! compares ([`SegmentRecord`], the wire-visible effect of a step), and
 //! how a mismatch is reported (first difference, with context). The
 //! oracle implementation lives beside it (`diff_smoltcp`); the in-house
-//! stack implements the same trait in 037 and the same scenarios run
+//! stack implements the same trait and the same scenarios run
 //! unchanged.
 //!
 //! A scenario is a script of steps: inject a packet after some delay, or

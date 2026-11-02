@@ -4,7 +4,7 @@
 //! The in-house TCP, volume one: the state machine from LISTEN through
 //! the handshake into bidirectional data, written against RFC 9293
 //! with a citation on every state transition, and validated segment by
-//! segment against the smoltcp oracle (035's bed).
+//! segment against the smoltcp oracle (the differential bed).
 //!
 //! Scope of this volume, stated plainly: SYN processing and the
 //! handshake sequence, sequence-space bookkeeping (SND.NXT/RCV.NXT and
@@ -12,7 +12,7 @@
 //! receive queue, MSS advertisement, and FIN handling on the passive
 //! side so the teardown scenarios close cleanly. Out-of-order queues,
 //! retransmission timers, SACK, window scaling, and congestion control
-//! arrive in volume two (038); when this volume meets a segment it is
+//! arrive with their volumes; when this volume meets a segment it is
 //! not ready for, the segment is dropped on purpose rather than
 //! guessing.
 //!
@@ -38,8 +38,8 @@ pub mod ctl {
 }
 
 /// A connection's place in the RFC 9293 §3.3.2 state diagram. Only the
-/// states this volume can occupy are listed; the rest arrive with their
-/// features in 038.
+/// states this volume can occupy are listed; the rest arrive with the
+/// features that need them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TcpState {
     /// Waiting for a connection request (the listening side).
@@ -253,7 +253,7 @@ impl ServerConnection {
     /// LISTEN: a SYN opens the handshake (RFC 9293 §3.4: the listener
     /// answers SYN-ACK and moves to SYN-RECEIVED). Anything else from
     /// an unknown peer dies silently in this volume; RST generation for
-    /// it belongs to the accept queue in 039.
+    /// it belongs to the backend that holds the raw segment.
     fn on_listen(&mut self, inbound: &Inbound) -> Reaction {
         if !inbound.has(ctl::SYN) {
             return Reaction::silent();

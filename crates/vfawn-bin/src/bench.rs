@@ -12,7 +12,8 @@
 //!   is what the dispatcher does per packet to pick a shard.
 //!
 //! For connection-cycle rate against the full stack (SYN to FIN), the
-//! harness needs a TUN device and runs under Linux with the 008 script;
+//! harness needs a TUN device and runs under Linux with the netns
+//! script;
 //! these numbers are the deterministic component that can be compared
 //! across machines and CI runs.
 

@@ -127,7 +127,7 @@ impl NftablesBackend {
 }
 
 /// Convenience: run `nft list ruleset` and return lines mentioning vfawn.
-/// Used by the crash-safety scanner (task 018) to find orphan rules.
+/// Used by the crash-safety scanner to find orphan rules.
 pub fn find_vfawn_rules() -> Vec<String> {
     let output = Command::new("nft").args(["list", "ruleset"]).output().ok();
     let Some(output) = output else {

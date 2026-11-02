@@ -26,7 +26,7 @@ pub fn current_default_interface() -> Option<DefaultInterface> {
 /// (IPv6) and /proc/net/route (IPv4, via the fib trie).
 fn interface_addresses(_name: &str) -> Vec<IpAddr> {
     // For M1, return a placeholder; full address enumeration is a route
-    // engine concern (015's snapshot covers it). This list feeds only the
+    // engine concern (the snapshot covers it). This list feeds only the
     // "what to exclude" hint, so empty is safe.
     Vec::new()
 }
