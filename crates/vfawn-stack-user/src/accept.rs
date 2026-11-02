@@ -132,6 +132,18 @@ impl AcceptQueue {
         }
     }
 
+    /// The verdict on a new SYN: the sequence number to answer with,
+    /// or none when the backlog is full and the SYN is dropped (every
+    /// socket layer's honest behavior under a flood it cannot cookie).
+    /// In cookie mode a handout costs nothing, so nothing is refused.
+    pub fn admit(&mut self, source: SocketAddr, now: Instant) -> Option<u32> {
+        if !self.cookies && self.half_open.len() >= self.backlog {
+            return None;
+        }
+        self.on_syn(source, now);
+        Some(self.sequence_for(source, now))
+    }
+
     /// The handshake completed for a flow. In backlog mode the
     /// half-open entry (if any) retires.
     pub fn on_established(&mut self, source: SocketAddr) {
@@ -242,5 +254,25 @@ mod tests {
         queue.on_established(peer);
         assert_eq!(queue.half_open_len(), 0);
         assert_eq!(queue.established_count(), 1);
+    }
+
+    #[test]
+    fn admit_refuses_only_when_the_backlog_is_full() {
+        let mut cookies = AcceptQueue::new(true, 2, Box::new(FixedSecret(0x6)));
+        for port in 40000u16..40020 {
+            assert!(cookies.admit(client(port), now()).is_some());
+        }
+        assert_eq!(cookies.half_open_len(), 0);
+
+        let mut backlog = AcceptQueue::new(false, 2, Box::new(FixedSecret(0x7)));
+        assert!(backlog.admit(client(40040), now()).is_some());
+        assert!(backlog.admit(client(40041), now()).is_some());
+        assert!(
+            backlog.admit(client(40042), now()).is_none(),
+            "a full backlog drops the SYN outright"
+        );
+        // Retirement makes room again.
+        backlog.on_established(client(40040));
+        assert!(backlog.admit(client(40043), now()).is_some());
     }
 }

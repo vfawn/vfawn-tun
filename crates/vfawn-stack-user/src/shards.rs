@@ -17,10 +17,10 @@
 //! * here: batch hand-off (whole device batches split per shard), a
 //!   wake flag so idle shards sleep instead of spin, a per-shard binary
 //!   timer heap, pooled packet buffers, and a per-slot bypass state as
-//!   the hook the payload fast path (039) attaches to;
-//! * not here: any TCP. The slot logic is a trait; 037 implements it
-//!   with the state machine, and until then a UDP echo logic proves the
-//!   plumbing end to end.
+//!   the hook the payload fast path attaches to;
+//! * not here: any TCP. The slot logic is a trait; the native backend
+//!   implements it with the state machine, and a UDP echo logic proves
+//!   the plumbing end to end.
 
 use std::cell::UnsafeCell;
 use std::collections::{BinaryHeap, HashMap, VecDeque};
@@ -210,7 +210,7 @@ pub fn shard_hash_of(flow: &FlowKey, shards: usize) -> usize {
 pub struct Slot {
     /// The payload fast-path hook: once a session enters bypass, the
     /// loop routes its packets to the bypass queue instead of the
-    /// per-segment path. The fast path attaches here in 039.
+    /// per-segment path. The fast path attaches here when it lands.
     pub bypass: bool,
     pub logic: Box<dyn SlotLogic>,
 }
@@ -218,7 +218,7 @@ pub struct Slot {
 /// The slot constructor a backend supplies: one call per new flow.
 pub type LogicFactory = Arc<dyn Fn(&vfawn_wire::flow::FlowKey) -> Box<dyn SlotLogic> + Send + Sync>;
 
-/// Per-slot behavior. The in-house TCP (037) is the real
+/// Per-slot behavior. The in-house TCP is the real
 /// implementation; the UDP echo below proves the plumbing.
 pub trait SlotLogic: Send {
     /// One inbound packet for this flow. Emit replies into `out` using
@@ -505,7 +505,6 @@ impl Shards {
                             }
                         }
                         if !batch.is_empty() {
-                            eprintln!("probe: writer writing {}", batch.len());
                             if device.write_batch(&batch).is_err() {
                                 for packet in batch.drain(..) {
                                     writer_pool.release_packet(packet);
@@ -622,7 +621,6 @@ fn shard_loop(
 
         while let Some(batch) = inbox.pop() {
             did_work = true;
-            eprintln!("probe: shard got batch of {}", batch.len());
             for packet in &batch {
                 counter.fetch_add(1, Ordering::Relaxed);
                 let Some(flow) = flow_key(packet) else {
@@ -635,7 +633,7 @@ fn shard_loop(
                 if slot.bypass {
                     // The fast-path hook: packets of a bypassed session
                     // queue for the splice lane instead of the
-                    // per-segment path. The lane attaches in 039.
+                    // per-segment path. The lane attaches with the fast path.
                     continue;
                 }
                 slot.logic

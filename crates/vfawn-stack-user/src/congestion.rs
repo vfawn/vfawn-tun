@@ -6,7 +6,7 @@
 //!
 //! The trait is two questions and a report: the window in
 //! flight (RFC 5681's cwnd bound), whether an outstanding byte may
-//! leave now (the pacing hook of 039's design note), and what happened
+//! leave now (the pacing hook the payload fast path reserves), and what happened
 //! to the last transmission. Everything else, RTT measurement,
 //! backoff state, slow start versus avoidance, is the algorithm's
 //! private business, so swapping CUBIC for Reno (or BBR in v0.5)
@@ -68,9 +68,13 @@ impl CongestionAlgo for Reno {
         match signal {
             Signal::Acked { newly, .. } => {
                 if self.cwnd < self.ssthresh {
-                    // Slow start: one MSS per acknowledgment
-                    // (RFC 5681 §3.1, exponential ramp).
-                    self.cwnd += mss * newly;
+                    // Slow start: the window grows by the bytes
+                    // acknowledged (RFC 5681 §3.1's one MSS per
+                    // acknowledgment restated in byte units: one
+                    // window's worth of acknowledgments doubles the
+                    // window, whatever size the individual
+                    // acknowledgments are).
+                    self.cwnd = self.cwnd.saturating_add(newly);
                 } else {
                     // Congestion avoidance: one MSS per RTT, spread
                     // over the window's acknowledgments.
@@ -194,8 +198,7 @@ impl CongestionAlgo for Cubic {
         match signal {
             Signal::Acked { newly, .. } => {
                 if self.cwnd < self.ssthresh {
-                    let mss = u32::from(mss);
-                    self.cwnd += mss * newly;
+                    self.cwnd = self.cwnd.saturating_add(newly);
                 } else {
                     self.advance(mss);
                 }
@@ -218,11 +221,15 @@ mod tests {
         algo.on_signal(mss, Signal::Acked { newly, rtt: None });
     }
 
+    fn acked_round(algo: &mut dyn CongestionAlgo, mss: u16) {
+        acked(algo, mss, u32::from(mss));
+    }
+
     #[test]
     fn slow_start_ramps_before_avoidance() {
         let mut reno = Reno::new(1400);
         let start = reno.window();
-        acked(&mut reno, 1400, 1);
+        acked_round(&mut reno, 1400);
         assert!(reno.window() > start, "slow start grows per ack");
         // Threshold below the window flips to avoidance; growth per
         // ack becomes fractional and far slower.
@@ -234,7 +241,7 @@ mod tests {
     fn timeout_collapses_the_window() {
         let mut reno = Reno::new(1400);
         for _ in 0..20 {
-            acked(&mut reno, 1400, 1);
+            acked_round(&mut reno, 1400);
         }
         let grown = reno.window();
         reno.on_signal(1400, Signal::Timeout);
@@ -246,7 +253,7 @@ mod tests {
     fn fast_retransmit_halves_without_full_collapse() {
         let mut reno = Reno::new(1400);
         for _ in 0..20 {
-            acked(&mut reno, 1400, 1);
+            acked_round(&mut reno, 1400);
         }
         reno.on_signal(1400, Signal::FastRetransmit);
         assert_eq!(reno.name(), "reno");
@@ -257,7 +264,7 @@ mod tests {
     fn cubic_recovers_past_w_max() {
         let mut cubic = Cubic::new(1400);
         for _ in 0..40 {
-            acked(&mut cubic, 1400, 1);
+            acked_round(&mut cubic, 1400);
         }
         let grown = cubic.window();
         cubic.on_signal(1400, Signal::FastRetransmit);
@@ -265,9 +272,9 @@ mod tests {
         // Long quiet growth window: the curve must climb past W_max
         // eventually and reset the epoch.
         std::thread::sleep(Duration::from_millis(60));
-        acked(&mut cubic, 1400, 1);
+        acked_round(&mut cubic, 1400);
         std::thread::sleep(Duration::from_millis(60));
-        acked(&mut cubic, 1400, 1);
+        acked_round(&mut cubic, 1400);
         assert!(
             cubic.window() > cubic.ssthresh,
             "time-based growth moves the window"

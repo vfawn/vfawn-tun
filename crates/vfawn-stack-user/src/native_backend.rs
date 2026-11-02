@@ -13,60 +13,54 @@
 //! ownership of the connection table, and this file is the only place
 //! that knows both.
 //!
-//! Volume-one honesty: no retransmission timers beyond the handshake
-//! retry, no out-of-order queue, no congestion control. Flows needing
-//! those today belong on the ipstack backend until 038/039 land.
+//! The slot is where three policy layers attach: the
+//! host's verdict on the flow's first segment (a rejected flow is
+//! answered with a real RST, the debt the transitional backend could
+//! not pay because it never saw the SYN's bytes), the accept layer's
+//! choice of ISN (a SYN cookie in cookie mode, a backlog bound in
+//! the other), and a congestion controller whose window bounds how
+//! much unacknowledged data the write drain may put on the wire.
+//!
+//! Honesty ledger: the session reaches the host only once the
+//! handshake completes, so a spoofed SYN costs a shard slot and
+//! nothing else; loss signals (timeout, fast retransmit) cannot fire
+//! in production yet because retransmission timers ride the shard
+//! timer heap, which is the next wiring, so today the window only
+//! grows and gates.
 
 use std::collections::VecDeque;
 use std::io;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
+use std::time::Instant;
 
 use bytes::BytesMut;
 
 use vfawn_core::{
     FlowInfo, Network, PacketDevice, SessionHandler, StackBackend, StackHandle, TcpSession,
-    TcpTransport,
+    TcpTransport, Verdict,
 };
+use vfawn_wire::emit::tcp_rst_v4;
 use vfawn_wire::flow::FlowKey;
 use vfawn_wire::ipv4::Ipv4Header;
 use vfawn_wire::protocol::IpProtocol;
 use vfawn_wire::tcp::TcpHeader;
 
+use crate::accept::{AcceptQueue, FixedSecret};
+use crate::congestion::{CongestionAlgo, Cubic, Reno, Signal};
 use crate::native_tcp::{Inbound, Reaction, ServerConnection, TcpState, emit_v4};
 use crate::shards::{BufferPool, LogicFactory, ShardConfig, Shards, SlotLogic};
+
+/// The segment size the native stack answers with: RFC 9293 §3.7.1's
+/// default for a peer that sent no MSS option. The TUN's full 1460 is
+/// a bench-time knob once the differential bed grows option parsing.
+const MSS: u16 = 536;
 
 /// What a slot tells the session wrapper.
 enum HostEvent {
     Established,
     Bytes(Vec<u8>),
     Closed,
-}
-
-/// A stable, predictable ISN policy for volume one: the flow tuple
-/// hashed into sequence space. Real per-connection entropy arrives
-/// with the accept queue (039); until then, predictability is what
-/// both the differential bed and the e2e suite rely on.
-fn listen_isn_for(flow: &FlowKey) -> u32 {
-    let mut hash: u64 = 0x9e3779b97f4a7c15;
-    let mut mix = |bytes: &[u8]| {
-        for byte in bytes {
-            hash ^= u64::from(*byte);
-            hash = hash.wrapping_mul(0x100000001b3);
-        }
-    };
-    match flow.src {
-        std::net::IpAddr::V4(a) => mix(&a.octets()),
-        std::net::IpAddr::V6(a) => mix(&a.octets()),
-    }
-    mix(&flow.src_port.to_be_bytes());
-    match flow.dst {
-        std::net::IpAddr::V4(a) => mix(&a.octets()),
-        std::net::IpAddr::V6(a) => mix(&a.octets()),
-    }
-    mix(&flow.dst_port.to_be_bytes());
-    (hash >> 16) as u32
 }
 
 /// The v4 endpoints of a flow, as the emitter wants them.
@@ -80,43 +74,97 @@ fn v4_ends(flow: &FlowKey) -> Option<(std::net::SocketAddrV4, std::net::SocketAd
     ))
 }
 
-/// One flow inside a shard: the connection, its host channels, and the
-/// write backlog the host has queued.
+/// One flow inside a shard: the connection, the congestion controller
+/// that bounds its send side, and the host lane that earns a channel
+/// only when the handshake completes.
 struct TcpSlot {
     connection: ServerConnection,
     client: std::net::SocketAddrV4,
     server: std::net::SocketAddrV4,
-    to_host: mpsc::SyncSender<HostEvent>,
+    handler: Arc<dyn SessionHandler>,
+    accept: Arc<std::sync::Mutex<AcceptQueue>>,
+    sessions: mpsc::SyncSender<SessionHandoff>,
+    flow: FlowInfo,
     /// The lane this slot's host writes arrive on.
     write_lane: Arc<std::sync::Mutex<VecDeque<Vec<u8>>>>,
-    session_open: bool,
+    cc: Box<dyn CongestionAlgo>,
+    /// The host channel, created when the handshake completes. A SYN
+    /// that never completes (a spoofed flood) costs nothing here.
+    to_host: Option<mpsc::SyncSender<HostEvent>>,
+    /// The host verdict runs once, on the flow's first segment.
+    judged: bool,
+    /// A rejected or dropped flow: everything after is swallowed.
+    refused: bool,
 }
 
 impl TcpSlot {
     fn announce(&mut self) {
-        if self.session_open {
+        if self.to_host.is_some() || self.connection.state() != TcpState::Established {
             return;
         }
-        // The handshake completes exactly once; the session wrapper is
-        // created then, not before, so the host never sees a half-open
-        // flow as established.
-        if self.connection.state() == TcpState::Established {
-            self.session_open = true;
-            let _ = self.to_host.send(HostEvent::Established);
+        // The handshake completed; only now does the flow earn a
+        // session. This is the accept layer's other half: state that
+        // never establishes (the spoofed SYN's slot) never reaches the
+        // host, never allocates channels, never spawns a task.
+        let (event_tx, event_rx) = mpsc::sync_channel(1024);
+        let handoff = SessionHandoff {
+            flow: self.flow.clone(),
+            events: event_rx,
+            write_lane: Arc::clone(&self.write_lane),
+        };
+        if self.sessions.send(handoff).is_ok() {
+            let _ = event_tx.send(HostEvent::Established);
+            self.to_host = Some(event_tx);
+            self.accept
+                .lock()
+                .expect("accept lock")
+                .on_established(self.flow.source);
         }
     }
 
-    /// Move host-written backlog bytes into segments.
+    /// The host's verdict on the first segment, with the same panic
+    /// containment as the transitional backend: a panicking judge costs
+    /// its own flow, never the shard. The contract sends no SYN bytes
+    /// (`judge_flow`'s first packet is a payload for UDP only); the
+    /// raw segment stays available for the RST the reject path owes.
+    fn judge(&mut self, packet: &[u8], out: &mut VecDeque<BytesMut>) {
+        self.judged = true;
+        let verdict = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.handler.judge_flow(&self.flow, &[])
+        }))
+        .unwrap_or(Verdict::Drop);
+        match vfawn_core::verdict::execute(verdict, &self.flow) {
+            vfawn_core::verdict::VerdictAction::CreateSession { .. } => {}
+            vfawn_core::verdict::VerdictAction::Reset => {
+                // The debt the transitional backend could not pay: the
+                // raw SYN is right here, so the RST is real (RFC 9293
+                // §3.4, constructed from the offending segment).
+                if let Some(frame) = tcp_rst_v4(packet, *self.server.ip()) {
+                    out.push_back(BytesMut::from(&frame[..]));
+                }
+                self.refused = true;
+            }
+            _ => self.refused = true,
+        }
+    }
+
+    /// Move host-written backlog bytes into segments, never letting
+    /// what is unacknowledged exceed the congestion window (RFC 5681
+    /// §3.1: cwnd bounds SND.NXT minus SND.UNA).
     fn drain_writes(&mut self, out: &mut VecDeque<BytesMut>) {
-        let writes: Vec<Vec<u8>> = self
-            .write_lane
-            .lock()
-            .expect("write lane")
-            .drain(..)
-            .collect();
-        for write in writes {
+        let inflight = self
+            .connection
+            .send_nxt()
+            .wrapping_sub(self.connection.send_una());
+        let mut budget = self.cc.window().saturating_sub(inflight) as usize;
+        let mut lane = self.write_lane.lock().expect("write lane");
+        while let Some(write) = lane.front_mut() {
             if write.is_empty() {
-                // The host's shutdown marker: a FIN after any data.
+                // The host's shutdown marker: a FIN after any data. The
+                // FIN is one byte past the stream and leaves ungated;
+                // a window with no room must not wedge the close.
+                lane.pop_front();
+                drop(lane);
                 let reaction = self.connection.fin_reaction();
                 if reaction.flags != 0 {
                     let frame = emit_v4(self.server, self.client, &reaction, &[]);
@@ -125,25 +173,29 @@ impl TcpSlot {
                     self.connection
                         .send_advance(u32::from(reaction.flags & 0x03 != 0));
                 }
-                continue;
+                return;
             }
-            let mut remaining = write.as_slice();
-            while !remaining.is_empty() {
-                let take = remaining.len().min(self.connection.mss() as usize);
-                let more_after = remaining.len() > take;
-                let reaction = Reaction {
-                    seq: self.connection.send_nxt(),
-                    ack: self.connection.recv_nxt(),
-                    flags: if more_after { 0x10 } else { 0x18 },
-                    window: 65535,
-                    delivered: Vec::new(),
-                    held: false,
-                    gap_filled: false,
-                };
-                let frame = emit_v4(self.server, self.client, &reaction, &remaining[..take]);
-                out.push_back(BytesMut::from(&frame[..]));
-                self.connection.send_advance(take as u32);
-                remaining = &remaining[take..];
+            if budget == 0 {
+                break;
+            }
+            let take = write.len().min(budget).min(self.connection.mss() as usize);
+            let more_after = write.len() > take;
+            let reaction = Reaction {
+                seq: self.connection.send_nxt(),
+                ack: self.connection.recv_nxt(),
+                flags: if more_after { 0x10 } else { 0x18 },
+                window: 65535,
+                delivered: Vec::new(),
+                held: false,
+                gap_filled: false,
+            };
+            let frame = emit_v4(self.server, self.client, &reaction, &write[..take]);
+            out.push_back(BytesMut::from(&frame[..]));
+            self.connection.send_advance(take as u32);
+            write.drain(..take);
+            budget -= take;
+            if write.is_empty() {
+                lane.pop_front();
             }
         }
     }
@@ -166,15 +218,44 @@ impl SlotLogic for TcpSlot {
         let Ok((header, segment_payload)) = TcpHeader::parse(payload) else {
             return;
         };
+        if !self.judged {
+            self.judge(packet, out);
+        }
+        if self.refused {
+            return;
+        }
         let inbound = Inbound::parse(&header, segment_payload);
+        let una_before = self.connection.send_una();
         let reaction = self.connection.on_segment(&inbound);
 
-        if !reaction.delivered.is_empty() {
-            let _ = self
-                .to_host
-                .send(HostEvent::Bytes(reaction.delivered.clone()));
+        // Congestion reporting rides every inbound acknowledgment: the
+        // reaction can be silent when an ACK only moved SND.UNA, but
+        // those are exactly the acknowledgments the window grows on
+        // (RFC 5681 §3.1 counts acknowledgments, not replies). The
+        // half-window guard keeps an old or replayed ACK from looking
+        // like a full wrap of sequence space.
+        if inbound.flags & 0x10 != 0 {
+            let delta = inbound.ack.wrapping_sub(una_before);
+            if delta > 0 && delta < u32::MAX / 2 {
+                self.cc.on_signal(
+                    self.connection.mss(),
+                    Signal::Acked {
+                        newly: delta.min(u32::from(u16::MAX)),
+                        rtt: None,
+                    },
+                );
+            }
         }
+
+        // Establish before delivering: the completing ACK may carry
+        // data, and those bytes need the channel the handshake just
+        // earned.
         self.announce();
+        if let Some(to_host) = &self.to_host
+            && !reaction.delivered.is_empty()
+        {
+            let _ = to_host.send(HostEvent::Bytes(reaction.delivered.clone()));
+        }
 
         if reaction.flags != 0 {
             let frame = emit_v4(self.server, self.client, &reaction, &[]);
@@ -189,7 +270,9 @@ impl SlotLogic for TcpSlot {
         // CLOSE-WAIT. Full closure keeps the same event.
         match self.connection.state() {
             TcpState::CloseWait | TcpState::Closed => {
-                let _ = self.to_host.send(HostEvent::Closed);
+                if let Some(to_host) = &self.to_host {
+                    let _ = to_host.send(HostEvent::Closed);
+                }
             }
             _ => {
                 self.drain_writes(out);
@@ -279,6 +362,16 @@ impl TcpTransport for NativeTcpIo {
 #[derive(Clone)]
 pub struct NativeBackend {
     pub shards: usize,
+    /// Which congestion controller each new connection runs. The type
+    /// is the one `StackConfig.congestion` carries, so a facade hands
+    /// its configured choice straight through.
+    pub congestion: vfawn_core::CongestionAlgo,
+    /// SYN cookies on: every SYN is answered statelessly and the ISN
+    /// carries the proof (RFC 4987 §3.3, the countermeasure the
+    /// reference stacks ship without).
+    pub syn_cookies: bool,
+    /// The half-open bound when cookies are off.
+    pub backlog: usize,
 }
 
 impl Default for NativeBackend {
@@ -288,6 +381,25 @@ impl Default for NativeBackend {
                 .map(|n| n.get())
                 .unwrap_or(4)
                 .min(4),
+            congestion: vfawn_core::CongestionAlgo::default(),
+            syn_cookies: true,
+            backlog: 128,
+        }
+    }
+}
+
+impl NativeBackend {
+    /// One controller source per spawn: each slot builds its own from
+    /// this and owns it, so nothing shared sits between a connection
+    /// and its window. BBR is a v0.5 module; until it exists the
+    /// choice falls back to CUBIC rather than failing a valid
+    /// configuration.
+    fn cc_factory(
+        choice: vfawn_core::CongestionAlgo,
+    ) -> Arc<dyn Fn() -> Box<dyn CongestionAlgo> + Send + Sync> {
+        match choice {
+            vfawn_core::CongestionAlgo::Reno => Arc::new(|| Box::new(Reno::new(MSS))),
+            _ => Arc::new(|| Box::new(Cubic::new(MSS))),
         }
     }
 }
@@ -296,7 +408,8 @@ impl Default for NativeBackend {
 struct SpawnShared {
     handler: Arc<dyn SessionHandler>,
     sessions: mpsc::SyncSender<SessionHandoff>,
-    session_count: AtomicU64,
+    accept: Arc<std::sync::Mutex<AcceptQueue>>,
+    cc_factory: Arc<dyn Fn() -> Box<dyn CongestionAlgo> + Send + Sync>,
 }
 
 /// A ready session handed to the runtime side.
@@ -319,38 +432,51 @@ impl StackBackend for NativeBackend {
         let shared = Arc::new(SpawnShared {
             handler,
             sessions: sessions_tx,
-            session_count: AtomicU64::new(0),
+            accept: Arc::new(std::sync::Mutex::new(AcceptQueue::new(
+                self.syn_cookies,
+                self.backlog,
+                Box::new(FixedSecret(flood_secret())),
+            ))),
+            cc_factory: Self::cc_factory(self.congestion),
         });
 
         let factory_shared = Arc::clone(&shared);
         let logic_factory: LogicFactory = Arc::new(move |flow: &FlowKey| {
-            // Only v4 flows ride volume one; anything else gets a
+            // Only v4 flows ride the native stack; anything else gets a
             // sink slot so the shard keeps flowing.
             let Some((client, server)) = v4_ends(flow) else {
                 return Box::new(SinkSlot) as Box<dyn SlotLogic>;
             };
-            let (event_tx, event_rx) = mpsc::sync_channel(1024);
-            let write_lane = Arc::new(std::sync::Mutex::new(VecDeque::new()));
-            let handoff = SessionHandoff {
-                flow: FlowInfo {
-                    network: Network::Tcp,
-                    source: std::net::SocketAddr::new(flow.src, flow.src_port),
-                    destination: std::net::SocketAddr::new(flow.dst, flow.dst_port),
-                },
-                events: event_rx,
-                write_lane: Arc::clone(&write_lane),
-            };
-            if factory_shared.sessions.send(handoff).is_err() {
+            // The accept layer's say on the new flow: cookie mode
+            // hands every SYN a secret-keyed ISN at no cost, backlog
+            // mode drops the SYN outright once the queue is full.
+            let source = std::net::SocketAddr::new(flow.src, flow.src_port);
+            let Some(isn) = factory_shared
+                .accept
+                .lock()
+                .expect("accept lock")
+                .admit(source, Instant::now())
+            else {
                 return Box::new(SinkSlot) as Box<dyn SlotLogic>;
-            }
-            factory_shared.session_count.fetch_add(1, Ordering::Relaxed);
+            };
+            let write_lane = Arc::new(std::sync::Mutex::new(VecDeque::new()));
             Box::new(TcpSlot {
-                connection: ServerConnection::new(listen_isn_for(flow), 536),
+                connection: ServerConnection::new(isn, MSS),
                 client,
                 server,
-                to_host: event_tx,
+                handler: Arc::clone(&factory_shared.handler),
+                accept: Arc::clone(&factory_shared.accept),
+                sessions: factory_shared.sessions.clone(),
+                flow: FlowInfo {
+                    network: Network::Tcp,
+                    source,
+                    destination: std::net::SocketAddr::new(flow.dst, flow.dst_port),
+                },
                 write_lane,
-                session_open: false,
+                cc: (factory_shared.cc_factory)(),
+                to_host: None,
+                judged: false,
+                refused: false,
             })
         });
 
@@ -407,7 +533,25 @@ impl StackBackend for NativeBackend {
     }
 }
 
-/// A slot that swallows everything: for flows volume one cannot carry.
+/// The cookie secret for one spawn: drawn from the clock and mixed,
+/// so each process run answers SYNs with a different key (RFC 4987
+/// §3.3's rotating secret, taken to process granularity).
+fn flood_secret() -> u32 {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| since.as_nanos() as u64)
+        .unwrap_or(0x9e37_79b9);
+    let mut hash = nanos ^ 0x9e37_79b9_7f4a_7c15;
+    hash ^= hash >> 30;
+    hash = hash.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    hash ^= hash >> 27;
+    hash = hash.wrapping_mul(0x94d0_49bb_1331_11eb);
+    hash ^= hash >> 31;
+    hash as u32
+}
+
+/// A slot that swallows everything: for flows the native stack cannot
+/// carry, and for the SYNs a full backlog refused.
 struct SinkSlot;
 
 impl SlotLogic for SinkSlot {

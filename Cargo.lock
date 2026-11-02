@@ -1361,12 +1361,14 @@ name = "vfawn-bin"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "bytes",
  "criterion",
  "ipnet",
  "tokio",
  "vfawn",
  "vfawn-core",
  "vfawn-platform",
+ "vfawn-stack-user",
  "vfawn-testsuite",
  "vfawn-wire",
 ]
@@ -1453,10 +1455,12 @@ dependencies = [
 name = "vfawn-testsuite"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "bytes",
  "pcap-file",
  "smoltcp",
  "vfawn-core",
+ "vfawn-stack-user",
  "vfawn-wire",
 ]
 
