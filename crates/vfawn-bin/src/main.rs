@@ -20,6 +20,7 @@ fn main() -> ExitCode {
         _ => {
             eprintln!("usage: vfawn-bin <up|bench|cleanup> [options]");
             eprintln!("  up <address/len> [mtu] [--bind-default-iface]");
+            eprintln!("                           [--stack native] in-house stack");
             eprintln!("                           create a TUN and echo sessions");
             eprintln!("  bench                    packet-processing throughput");
             eprintln!("  cleanup                  remove stale route rules (placeholder)");
@@ -30,6 +31,7 @@ fn main() -> ExitCode {
 
 fn up_command(args: &[String]) -> ExitCode {
     let bind_default_iface = args.iter().any(|a| a == "--bind-default-iface");
+    let stack_native = args.windows(2).any(|w| w == ["--stack", "native"]);
     let relay = args.iter().any(|a| a == "--relay");
     let auto_route = args.iter().any(|a| a == "--auto-route");
     let positional: Vec<&String> = args.iter().filter(|a| !a.starts_with("--")).collect();
@@ -48,7 +50,14 @@ fn up_command(args: &[String]) -> ExitCode {
     let worker = std::thread::Builder::new()
         .name("vfawn-up".into())
         .spawn(move || {
-            match vfawn_bin::up::run(&address, mtu, bind_default_iface, relay, auto_route) {
+            match vfawn_bin::up::run(
+                &address,
+                mtu,
+                bind_default_iface,
+                relay,
+                auto_route,
+                stack_native,
+            ) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => {
                     eprintln!("up: {e}");

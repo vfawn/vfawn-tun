@@ -17,11 +17,12 @@ tokio = { workspace = true, features = ["rt", "signal", "macros"] }
 ipnet.workspace = true
 vfawn-wire = { path = "../vfawn-wire" }
 vfawn-platform = { path = "../vfawn-platform" }
+vfawn-device = { path = "../vfawn-device" }
+vfawn-stack-user = { path = "../vfawn-stack-user", features = ["backend-native"] }
 
 [dev-dependencies]
 criterion = "0.5"
 bytes.workspace = true
-vfawn-stack-user = { path = "../vfawn-stack-user", features = ["backend-native"] }
 vfawn-testsuite = { path = "../vfawn-testsuite" }
 
 [[bench]]

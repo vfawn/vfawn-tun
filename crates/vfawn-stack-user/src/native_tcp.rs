@@ -84,6 +84,9 @@ pub struct Inbound<'a> {
     pub seq: u32,
     pub ack: u32,
     pub flags: u8,
+    /// The window the peer advertised on this segment (SND.WND's
+    /// source, RFC 9293 §3.1).
+    pub window: u16,
     pub payload: &'a [u8],
 }
 
@@ -93,6 +96,7 @@ impl<'a> Inbound<'a> {
             seq: header.seq,
             ack: header.ack,
             flags: header.flags.bits(),
+            window: header.window,
             payload,
         }
     }
@@ -182,6 +186,12 @@ pub struct ServerConnection {
     /// zero and a probe is owed (RFC 9293 §3.8.2, persist timer in
     /// volume two's timer module; the flag drives the driver).
     peer_window_zero: bool,
+    /// The peer's advertised receive window (SND.WND, RFC 9293 §3.1),
+    /// taken from the last acceptable segment. The sender's bound is
+    /// the smaller of this and the congestion window; a sender that
+    /// ignores it blasts past the receiver's buffer, and the excess is
+    /// gone for good without retransmission.
+    peer_window: u32,
 }
 
 /// What the sender owes the wire again when the timer fires
@@ -215,6 +225,7 @@ impl ServerConnection {
             dup_acks: 0,
             retransmit: None,
             peer_window_zero: false,
+            peer_window: u32::from(u16::MAX),
         }
     }
 
@@ -241,6 +252,12 @@ impl ServerConnection {
     /// Process one inbound segment and produce the reaction. Every
     /// transition cites the RFC paragraph that prescribes it.
     pub fn on_segment(&mut self, inbound: &Inbound) -> Reaction {
+        // The peer's window travels on every segment it sends (RFC 9293
+        // §3.1); whoever is past the handshake refreshes the bound.
+        if self.state != TcpState::Listen {
+            self.peer_window = u32::from(inbound.window);
+            self.peer_window_zero = inbound.window == 0;
+        }
         match self.state {
             TcpState::Listen => self.on_listen(inbound),
             TcpState::SynReceived => self.on_syn_received(inbound),
@@ -545,6 +562,12 @@ impl ServerConnection {
         self.dup_acks
     }
 
+    /// The window the peer last advertised (SND.WND): the send bound
+    /// beside the congestion window.
+    pub fn peer_window(&self) -> u32 {
+        self.peer_window
+    }
+
     /// The MSS this connection advertises (RFC 9293 §3.7.1).
     pub fn mss(&self) -> u16 {
         self.mss
@@ -697,6 +720,7 @@ mod tests {
             seq: 5000,
             ack: 0,
             flags: ctl::SYN,
+            window: 65535,
             payload: &[],
         };
         let _ = connection.on_segment(&syn);
@@ -707,6 +731,7 @@ mod tests {
             seq: 5001,
             ack: 1001,
             flags: ctl::ACK,
+            window: 65535,
             payload: &[],
         };
         let _ = connection.on_segment(&ack);
@@ -719,6 +744,7 @@ mod tests {
             seq,
             ack: 1001,
             flags: ctl::ACK,
+            window: 65535,
             payload: bytes,
         }
     }

@@ -428,6 +428,47 @@ fn oracle_self_identity() {
     );
 }
 
+/// The corpus through the verdict's five core classes: handshake,
+/// bidirectional data, teardown with half-close, RTO retransmission,
+/// and out-of-order recovery (the held-gap, duplicate-acknowledgment,
+/// SACK-block family). Everything else lands in "rest" and still runs
+/// under the same comparison.
+fn class_of(name: &str) -> &'static str {
+    if name.starts_with("syn-") {
+        "handshake"
+    } else if name.starts_with("bulk-fin") || name.starts_with("bulk-rst") {
+        "teardown"
+    } else if name.starts_with("rto-") {
+        "rto"
+    } else if name.starts_with("loss-") || name.starts_with("reorder-") || name.starts_with("dup-")
+    {
+        "recovery"
+    } else if name.starts_with("bulk-") || name.starts_with("window-flow") {
+        "data"
+    } else {
+        "rest"
+    }
+}
+
+#[test]
+fn corpus_class_table() {
+    let mut table: std::collections::BTreeMap<&str, usize> = Default::default();
+    let corpus = corpus();
+    for scenario in &corpus {
+        *table.entry(class_of(&scenario.name)).or_default() += 1;
+    }
+    for class in ["handshake", "data", "teardown", "rto", "recovery"] {
+        assert!(table.get(class).copied().unwrap_or(0) > 0, "{class} empty");
+    }
+    let total: usize = table.values().sum();
+    assert_eq!(
+        total,
+        corpus.len(),
+        "every scenario lands in exactly one class"
+    );
+    println!("corpus classes: {table:?}");
+}
+
 /// The scenario families: ordered traffic (handshake and in-window
 /// data) under a strict record comparison, and chaos (loss, reorder,
 /// duplicates, timers under stress) behind the same comparison.
@@ -467,6 +508,7 @@ fn native_vs_oracle_handshake_and_data() {
         "native vs oracle (ordered family): {passed}/{}",
         ordered.len()
     );
+    assert_eq!(passed, ordered.len(), "the ordered family must match whole");
 }
 
 #[test]

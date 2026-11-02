@@ -51,10 +51,10 @@ use crate::congestion::{CongestionAlgo, Cubic, Reno, Signal};
 use crate::native_tcp::{Inbound, Reaction, ServerConnection, TcpState, emit_v4};
 use crate::shards::{BufferPool, LogicFactory, ShardConfig, Shards, SlotLogic};
 
-/// The segment size the native stack answers with: RFC 9293 §3.7.1's
-/// default for a peer that sent no MSS option. The TUN's full 1460 is
-/// a bench-time knob once the differential bed grows option parsing.
-const MSS: u16 = 536;
+/// The fallback segment size when the backend is constructed without
+/// one: RFC 9293 §3.7.1's default for a peer that sent no MSS option.
+/// A real deployment derives it from the device's MTU instead.
+const DEFAULT_MSS: u16 = 536;
 
 /// What a slot tells the session wrapper.
 enum HostEvent {
@@ -74,6 +74,29 @@ fn v4_ends(flow: &FlowKey) -> Option<(std::net::SocketAddrV4, std::net::SocketAd
     ))
 }
 
+/// The host's outbound queue for one flow, bounded in bytes: a host
+/// that writes faster than the wire carries (a relay pumping from a
+/// memory-speed socket) must feel backpressure, or the queue becomes
+/// the process's memory ceiling.
+struct WriteLane {
+    writes: VecDeque<Vec<u8>>,
+    bytes: usize,
+}
+
+/// How much unsent host output one flow may hold. A few windows'
+/// worth keeps the pipe full; the bound keeps ten thousand flows
+/// from owing the process gigabytes.
+const LANE_CAP: usize = 256 * 1024;
+
+impl WriteLane {
+    fn new() -> Self {
+        Self {
+            writes: VecDeque::new(),
+            bytes: 0,
+        }
+    }
+}
+
 /// One flow inside a shard: the connection, the congestion controller
 /// that bounds its send side, and the host lane that earns a channel
 /// only when the handshake completes.
@@ -86,11 +109,11 @@ struct TcpSlot {
     sessions: mpsc::SyncSender<SessionHandoff>,
     flow: FlowInfo,
     /// The lane this slot's host writes arrive on.
-    write_lane: Arc<std::sync::Mutex<VecDeque<Vec<u8>>>>,
+    write_lane: Arc<std::sync::Mutex<WriteLane>>,
     cc: Box<dyn CongestionAlgo>,
     /// The host channel, created when the handshake completes. A SYN
     /// that never completes (a spoofed flood) costs nothing here.
-    to_host: Option<mpsc::SyncSender<HostEvent>>,
+    to_host: Option<tokio::sync::mpsc::UnboundedSender<HostEvent>>,
     /// The host verdict runs once, on the flow's first segment.
     judged: bool,
     /// A rejected or dropped flow: everything after is swallowed.
@@ -106,7 +129,7 @@ impl TcpSlot {
         // session. This is the accept layer's other half: state that
         // never establishes (the spoofed SYN's slot) never reaches the
         // host, never allocates channels, never spawns a task.
-        let (event_tx, event_rx) = mpsc::sync_channel(1024);
+        let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel();
         let handoff = SessionHandoff {
             flow: self.flow.clone(),
             events: event_rx,
@@ -156,14 +179,21 @@ impl TcpSlot {
             .connection
             .send_nxt()
             .wrapping_sub(self.connection.send_una());
-        let mut budget = self.cc.window().saturating_sub(inflight) as usize;
+        // The sender's two bounds (RFC 9293 §3.1): the congestion
+        // window and the window the receiver advertised. Without the
+        // second, a grown congestion window overshoots the receiver's
+        // buffer; the dropped excess leaves holes nothing will fill
+        // while retransmission is not wired.
+        let sendable = self.cc.window().min(self.connection.peer_window());
+        let mut budget = sendable.saturating_sub(inflight) as usize;
         let mut lane = self.write_lane.lock().expect("write lane");
-        while let Some(write) = lane.front_mut() {
+        while let Some(write) = lane.writes.front_mut() {
             if write.is_empty() {
                 // The host's shutdown marker: a FIN after any data. The
                 // FIN is one byte past the stream and leaves ungated;
                 // a window with no room must not wedge the close.
-                lane.pop_front();
+                let marker = lane.writes.pop_front().expect("front held the marker");
+                let _ = marker;
                 drop(lane);
                 let reaction = self.connection.fin_reaction();
                 if reaction.flags != 0 {
@@ -192,10 +222,14 @@ impl TcpSlot {
             let frame = emit_v4(self.server, self.client, &reaction, &write[..take]);
             out.push_back(BytesMut::from(&frame[..]));
             self.connection.send_advance(take as u32);
-            write.drain(..take);
+            let drained_dry = {
+                write.drain(..take);
+                write.is_empty()
+            };
             budget -= take;
-            if write.is_empty() {
-                lane.pop_front();
+            lane.bytes -= take;
+            if drained_dry {
+                lane.writes.pop_front();
             }
         }
     }
@@ -296,8 +330,8 @@ impl SlotLogic for TcpSlot {
 /// The session-facing transport: host reads pull from slot events,
 /// host writes push into the slot's lane.
 struct NativeTcpIo {
-    events: mpsc::Receiver<HostEvent>,
-    write_lane: Arc<std::sync::Mutex<VecDeque<Vec<u8>>>>,
+    events: tokio::sync::mpsc::UnboundedReceiver<HostEvent>,
+    write_lane: Arc<std::sync::Mutex<WriteLane>>,
     pending: VecDeque<u8>,
     closed: bool,
 }
@@ -312,23 +346,14 @@ impl TcpTransport for NativeTcpIo {
                 buf[..take].copy_from_slice(&bytes);
                 return Ok(take);
             }
-            match self.events.try_recv() {
-                Ok(HostEvent::Bytes(bytes)) => self.pending.extend(bytes),
-                Ok(HostEvent::Established) => continue,
-                Ok(HostEvent::Closed) => {
+            match self.events.recv().await {
+                Some(HostEvent::Bytes(bytes)) => self.pending.extend(bytes),
+                Some(HostEvent::Established) => continue,
+                Some(HostEvent::Closed) => {
                     self.closed = true;
                     return Ok(0);
                 }
-                Err(mpsc::TryRecvError::Empty) => {
-                    if self.closed {
-                        return Ok(0);
-                    }
-                    // One millisecond at a time: no runtime dependency,
-                    // no busy spin, and the shard wakes this within a
-                    // batch of any packet arriving.
-                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
-                }
-                Err(mpsc::TryRecvError::Disconnected) => {
+                None => {
                     self.closed = true;
                     return Ok(0);
                 }
@@ -337,23 +362,32 @@ impl TcpTransport for NativeTcpIo {
     }
 
     async fn write(&mut self, data: &[u8]) -> io::Result<usize> {
-        self.write_lane
-            .lock()
-            .expect("write lane")
-            .push_back(data.to_vec());
+        // Backpressure the host against the wire: a full lane waits
+        // instead of growing, so the kernel socket buffers upstream
+        // slow the source the way the network would.
+        while self.write_lane.lock().expect("write lane").bytes >= LANE_CAP {
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        let mut lane = self.write_lane.lock().expect("write lane");
+        lane.bytes += data.len();
+        lane.writes.push_back(data.to_vec());
         Ok(data.len())
     }
 
     async fn shutdown_write(&mut self) -> io::Result<()> {
+        // The empty marker is not data and never waits behind the cap.
         self.write_lane
             .lock()
             .expect("write lane")
+            .writes
             .push_back(Vec::new());
         Ok(())
     }
 
     async fn abort(&mut self) -> io::Result<()> {
-        self.write_lane.lock().expect("write lane").clear();
+        let mut lane = self.write_lane.lock().expect("write lane");
+        lane.writes.clear();
+        lane.bytes = 0;
         Ok(())
     }
 }
@@ -372,6 +406,10 @@ pub struct NativeBackend {
     pub syn_cookies: bool,
     /// The half-open bound when cookies are off.
     pub backlog: usize,
+    /// The segment size the connection answers with. The device's MTU
+    /// minus its headers is the honest value; the RFC default is the
+    /// fallback until SYN options are parsed (RFC 9293 §3.7.1).
+    pub mss: u16,
 }
 
 impl Default for NativeBackend {
@@ -384,6 +422,7 @@ impl Default for NativeBackend {
             congestion: vfawn_core::CongestionAlgo::default(),
             syn_cookies: true,
             backlog: 128,
+            mss: DEFAULT_MSS,
         }
     }
 }
@@ -396,10 +435,11 @@ impl NativeBackend {
     /// configuration.
     fn cc_factory(
         choice: vfawn_core::CongestionAlgo,
+        mss: u16,
     ) -> Arc<dyn Fn() -> Box<dyn CongestionAlgo> + Send + Sync> {
         match choice {
-            vfawn_core::CongestionAlgo::Reno => Arc::new(|| Box::new(Reno::new(MSS))),
-            _ => Arc::new(|| Box::new(Cubic::new(MSS))),
+            vfawn_core::CongestionAlgo::Reno => Arc::new(move || Box::new(Reno::new(mss))),
+            _ => Arc::new(move || Box::new(Cubic::new(mss))),
         }
     }
 }
@@ -410,13 +450,14 @@ struct SpawnShared {
     sessions: mpsc::SyncSender<SessionHandoff>,
     accept: Arc<std::sync::Mutex<AcceptQueue>>,
     cc_factory: Arc<dyn Fn() -> Box<dyn CongestionAlgo> + Send + Sync>,
+    mss: u16,
 }
 
 /// A ready session handed to the runtime side.
 struct SessionHandoff {
     flow: FlowInfo,
-    events: mpsc::Receiver<HostEvent>,
-    write_lane: Arc<std::sync::Mutex<VecDeque<Vec<u8>>>>,
+    events: tokio::sync::mpsc::UnboundedReceiver<HostEvent>,
+    write_lane: Arc<std::sync::Mutex<WriteLane>>,
 }
 
 impl StackBackend for NativeBackend {
@@ -437,7 +478,8 @@ impl StackBackend for NativeBackend {
                 self.backlog,
                 Box::new(FixedSecret(flood_secret())),
             ))),
-            cc_factory: Self::cc_factory(self.congestion),
+            cc_factory: Self::cc_factory(self.congestion, self.mss),
+            mss: self.mss,
         });
 
         let factory_shared = Arc::clone(&shared);
@@ -459,9 +501,9 @@ impl StackBackend for NativeBackend {
             else {
                 return Box::new(SinkSlot) as Box<dyn SlotLogic>;
             };
-            let write_lane = Arc::new(std::sync::Mutex::new(VecDeque::new()));
+            let write_lane = Arc::new(std::sync::Mutex::new(WriteLane::new()));
             Box::new(TcpSlot {
-                connection: ServerConnection::new(isn, MSS),
+                connection: ServerConnection::new(isn, factory_shared.mss),
                 client,
                 server,
                 handler: Arc::clone(&factory_shared.handler),
@@ -491,22 +533,27 @@ impl StackBackend for NativeBackend {
             logic_factory,
         );
 
-        // Hand established sessions to the host on a plain thread: the
-        // contract wants `on_tcp` awaited, and nothing here needs a
-        // runtime of its own.
+        // Hand established sessions to the host. One shared runtime,
+        // one task per session: a host handler that lives as long as
+        // its session (a relay's pump loop) must never occupy the
+        // handoff lane, or the second long-lived flow of the process
+        // would never reach its handler.
         let runtime_handler = Arc::clone(&shared.handler);
         std::thread::Builder::new()
             .name("vfawn-native-sessions".into())
             .spawn(move || {
-                // A minimal single-threaded runtime per session batch;
-                // each session gets its own small context.
+                let workers = std::thread::available_parallelism()
+                    .map(|n| n.get())
+                    .unwrap_or(4)
+                    .min(4);
+                let runtime = tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(workers)
+                    .enable_all()
+                    .build()
+                    .expect("session runtime");
                 while let Ok(handoff) = sessions_rx.recv() {
                     let handler = Arc::clone(&runtime_handler);
-                    let rt = tokio::runtime::Builder::new_current_thread()
-                        .enable_all()
-                        .build()
-                        .expect("session runtime");
-                    rt.block_on(async move {
+                    runtime.spawn(async move {
                         let transport = NativeTcpIo {
                             events: handoff.events,
                             write_lane: Arc::clone(&handoff.write_lane),
