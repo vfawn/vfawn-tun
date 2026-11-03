@@ -38,6 +38,12 @@ impl DeviceCaps {
 }
 
 /// Batched raw-packet I/O against a TUN-style device.
+///
+/// The framing contract is raw IP, version 4 or 6, with no
+/// link-layer header: Linux TUN hands that over as-is, Windows
+/// wintun likewise, and Darwin's utun strips or adds its address
+/// family prefix in its own implementation. Every consumer above
+/// this trait is platform-free by construction.
 pub trait PacketDevice: Send {
     /// Fill `bufs` with as many pending packets as fit and return the count.
     /// Blocks when nothing is pending. After [`PacketDevice::shutdown`] a
