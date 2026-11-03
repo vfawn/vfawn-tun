@@ -235,6 +235,14 @@ pub trait SlotLogic: Send {
     /// A timer this slot scheduled has fired.
     fn on_timer(&mut self, _out: &mut VecDeque<BytesMut>, _pool: &BufferPool) {}
 
+    /// How long until this slot wants its [`SlotLogic::on_timer`] to
+    /// fire: the retransmission deadline while unacknowledged data is
+    /// outstanding, absent when nothing is owed. The loop schedules
+    /// one pending timer per slot at most.
+    fn timer_wanted(&self) -> Option<Duration> {
+        None
+    }
+
     /// A loop cycle with no inbound work. Sessions whose host wrote
     /// since the last packet have no packet to ride on; this is their
     /// turn.
@@ -611,6 +619,10 @@ fn shard_loop(
 ) {
     let mut connections: HashMap<FlowKey, Slot> = HashMap::new();
     let mut timers: BinaryHeap<Timer> = BinaryHeap::new();
+    // One pending timer per flow at most; a slot re-arms by wanting a
+    // timer again after the fire.
+    let mut scheduled: std::collections::HashSet<FlowKey> = std::collections::HashSet::new();
+    let mut next_scan = Instant::now();
     let mut pending: VecDeque<BytesMut> = VecDeque::new();
     loop {
         if stopped.load(Ordering::Acquire) || stop_all.load(Ordering::Acquire) {
@@ -642,13 +654,32 @@ fn shard_loop(
             pool.release_batch(batch);
         }
 
-        // Timers: everything due at this instant fires now.
+        // Timer scheduling: slots that owe the wire something say how
+        // long they can bear to wait. The scan is gated to the
+        // millisecond on busy cycles (the deadline scale is a hundred
+        // times coarser) and rides the idle sweep's cadence otherwise.
         let now = Instant::now();
+        if !did_work || now >= next_scan {
+            next_scan = now + Duration::from_millis(1);
+            for (flow, slot) in connections.iter() {
+                if let Some(delay) = slot.logic.timer_wanted()
+                    && scheduled.insert(*flow)
+                {
+                    timers.push(Timer {
+                        deadline: now + delay,
+                        flow: *flow,
+                    });
+                }
+            }
+        }
+
+        // Timers: everything due at this instant fires now.
         while let Some(earliest) = timers.peek() {
             if earliest.deadline > now {
                 break;
             }
             let timer = timers.pop().expect("peeked entry exists");
+            scheduled.remove(&timer.flow);
             if let Some(slot) = connections.get_mut(&timer.flow) {
                 slot.logic.on_timer(&mut pending, &pool);
                 did_work = true;

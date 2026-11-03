@@ -32,7 +32,7 @@ use std::collections::VecDeque;
 use std::io;
 use std::sync::Arc;
 use std::sync::mpsc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use bytes::BytesMut;
 
@@ -118,7 +118,39 @@ struct TcpSlot {
     judged: bool,
     /// A rejected or dropped flow: everything after is swallowed.
     refused: bool,
+    /// Unacknowledged sent bytes, contiguous from `flight_base`
+    /// (RFC 9293 §3.3.1's send buffer): what a retransmission owes.
+    flight: Vec<u8>,
+    flight_base: u32,
+    data_sent_at: Option<Instant>,
+    data_retries: u32,
+    /// The SYN-ACK's clock while the handshake waits (RFC 9293 §3.4).
+    synack_at: Option<Instant>,
+    synack_retries: u32,
+    /// Our FIN's sequence while LAST-ACK waits for its acknowledgment.
+    fin_at: Option<u32>,
 }
+
+/// The first retransmission timeout and its ceiling (RFC 6298 §2's
+/// bounds, taken to the local-link scale this stack serves: a floor of
+/// one second would leave a stalled control connection mute for ages).
+const RTO_BASE: Duration = Duration::from_millis(200);
+const RTO_CEIL: Duration = Duration::from_secs(2);
+
+/// The backoff for a retry count (RFC 6298 §5: doubling per attempt).
+fn rto_backoff(retries: u32) -> Duration {
+    let shift = retries.min(4);
+    let scaled = RTO_BASE.saturating_mul(1u32 << shift);
+    scaled.min(RTO_CEIL)
+}
+
+/// How many times the handshake's answer is repeated before the flow
+/// is written off, and how many times unacknowledged data is repeated
+/// before the connection is pronounced dead. Dead connections tell the
+/// host and go inert, which is also the only reaping a vanished peer
+/// gets in this volume.
+const SYNACK_RETRY_MAX: u32 = 5;
+const DATA_RETRY_MAX: u32 = 15;
 
 impl TcpSlot {
     fn announce(&mut self) {
@@ -199,6 +231,9 @@ impl TcpSlot {
                 if reaction.flags != 0 {
                     let frame = emit_v4(self.server, self.client, &reaction, &[], &[]);
                     out.push_back(BytesMut::from(&frame[..]));
+                    self.fin_at = Some(reaction.seq);
+                    self.data_sent_at = Some(Instant::now());
+                    self.data_retries = 0;
                     self.connection.mark_fin_sent();
                     self.connection
                         .send_advance(u32::from(reaction.flags & 0x03 != 0));
@@ -221,6 +256,12 @@ impl TcpSlot {
             };
             let frame = emit_v4(self.server, self.client, &reaction, &[], &write[..take]);
             out.push_back(BytesMut::from(&frame[..]));
+            if self.flight.is_empty() {
+                self.flight_base = self.connection.send_nxt();
+                self.data_sent_at = Some(Instant::now());
+                self.data_retries = 0;
+            }
+            self.flight.extend_from_slice(&write[..take]);
             self.connection.send_advance(take as u32);
             let drained_dry = {
                 write.drain(..take);
@@ -281,6 +322,31 @@ impl SlotLogic for TcpSlot {
             }
         }
 
+        // Prune the flight by what the connection accepted
+        // (SND.UNA), never by the raw ACK field: an acknowledgment
+        // beyond what was sent moves nothing (RFC 9293 §3.3.6).
+        let una = self.connection.send_una();
+        if !self.flight.is_empty() {
+            let end = self.flight_base.wrapping_add(self.flight.len() as u32);
+            let fully_acked = una == end || una.wrapping_sub(end) < u32::MAX / 2;
+            if fully_acked {
+                self.flight.clear();
+                self.data_sent_at = None;
+                self.data_retries = 0;
+            } else if una.wrapping_sub(self.flight_base) < u32::MAX / 2 {
+                let drop_bytes =
+                    (una.wrapping_sub(self.flight_base) as usize).min(self.flight.len());
+                self.flight.drain(..drop_bytes);
+                self.flight_base = una;
+            }
+        }
+        if self.connection.state() == TcpState::Established {
+            self.synack_at = None;
+        }
+        if self.connection.state() == TcpState::Closed {
+            self.fin_at = None;
+        }
+
         // Establish before delivering: the completing ACK may carry
         // data, and those bytes need the channel the handshake just
         // earned.
@@ -291,6 +357,12 @@ impl SlotLogic for TcpSlot {
             let _ = to_host.send(HostEvent::Bytes(reaction.delivered.clone()));
         }
 
+        if reaction.flags & 0x02 != 0 {
+            // The handshake's answer is now outstanding: its retry
+            // clock starts here (RFC 9293 §3.4).
+            self.synack_at = Some(Instant::now());
+            self.synack_retries = 0;
+        }
         if reaction.flags != 0 {
             // Only the handshake's SYN-ACK carries options (the MSS
             // and window-scale offers).
@@ -318,6 +390,120 @@ impl SlotLogic for TcpSlot {
             _ => {
                 self.drain_writes(out);
             }
+        }
+    }
+
+    fn timer_wanted(&self) -> Option<Duration> {
+        match self.connection.state() {
+            TcpState::SynReceived if self.synack_retries < SYNACK_RETRY_MAX => {
+                self.synack_at.map(|at| {
+                    (at + rto_backoff(self.synack_retries))
+                        .saturating_duration_since(Instant::now())
+                })
+            }
+            TcpState::Established | TcpState::CloseWait
+                if !self.flight.is_empty() && self.data_retries < DATA_RETRY_MAX =>
+            {
+                self.data_sent_at.map(|at| {
+                    (at + rto_backoff(self.data_retries)).saturating_duration_since(Instant::now())
+                })
+            }
+            TcpState::LastAck if self.data_retries < DATA_RETRY_MAX => {
+                self.data_sent_at.map(|at| {
+                    (at + rto_backoff(self.data_retries)).saturating_duration_since(Instant::now())
+                })
+            }
+            _ => None,
+        }
+    }
+
+    fn on_timer(&mut self, out: &mut VecDeque<BytesMut>, _pool: &BufferPool) {
+        match self.connection.state() {
+            TcpState::SynReceived => {
+                // The handshake's answer again (RFC 9293 §3.4): the
+                // same sequence, a longer wait if it fires again.
+                if let Some(reaction) = self.connection.synack_retransmit() {
+                    let options = self.connection.handshake_options();
+                    let frame = emit_v4(self.server, self.client, &reaction, &options, &[]);
+                    out.push_back(BytesMut::from(&frame[..]));
+                    self.synack_retries = self.synack_retries.saturating_add(1);
+                    self.synack_at = Some(Instant::now());
+                }
+            }
+            TcpState::Established | TcpState::CloseWait | TcpState::LastAck => {
+                if self.data_retries >= DATA_RETRY_MAX {
+                    // Dead, pronounced: the wire has had every chance,
+                    // the host learns the flow is gone, and the slot
+                    // goes inert instead of paying retries forever.
+                    self.connection.abandon();
+                    self.flight.clear();
+                    self.data_sent_at = None;
+                    self.fin_at = None;
+                    if let Some(to_host) = &self.to_host {
+                        let _ = to_host.send(HostEvent::Closed);
+                    }
+                    return;
+                }
+                if self.flight.is_empty() {
+                    // With no data owed, the only outstanding thing can
+                    // be our FIN: the passive closer's patience pays
+                    // for one more farewell (RFC 9293 §3.5).
+                    if self.connection.state() == TcpState::LastAck
+                        && let Some(seq) = self.fin_at
+                    {
+                        let reaction = Reaction {
+                            seq,
+                            ack: self.connection.recv_nxt(),
+                            flags: 0x11,
+                            window: self.connection.advertised_window(),
+                            delivered: Vec::new(),
+                            held: false,
+                            gap_filled: false,
+                        };
+                        let frame = emit_v4(self.server, self.client, &reaction, &[], &[]);
+                        out.push_back(BytesMut::from(&frame[..]));
+                        self.data_retries = self.data_retries.saturating_add(1);
+                        self.data_sent_at = Some(Instant::now());
+                    }
+                    return;
+                }
+                // Loss, pronounced: the window collapses (RFC 5681
+                // §3.1 via RFC 6298 §5) and the earliest outstanding
+                // bytes leave again in segment-sized pieces.
+                self.cc.on_signal(self.connection.mss(), Signal::Timeout);
+                let mss = self.connection.mss() as usize;
+                let budget = self
+                    .cc
+                    .window()
+                    .min(self.connection.peer_window())
+                    .saturating_sub(1) as usize;
+                let mut offset = 0usize;
+                while offset < self.flight.len() && offset < budget {
+                    let take = (self.flight.len() - offset).min(mss).min(budget - offset);
+                    let more_after = offset + take < self.flight.len();
+                    let reaction = Reaction {
+                        seq: self.flight_base.wrapping_add(offset as u32),
+                        ack: self.connection.recv_nxt(),
+                        flags: if more_after { 0x10 } else { 0x18 },
+                        window: self.connection.advertised_window(),
+                        delivered: Vec::new(),
+                        held: false,
+                        gap_filled: false,
+                    };
+                    let frame = emit_v4(
+                        self.server,
+                        self.client,
+                        &reaction,
+                        &[],
+                        &self.flight[offset..offset + take],
+                    );
+                    out.push_back(BytesMut::from(&frame[..]));
+                    offset += take;
+                }
+                self.data_retries = self.data_retries.saturating_add(1);
+                self.data_sent_at = Some(Instant::now());
+            }
+            _ => {}
         }
     }
 
@@ -526,6 +712,13 @@ impl StackBackend for NativeBackend {
                 to_host: None,
                 judged: false,
                 refused: false,
+                flight: Vec::new(),
+                flight_base: 0,
+                data_sent_at: None,
+                data_retries: 0,
+                synack_at: None,
+                synack_retries: 0,
+                fin_at: None,
             })
         });
 

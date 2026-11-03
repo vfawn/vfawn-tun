@@ -667,6 +667,13 @@ impl ServerConnection {
     /// current acknowledgment (RFC 9293 §3.5, active close's first
     /// step). Volume one folds the peer-FIN answer into ESTABLISHED
     /// handling; this is the host-initiated half.
+    /// Give the connection up: retries ran out and the wire will
+    /// never answer. Nothing further is owed or accepted; this is the
+    /// reaper a vanished peer gets in this volume.
+    pub fn abandon(&mut self) {
+        self.state = TcpState::Closed;
+    }
+
     pub fn fin_reaction(&self) -> Reaction {
         if self.fin_sent || !matches!(self.state, TcpState::Established | TcpState::CloseWait) {
             return Reaction::silent();
