@@ -511,12 +511,26 @@ fn flow_key_extracts_v6_through_extension_chain() {
 
 #[test]
 fn flow_key_returns_none_for_non_transport() {
-    let mut icmp = vec![8u8, 0, 0, 0, 1, 2, 3, 4];
-    icmp.extend_from_slice(b"payload");
-    let packet = v4_packet(1, 0, (0, 0, false), &icmp);
+    // ICMP carries the echo identifier as its key now (requests and
+    // replies of one exchange share a slot); the none cases are the
+    // protocols with no identity at all.
+    let mut igmp = vec![0x16u8, 0, 0, 0, 1, 2, 3, 4];
+    igmp.extend_from_slice(b"payload");
+    let packet = v4_packet(2, 0, (0, 0, false), &igmp);
     assert!(flow_key(&packet).is_none());
     assert!(flow_key(&[]).is_none());
     assert!(flow_key(&[0x70, 0, 0, 0, 0]).is_none());
+}
+
+#[test]
+fn flow_key_keys_icmp_by_echo_identifier() {
+    let mut icmp = vec![8u8, 0, 0, 0, 0x12, 0x34, 0, 1];
+    icmp.extend_from_slice(b"payload");
+    let packet = v4_packet(1, 0, (0, 0, false), &icmp);
+    let key = flow_key(&packet).unwrap();
+    assert_eq!(key.protocol, IpProtocol::Icmp);
+    assert_eq!(key.src_port, 0x1234, "the echo identifier");
+    assert_eq!(key.dst_port, 0);
 }
 
 #[test]

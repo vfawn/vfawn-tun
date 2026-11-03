@@ -710,7 +710,23 @@ impl StackBackend for NativeBackend {
         });
 
         let factory_shared = Arc::clone(&shared);
+        let icmp_table = Arc::new(crate::icmp::IcmpTable::new());
+        // The error lane's reader rides with the session surfaces
+        // (the close-on-IcmpError wiring); the sender end is live the
+        // moment the first datagram slot exists.
+        let (error_tx, _error_lane) = mpsc::sync_channel::<FlowInfo>(1024);
+        let icmp_handler = Arc::clone(&shared.handler);
+        let icmp_table_for_slots = Arc::clone(&icmp_table);
         let logic_factory: LogicFactory = Arc::new(move |flow: &FlowKey| {
+            // ICMP flows ride the datagram slot: echo answered in
+            // place, errors correlated, no connection to hold.
+            if flow.protocol == IpProtocol::Icmp {
+                return Box::new(crate::icmp_slot::IcmpSlot::new(
+                    Arc::clone(&icmp_handler),
+                    Arc::clone(&icmp_table_for_slots),
+                    error_tx.clone(),
+                )) as Box<dyn SlotLogic>;
+            }
             // Only v4 flows ride the native stack; anything else gets a
             // sink slot so the shard keeps flowing.
             let Some((client, server)) = v4_ends(flow) else {

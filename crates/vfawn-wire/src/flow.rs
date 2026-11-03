@@ -120,6 +120,16 @@ fn transport_key(src: IpAddr, dst: IpAddr, protocol: IpProtocol, bytes: &[u8]) -
             let (header, _) = UdpHeader::parse(bytes).ok()?;
             (header.src_port, header.dst_port)
         }
+        // ICMP has no ports; the echo identifier gives the exchange
+        // its key, so a ping's requests and its replies (same
+        // identifier) hash to one slot. Other ICMP messages share the
+        // zero identifier, which is exactly the "one datagram flow per
+        // address pair" the datagram slot wants.
+        IpProtocol::Icmp => {
+            let identifier =
+                u16::from_be_bytes([*bytes.get(4).unwrap_or(&0), *bytes.get(5).unwrap_or(&0)]);
+            (identifier, 0)
+        }
         _ => return None,
     };
     Some(FlowKey {

@@ -20,6 +20,7 @@ pub mod accept;
 #[cfg(feature = "backend-native")]
 pub mod congestion;
 mod icmp;
+mod icmp_slot;
 #[cfg(feature = "backend-native")]
 pub mod native_backend;
 #[cfg(feature = "backend-native")]
@@ -38,6 +39,7 @@ pub use accept::{AcceptQueue, CookieSecret, FixedSecret};
 #[cfg(feature = "backend-native")]
 pub use congestion::{CongestionAlgo, Cubic, Reno, Signal};
 pub use icmp::{ECHO_REPLY, ECHO_REQUEST, IcmpTable, IcmpVerdict, TIME_EXCEEDED, UNREACHABLE};
+pub use icmp_slot::IcmpSlot;
 #[cfg(feature = "backend-ipstack")]
 pub use ipstack_backend::IpstackBackend;
 #[cfg(feature = "backend-native")]

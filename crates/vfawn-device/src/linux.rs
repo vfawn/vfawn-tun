@@ -92,7 +92,7 @@ impl TunDevice {
         // Vnet stays off: with it the kernel coalesces the peer's
         // inbound TCP and both stacks above collapse (measured 4.5
         // Mbit/s on an eight-stream upload against 200 without it,
-        // buffer sizing already corrected — the merged-burst semantics
+        // buffer sizing already corrected ,  the merged-burst semantics
         // need dedicated integration work in the stacks, tracked as
         // its own item). The plain-frame path is the stable truth.
         let mut builder = DeviceBuilder::new().mtu(mtu as u16);
@@ -181,7 +181,7 @@ fn io_loop(shared: Arc<Shared>, mut device: SyncDevice, writes: Receiver<Vec<Byt
     // The buffers the kernel read fills hold one split segment each
     // (the merged burst lands whole in the scratch above and the
     // library slices it out), so an MTU-plus-slack length is the
-    // whole requirement — sizing them to the merge ceiling instead
+    // whole requirement ,  sizing them to the merge ceiling instead
     // zeroed megabytes per cycle and crushed an offload run to
     // single-digit Mbit/s. They travel to the reader by ownership;
     // the reader's empties flow back and get topped up (free inside
@@ -208,7 +208,7 @@ fn io_loop(shared: Arc<Shared>, mut device: SyncDevice, writes: Receiver<Vec<Byt
                         // is backpressure, not death: the drop behaves
                         // like a qdisc drop (TCP above retransmits,
                         // UDP loses one datagram), which beats taking
-                        // the whole interface down mid-transfer — the
+                        // the whole interface down mid-transfer ,  the
                         // kernel removes the device with the last fd,
                         // and every route falls through to a bypass.
                         if error.kind() == ErrorKind::NotConnected {
@@ -255,8 +255,8 @@ fn io_loop(shared: Arc<Shared>, mut device: SyncDevice, writes: Receiver<Vec<Byt
                 shared.stopped.store(true, Ordering::Release);
                 return;
             }
-            // Any other read failure — a burst that still does not fit,
-            // a hiccup in the merge path — loses that one read, not the
+            // Any other read failure ,  a burst that still does not fit,
+            // a hiccup in the merge path ,  loses that one read, not the
             // interface: the kernel retries, the flows retransmit, and
             // the descriptor staying alive keeps the routes owning the
             // namespace.

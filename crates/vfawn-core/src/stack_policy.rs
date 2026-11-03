@@ -3,14 +3,14 @@
 
 //! The Auto policy's decision: which termination engine a captured flow
 //! rides, chosen from platform and device facts before the first
-//! packet. Pure logic, no I/O — every input is a fact the caller
+//! packet. Pure logic, no I/O ,  every input is a fact the caller
 //! already holds, so the whole matrix is table-testable and the
 //! deployment behavior is exactly what the tests assert.
 //!
 //! The reasoning is one paragraph: the kernel stack is the maturity
 //! bench every platform tunes for, so wherever the kernel can own the
 //! flow it does; the userspace stacks exist for the traffic the kernel
-//! path cannot carry — full-capture modes where every byte must pass
+//! path cannot carry ,  full-capture modes where every byte must pass
 //! the host's judgment, and platforms whose kernel offers no
 //! programmable path at all. Offload changes nothing here yet (the
 //! userspace engines are batch-capable in design but vnet headers are
