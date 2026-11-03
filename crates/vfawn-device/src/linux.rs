@@ -294,7 +294,10 @@ impl PacketDevice for TunDevice {
         if self.shared.stopped.load(Ordering::Acquire) {
             return Ok(0);
         }
-        let mut frames = match reads.recv() {
+        // The old contract returns zero when nothing arrived, and
+        // callers loop on it; an unbounded block here would hang every
+        // poll-style reader past its own deadline.
+        let mut frames = match reads.recv_timeout(std::time::Duration::from_millis(50)) {
             Ok(frames) => frames,
             Err(_) => return Ok(0),
         };
