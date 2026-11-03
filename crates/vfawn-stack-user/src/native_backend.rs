@@ -338,6 +338,13 @@ impl SlotLogic for TcpSlot {
                     (una.wrapping_sub(self.flight_base) as usize).min(self.flight.len());
                 self.flight.drain(..drop_bytes);
                 self.flight_base = una;
+                // An acknowledgment that advanced proves the path is
+                // carrying: the remaining flight gets a fresh timeout
+                // and the backoff forgets its fears (RFC 6298 §5.3,
+                // without which a long transfer collapses its window
+                // on a timer that never stopped running).
+                self.data_sent_at = Some(Instant::now());
+                self.data_retries = 0;
             }
         }
         if self.connection.state() == TcpState::Established {
