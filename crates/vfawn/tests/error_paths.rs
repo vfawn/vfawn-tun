@@ -30,7 +30,7 @@ impl PacketDevice for FailingDevice {
         self.inner.read_batch(bufs)
     }
 
-    fn write_batch(&mut self, bufs: &[BytesMut]) -> io::Result<usize> {
+    fn write_batch(&mut self, bufs: &mut [BytesMut]) -> io::Result<usize> {
         self.inner.write_batch(bufs)
     }
 
@@ -125,7 +125,7 @@ fn mock_device_write_after_shutdown_is_rejected() {
     device.shutdown().unwrap();
 
     let mut dev = device;
-    let result = dev.write_batch(&[BytesMut::from(&b"late"[..])]);
+    let result = dev.write_batch(&mut [BytesMut::from(&b"late"[..])]);
     assert!(result.is_err());
     assert_eq!(result.unwrap_err().kind(), io::ErrorKind::NotConnected);
 }
@@ -157,5 +157,5 @@ fn loopback_shutdown_stops_both_directions() {
 
     let mut bufs = vec![BytesMut::new(); 1];
     assert_eq!(loopback.read_batch(&mut bufs).unwrap(), 0);
-    assert!(loopback.write_batch(&[BytesMut::new()]).is_err());
+    assert!(loopback.write_batch(&mut [BytesMut::new()]).is_err());
 }

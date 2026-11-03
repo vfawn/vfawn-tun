@@ -44,7 +44,7 @@ impl PacketDevice for FuzzInjector {
         Ok(count)
     }
 
-    fn write_batch(&mut self, bufs: &[BytesMut]) -> io::Result<usize> {
+    fn write_batch(&mut self, bufs: &mut [BytesMut]) -> io::Result<usize> {
         // Write passes through unmodified; the interesting fuzzing is on
         // the read side, where hostile packets arrive.
         self.inner.write_batch(bufs)

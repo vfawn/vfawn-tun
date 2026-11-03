@@ -97,18 +97,19 @@ impl PacketDevice for PcapDevice {
         Ok(count)
     }
 
-    fn write_batch(&mut self, bufs: &[BytesMut]) -> io::Result<usize> {
+    fn write_batch(&mut self, bufs: &mut [BytesMut]) -> io::Result<usize> {
         if self.shutdown.load(Ordering::Acquire) {
             return Err(io::Error::new(
                 io::ErrorKind::NotConnected,
                 "device is down",
             ));
         }
+        let count = bufs.len();
         let mut sink = self.written.lock().unwrap();
         for buf in bufs {
             sink.push(buf.to_vec());
         }
-        Ok(bufs.len())
+        Ok(count)
     }
 
     fn capabilities(&self) -> DeviceCaps {

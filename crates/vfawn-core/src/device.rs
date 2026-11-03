@@ -53,7 +53,7 @@ pub trait PacketDevice: Send {
 
     /// Write as many whole packets as the device accepts in one call and
     /// return the count. Buffers are not resized by the callee.
-    fn write_batch(&mut self, bufs: &[BytesMut]) -> io::Result<usize>;
+    fn write_batch(&mut self, bufs: &mut [BytesMut]) -> io::Result<usize>;
 
     /// What the device supports right now.
     fn capabilities(&self) -> DeviceCaps;

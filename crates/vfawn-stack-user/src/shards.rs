@@ -545,7 +545,7 @@ impl Shards {
                             }
                         }
                         if !batch.is_empty() {
-                            if let Err(error) = device.write_batch(&batch) {
+                            if let Err(error) = device.write_batch(&mut batch) {
                                 // A device that refuses writes is a
                                 // dead pipeline: say so, stop every
                                 // thread, and release what was in
@@ -574,7 +574,7 @@ impl Shards {
                                 }
                             }
                             if !tail.is_empty() {
-                                let _ = device.write_batch(&tail);
+                                let _ = device.write_batch(&mut tail);
                                 for packet in tail {
                                     writer_pool.release_packet(packet);
                                 }

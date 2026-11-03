@@ -47,11 +47,13 @@ impl PacketDevice for PcapWriter {
         Ok(count)
     }
 
-    fn write_batch(&mut self, bufs: &[BytesMut]) -> io::Result<usize> {
-        for buf in bufs {
+    fn write_batch(&mut self, bufs: &mut [BytesMut]) -> io::Result<usize> {
+        let count = bufs.len();
+        for buf in bufs.iter() {
             (self.sink)(buf, Direction::Write);
         }
-        self.inner.write_batch(bufs)
+        self.inner.write_batch(bufs)?;
+        Ok(count)
     }
 
     fn capabilities(&self) -> DeviceCaps {

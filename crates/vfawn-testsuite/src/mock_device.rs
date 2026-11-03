@@ -72,7 +72,7 @@ impl PacketDevice for MockDevice {
         Ok(count)
     }
 
-    fn write_batch(&mut self, bufs: &[BytesMut]) -> io::Result<usize> {
+    fn write_batch(&mut self, bufs: &mut [BytesMut]) -> io::Result<usize> {
         if self.shutdown.load(Ordering::Acquire) {
             return Err(io::Error::new(
                 io::ErrorKind::NotConnected,
@@ -80,10 +80,11 @@ impl PacketDevice for MockDevice {
             ));
         }
         let mut outbox = self.outbox.lock().unwrap();
+        let count = bufs.len();
         for packet in bufs {
             outbox.push_back(packet.clone());
         }
-        Ok(bufs.len())
+        Ok(count)
     }
 
     fn capabilities(&self) -> DeviceCaps {
@@ -133,7 +134,7 @@ mod tests {
         let mut device = MockDevice::new(DeviceCaps::MINIMAL);
         let first = BytesMut::from(&b"alpha"[..]);
         let second = BytesMut::from(&b"beta"[..]);
-        assert_eq!(device.write_batch(&[first, second]).unwrap(), 2);
+        assert_eq!(device.write_batch(&mut [first, second]).unwrap(), 2);
         assert_eq!(
             device.take_written(),
             vec![b"alpha".to_vec(), b"beta".to_vec()]
@@ -149,7 +150,7 @@ mod tests {
         device.shutdown().unwrap();
         let mut bufs = vec![BytesMut::new(); 1];
         assert_eq!(device.read_batch(&mut bufs).unwrap(), 0);
-        let error = device.write_batch(&[BytesMut::new()]).unwrap_err();
+        let error = device.write_batch(&mut [BytesMut::new()]).unwrap_err();
         assert_eq!(error.kind(), ErrorKind::NotConnected);
     }
 
@@ -181,8 +182,8 @@ mod tests {
         assert_eq!(bufs[0], &b"through"[..]);
 
         // The reader sees what the duplicate writes.
-        let outbound = [BytesMut::from(&b"back"[..])];
-        writer.write_batch(&outbound).unwrap();
+        let mut outbound = [BytesMut::from(&b"back"[..])];
+        writer.write_batch(&mut outbound).unwrap();
         assert_eq!(reader.take_written(), vec![b"back".to_vec()]);
 
         // Shutdown on either side reaches both.

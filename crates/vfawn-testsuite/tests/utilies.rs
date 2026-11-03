@@ -44,8 +44,8 @@ fn fuzz_injector_passes_writes_through() {
         }),
     );
 
-    let outbound = [BytesMut::from(&b"outbound"[..])];
-    assert_eq!(injector.write_batch(&outbound).unwrap(), 1);
+    let mut outbound = [BytesMut::from(&b"outbound"[..])];
+    assert_eq!(injector.write_batch(&mut outbound).unwrap(), 1);
     // Capabilities pass through the wrapper unchanged.
     assert_eq!(injector.capabilities(), DeviceCaps::MINIMAL);
 }
@@ -100,7 +100,9 @@ fn pcap_writer_records_both_directions() {
     let mut bufs = vec![BytesMut::new(); 1];
     assert_eq!(writer.read_batch(&mut bufs).unwrap(), 1);
     assert_eq!(
-        writer.write_batch(&[BytesMut::from(&b"out"[..])]).unwrap(),
+        writer
+            .write_batch(&mut [BytesMut::from(&b"out"[..])])
+            .unwrap(),
         1
     );
 
@@ -114,8 +116,8 @@ fn loopback_echoes_writes_back_as_reads() {
     assert_eq!(loopback.depth(), 0);
 
     // Write a packet; it should come back as a read.
-    let packets = [BytesMut::from(&b"round trip"[..])];
-    assert_eq!(loopback.write_batch(&packets).unwrap(), 1);
+    let mut packets = [BytesMut::from(&b"round trip"[..])];
+    assert_eq!(loopback.write_batch(&mut packets).unwrap(), 1);
     assert_eq!(loopback.depth(), 1);
 
     let mut bufs = vec![BytesMut::new(); 1];

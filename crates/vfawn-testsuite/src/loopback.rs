@@ -59,7 +59,7 @@ impl PacketDevice for Loopback {
         Ok(count)
     }
 
-    fn write_batch(&mut self, bufs: &[BytesMut]) -> io::Result<usize> {
+    fn write_batch(&mut self, bufs: &mut [BytesMut]) -> io::Result<usize> {
         if self.shutdown.load(Ordering::Acquire) {
             return Err(io::Error::new(
                 io::ErrorKind::NotConnected,
@@ -67,10 +67,11 @@ impl PacketDevice for Loopback {
             ));
         }
         let mut queue = self.queue.lock().unwrap();
+        let count = bufs.len();
         for buf in bufs {
             queue.push_back(buf.clone());
         }
-        Ok(bufs.len())
+        Ok(count)
     }
 
     fn capabilities(&self) -> DeviceCaps {

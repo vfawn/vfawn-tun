@@ -35,7 +35,7 @@ impl PacketDevice for TunDevice {
         Err(unsupported())
     }
 
-    fn write_batch(&mut self, _bufs: &[BytesMut]) -> io::Result<usize> {
+    fn write_batch(&mut self, _bufs: &mut [BytesMut]) -> io::Result<usize> {
         Err(unsupported())
     }
 

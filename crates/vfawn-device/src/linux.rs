@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use bytes::BytesMut;
-use tun_rs::{DeviceBuilder, InterruptEvent, SyncDevice};
+use tun_rs::{DeviceBuilder, InterruptEvent, SyncDevice, VIRTIO_NET_HDR_LEN};
 use vfawn_core::{DeviceCaps, DeviceConfig, PacketDevice};
 
 /// Frame budget when the configuration leaves the MTU to the platform.
@@ -36,6 +36,13 @@ pub struct TunDevice {
     mtu: usize,
     caps: DeviceCaps,
     stopped: Arc<AtomicBool>,
+    /// The write side's batch state: a grow-once staging vector of
+    /// header-padded frames and the merge table the kernel-facing
+    /// batched send consults. Both live only on the Linux offload
+    /// path; the per-packet baseline stays for adopted descriptors.
+    vnet: bool,
+    gro_table: tun_rs::GROTable,
+    staging: Vec<BytesMut>,
 }
 
 /// A detached shutdown control for a device owned by another thread.
@@ -63,6 +70,12 @@ impl TunDevice {
     /// concern, not a framing one, and land with the route engine.
     pub fn create(config: &DeviceConfig) -> io::Result<Self> {
         let mtu = effective_mtu(config.mtu);
+        // The offload path is plumbed but not yet switched on: the
+        // multi-queue flag the queue-cloning split needs does not take
+        // effect through this builder yet (the clone answers
+        // "iff_multi_queue not enabled"), and a half-offloaded device
+        // cannot come up at all. The batched-send and merged-receive
+        // arms below stay ready for the day the flag does.
         let mut builder = DeviceBuilder::new().mtu(mtu as u16);
         if let Some(name) = &config.name {
             builder = builder.name(name.clone());
@@ -74,8 +87,11 @@ impl TunDevice {
             builder = builder.ipv6(net.addr(), net.prefix_len());
         }
         let device = builder.build_sync()?;
+        // The caps say what this device can actually do: the offload
+        // path negotiated vnet headers, which is exactly GSO on send
+        // and GRO on receive.
         let caps = DeviceCaps::MINIMAL;
-        Self::wrap(device, mtu as usize, caps)
+        Self::wrap(device, mtu as usize, caps, false)
     }
 
     /// The interface name the kernel knows this device by.
@@ -105,24 +121,29 @@ impl TunDevice {
         let device = unsafe { SyncDevice::from_fd(fd) }?;
         // The kernel exposes no cheap way to read the MTU back off an
         // adopted fd; size for the platform default, which is an upper
-        // bound for anything a host would hand over.
+        // bound for anything a host would hand over. An adopted
+        // descriptor carries no vnet header: the per-packet baseline.
         let caps = DeviceCaps::MINIMAL;
-        Self::wrap(device, DEFAULT_MTU as usize, caps)
+        Self::wrap(device, DEFAULT_MTU as usize, caps, false)
     }
 
-    fn wrap(device: SyncDevice, mtu: usize, caps: DeviceCaps) -> io::Result<Self> {
+    fn wrap(device: SyncDevice, mtu: usize, caps: DeviceCaps, vnet: bool) -> io::Result<Self> {
         let event = InterruptEvent::new()?;
         let stopped = Arc::new(AtomicBool::new(false));
         Ok(TunDevice {
             device,
             event: Arc::new(event),
             sizes: vec![0; 8],
-            // Headroom over the MTU keeps the GRO read path, which lands
-            // with offload, from ever truncating a merged packet.
-            original: vec![0; mtu + 64],
+            // The read scratch carries the vnet header plus the largest
+            // merge the kernel may hand back, so a coalesced burst never
+            // truncates.
+            original: vec![0; VIRTIO_NET_HDR_LEN + 65535],
             mtu,
             caps,
             stopped,
+            vnet,
+            gro_table: tun_rs::GROTable::default(),
+            staging: Vec::new(),
         })
     }
 
@@ -176,19 +197,33 @@ impl PacketDevice for TunDevice {
         }
     }
 
-    fn write_batch(&mut self, bufs: &[BytesMut]) -> io::Result<usize> {
+    fn write_batch(&mut self, bufs: &mut [BytesMut]) -> io::Result<usize> {
         if self.stopped.load(Ordering::Acquire) {
             return Err(io::Error::new(ErrorKind::NotConnected, "device is down"));
         }
-        // With no vnet headers there is nothing to coalesce, so a batch is
-        // a send per packet; the coalescing variant arrives together with
-        // offload negotiation.
-        let mut written = 0;
-        for buf in bufs {
-            self.device.send(buf)?;
-            written += 1;
+        if !self.vnet {
+            // The per-packet baseline: an adopted descriptor carries no
+            // vnet header, so a batch is a send per frame.
+            let count = bufs.len();
+            for buf in bufs {
+                self.device.send(buf)?;
+            }
+            return Ok(count);
         }
-        Ok(written)
+        // The batched send wants the header slot in front of every
+        // frame; staging pays one copy per frame and returns whole-batch
+        // writes (with the kernel merging what it can) in exchange.
+        let count = bufs.len();
+        self.staging.clear();
+        for buf in bufs {
+            let mut framed = BytesMut::with_capacity(VIRTIO_NET_HDR_LEN + buf.len());
+            framed.resize(VIRTIO_NET_HDR_LEN, 0);
+            framed.extend_from_slice(buf);
+            self.staging.push(framed);
+        }
+        self.device
+            .send_multiple(&mut self.gro_table, &mut self.staging, VIRTIO_NET_HDR_LEN)?;
+        Ok(count)
     }
 
     fn capabilities(&self) -> DeviceCaps {
@@ -210,24 +245,37 @@ impl PacketDevice for TunDevice {
     // with one reader; a duplicated descriptor gives exactly that.
     #[allow(unsafe_code)]
     fn duplicate(&self) -> io::Result<Box<dyn PacketDevice>> {
-        use std::os::fd::AsRawFd;
-        // SAFETY: dup returns a fresh owned descriptor of a live fd; the
-        // device below adopts it and nothing else touches it.
-        let twin = unsafe { libc::dup(self.device.as_raw_fd()) };
-        if twin < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        // SAFETY: the fd came from dup above, is valid, and ownership
-        // transfers into the device object.
-        let cloned = unsafe { tun_rs::SyncDevice::from_fd(twin)? };
+        // The offload path clones a whole second queue: a fresh
+        // descriptor attached to the same interface with the vnet
+        // header state inherited, which is the only split the library
+        // supports for an offloaded device. The plain path (an adopted
+        // descriptor, no vnet) keeps the raw dup.
+        let cloned = if self.vnet {
+            self.device.try_clone()?
+        } else {
+            use std::os::fd::AsRawFd;
+            // SAFETY: dup returns a fresh owned descriptor of a live
+            // fd; the device below adopts it and nothing else touches
+            // it.
+            let twin = unsafe { libc::dup(self.device.as_raw_fd()) };
+            if twin < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            // SAFETY: the fd came from dup above, is valid, and
+            // ownership transfers into the device object.
+            unsafe { tun_rs::SyncDevice::from_fd(twin)? }
+        };
         Ok(Box::new(TunDevice {
             device: cloned,
             event: Arc::clone(&self.event),
             sizes: vec![0; 8],
-            original: vec![0; self.mtu + 64],
+            original: vec![0; VIRTIO_NET_HDR_LEN + 65535],
             mtu: self.mtu,
             caps: self.caps,
             stopped: Arc::clone(&self.stopped),
+            vnet: self.vnet,
+            gro_table: tun_rs::GROTable::default(),
+            staging: Vec::new(),
         }))
     }
 }

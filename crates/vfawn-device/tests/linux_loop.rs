@@ -74,8 +74,8 @@ fn reads_kernel_traffic_writes_back_and_stops_cleanly() {
     assert!(seen >= 4, "expected at least four probes, saw {seen}");
 
     let packet = sample.unwrap();
-    let echoed = [BytesMut::from(&packet[..])];
-    assert_eq!(device.write_batch(&echoed).unwrap(), 1);
+    let mut echoed = [BytesMut::from(&packet[..])];
+    assert_eq!(device.write_batch(&mut echoed).unwrap(), 1);
 
     // Shutdown is idempotent; afterwards reads drain to zero and writes
     // are refused.
@@ -83,7 +83,11 @@ fn reads_kernel_traffic_writes_back_and_stops_cleanly() {
     device.shutdown().unwrap();
     let mut drained = vec![BytesMut::new(); 2];
     assert_eq!(device.read_batch(&mut drained).unwrap(), 0);
-    assert!(device.write_batch(&[BytesMut::from(&packet[..])]).is_err());
+    assert!(
+        device
+            .write_batch(&mut [BytesMut::from(&packet[..])])
+            .is_err()
+    );
     let _ = pinger.join().expect("ping thread");
 }
 

@@ -93,7 +93,7 @@ impl PacketDevice for ChaoticDevice {
         Ok(delivered)
     }
 
-    fn write_batch(&mut self, bufs: &[bytes::BytesMut]) -> std::io::Result<usize> {
+    fn write_batch(&mut self, bufs: &mut [bytes::BytesMut]) -> std::io::Result<usize> {
         self.inner.write_batch(bufs)
     }
 

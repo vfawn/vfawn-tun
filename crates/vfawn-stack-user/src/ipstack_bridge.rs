@@ -178,8 +178,8 @@ pub fn start(
                 if let Some(engine) = dns.as_ref() {
                     engine.restore(&mut packet);
                 }
-                let batch = [packet];
-                if write_device.write_batch(&batch).is_err() {
+                let mut batch = [packet];
+                if write_device.write_batch(&mut batch).is_err() {
                     return;
                 }
             }
