@@ -327,18 +327,29 @@ pub struct IcmpPacket {
     flow: FlowInfo,
     kind: u8,
     code: u8,
+    /// The IP hop budget the datagram arrived with: the echo answer
+    /// spends one, exactly as a router in the path would.
+    ttl: u8,
     payload: Bytes,
 }
 
 impl IcmpPacket {
-    /// Wrap a captured ICMP packet.
+    /// Wrap a captured ICMP packet; the hop budget defaults to the
+    /// canonical 64 for callers that did not read one off the wire.
     pub fn new(flow: FlowInfo, kind: u8, code: u8, payload: Bytes) -> Self {
         Self {
             flow,
             kind,
             code,
+            ttl: 64,
             payload,
         }
+    }
+
+    /// State the datagram's hop budget explicitly.
+    pub fn with_ttl(mut self, ttl: u8) -> Self {
+        self.ttl = ttl;
+        self
     }
 
     /// The captured flow identity.
@@ -349,6 +360,11 @@ impl IcmpPacket {
     /// ICMP type field.
     pub fn kind(&self) -> u8 {
         self.kind
+    }
+
+    /// The IP hop budget the datagram arrived with.
+    pub fn ttl(&self) -> u8 {
+        self.ttl
     }
 
     /// ICMP code field.

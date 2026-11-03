@@ -103,6 +103,32 @@ pub fn tcp_rst_teardown_v4(
 /// refused datagram flow produces. The message quotes the offending IP
 /// header and the first eight octets of its payload, per RFC 792, which
 /// is exactly what the sender needs to find the socket responsible.
+/// A whole IPv4 frame around a transport payload: the answer path for
+/// locally built segments (an ICMP echo reply leaves this way). No
+/// options, no fragments, a caller-chosen hop budget.
+pub fn ipv4_frame_v4(
+    src: Ipv4Addr,
+    dst: Ipv4Addr,
+    protocol: IpProtocol,
+    ttl: u8,
+    payload: &[u8],
+) -> Vec<u8> {
+    let total = 20 + payload.len();
+    let mut packet = Vec::with_capacity(total);
+    packet.extend_from_slice(&[0x45, 0x00]);
+    packet.extend_from_slice(&(total as u16).to_be_bytes());
+    packet.extend_from_slice(&[0x00, 0x01, 0x00, 0x00]); // id, flags
+    packet.push(ttl);
+    packet.push(protocol.number());
+    packet.extend_from_slice(&[0x00, 0x00]); // checksum, fixed below
+    packet.extend_from_slice(&src.octets());
+    packet.extend_from_slice(&dst.octets());
+    packet.extend_from_slice(payload);
+    let sum = crate::checksum::sum_words(&packet[..20]);
+    packet[10..12].copy_from_slice(&(!crate::checksum::fold(sum)).to_be_bytes());
+    packet
+}
+
 pub fn icmpv4_unreachable_v4(from: Ipv4Addr, offending: &[u8], code: u8) -> Option<Vec<u8>> {
     let (ip, _) = Ipv4Header::parse(offending).ok()?;
     let quote_end = offending.len().min(ip.header_len + 8);

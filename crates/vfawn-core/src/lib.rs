@@ -21,6 +21,7 @@ pub mod monitor;
 pub mod outbound;
 pub mod session;
 pub mod stack;
+pub mod stack_policy;
 pub mod udp_nat;
 pub mod verdict;
 
@@ -38,5 +39,6 @@ pub use session::{
     TcpSession, TcpTransport, UdpSession, UdpTransport, Verdict,
 };
 pub use stack::{StackBackend, StackHandle};
+pub use stack_policy::{AutoChoice, AutoFacts, Platform};
 pub use udp_nat::{UdpFlowOutcome, UdpNat};
 pub use verdict::{CountingTracker, VerdictAction, execute};
