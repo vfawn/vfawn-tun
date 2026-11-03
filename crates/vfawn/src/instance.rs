@@ -100,13 +100,81 @@ impl Instance {
         self.start_inner(handler)
     }
 
-    #[cfg(feature = "backend-ipstack")]
     fn start_inner(&mut self, handler: Arc<dyn SessionHandler>) -> io::Result<()> {
         let device = vfawn_device::TunDevice::create(&self.config.device)?;
+
+        // The policy resolves before the first packet: Auto consults
+        // its matrix (platform, capture mode, kernel-path facts), the
+        // explicit policies answer themselves. An engine the build
+        // left out falls back to the one that is in, with the choice
+        // recorded so the mismatch is visible, not silent.
+        let facts = vfawn_core::AutoFacts {
+            platform: self.platform(),
+            include_all_networks: self.config.stack.include_all_networks,
+            kernel_path_available: cfg!(any(target_os = "linux", target_os = "macos")),
+        };
+        let choice = self.config.stack.policy.resolve(&facts);
+        let backend: Box<dyn vfawn_core::StackBackend> = match choice {
+            vfawn_core::AutoChoice::Userspace => self.native_backend(),
+            vfawn_core::AutoChoice::Kernel => self.ipstack_backend(),
+        };
+        self.finish_start(backend, device, handler)
+    }
+
+    /// The platform fact the matrix consults.
+    fn platform(&self) -> vfawn_core::Platform {
+        #[cfg(target_os = "linux")]
+        {
+            vfawn_core::Platform::Linux
+        }
+        #[cfg(target_os = "macos")]
+        {
+            vfawn_core::Platform::Darwin
+        }
+        #[cfg(target_os = "windows")]
+        {
+            vfawn_core::Platform::Windows
+        }
+        #[cfg(target_os = "android")]
+        {
+            vfawn_core::Platform::Android
+        }
+        #[cfg(not(any(
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "windows",
+            target_os = "android"
+        )))]
+        {
+            vfawn_core::Platform::Linux
+        }
+    }
+
+    #[cfg(feature = "backend-native")]
+    fn native_backend(&self) -> Box<dyn vfawn_core::StackBackend> {
+        Box::new(vfawn_stack_user::NativeBackend {
+            congestion: self.config.stack.congestion,
+            ..vfawn_stack_user::NativeBackend::default()
+        })
+    }
+
+    #[cfg(not(feature = "backend-native"))]
+    fn native_backend(&self) -> Box<dyn vfawn_core::StackBackend> {
+        // The matrix chose userspace and the build has only the other
+        // engine: the fallback is the transitional stack, and the
+        // mismatch rides in the logs once, not in silence.
+        eprintln!(
+            "vfawn: policy chose the native stack; falling back to ipstack (feature not compiled)"
+        );
+        self.ipstack_backend()
+    }
+
+    #[cfg(feature = "backend-ipstack")]
+    fn ipstack_backend(&self) -> Box<dyn vfawn_core::StackBackend> {
         let mss = (self.config.device.mtu.min(65535) as u16)
             .saturating_sub(40)
             .max(536);
-        let backend = Box::new(vfawn_stack_user::IpstackBackend {
+        Box::new(vfawn_stack_user::IpstackBackend {
             mss,
             udp_nat: std::sync::Arc::new(vfawn_core::UdpNat::from_config(
                 &self.config.stack.udp_nat,
@@ -118,7 +186,24 @@ impl Instance {
             )),
             udp_timeout_secs: self.config.stack.udp_timeout.as_secs(),
             tcp_timeout_secs: 60,
-        });
+        })
+    }
+
+    #[cfg(not(feature = "backend-ipstack"))]
+    fn ipstack_backend(&self) -> Box<dyn vfawn_core::StackBackend> {
+        eprintln!(
+            "vfawn: policy chose the kernel path; falling back to native (feature not compiled)"
+        );
+        self.native_backend()
+    }
+
+    /// The shared tail: capture orchestration, backend spawn, handle.
+    fn finish_start(
+        &mut self,
+        backend: Box<dyn vfawn_core::StackBackend>,
+        device: vfawn_device::TunDevice,
+        handler: Arc<dyn SessionHandler>,
+    ) -> io::Result<()> {
         // Route orchestration installs after the device exists (rules
         // and addresses reference its real name) and before traffic
         // flows (the capture must already own the routing table).
@@ -140,13 +225,12 @@ impl Instance {
             )?);
         }
 
-        use vfawn_core::StackBackend;
-        let handle = backend.spawn(Box::new(device), handler)?;
-        self.handle = Some(handle);
-        Ok(())
+        vfawn_core::StackBackend::spawn(backend, Box::new(device), handler).map(|handle| {
+            self.handle = Some(handle);
+        })
     }
 
-    #[cfg(not(feature = "backend-ipstack"))]
+    #[cfg(not(any(feature = "backend-ipstack", feature = "backend-native")))]
     fn start_inner(&mut self, _handler: Arc<dyn SessionHandler>) -> io::Result<()> {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,

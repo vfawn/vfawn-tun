@@ -25,6 +25,7 @@ vfawn-platform = { path = "../vfawn-platform" }
 [features]
 default = ["backend-ipstack"]
 backend-ipstack = ["dep:vfawn-stack-user", "vfawn-stack-user/backend-ipstack"]
+backend-native = ["dep:vfawn-stack-user", "vfawn-stack-user/backend-native"]
 
 [dev-dependencies]
 vfawn-testsuite = { path = "../vfawn-testsuite" }
