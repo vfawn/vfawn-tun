@@ -89,12 +89,12 @@ impl TunDevice {
     /// concern, not a framing one, and land with the route engine.
     pub fn create(config: &DeviceConfig) -> io::Result<Self> {
         let mtu = effective_mtu(config.mtu);
-        // Vnet headers stay off this phase: the write batching they
-        // buy is real, but the read side then receives kernel-merged
-        // GSO bursts that both stacks above mis-handle (measured: an
-        // eight-stream upload collapses from 200 to 6-18 Mbit/s with
-        // the merge active). That integration is its own work; the
-        // stable truth today is the plain-frame path.
+        // Vnet stays off: with it the kernel coalesces the peer's
+        // inbound TCP and both stacks above collapse (measured 4.5
+        // Mbit/s on an eight-stream upload against 200 without it,
+        // buffer sizing already corrected — the merged-burst semantics
+        // need dedicated integration work in the stacks, tracked as
+        // its own item). The plain-frame path is the stable truth.
         let mut builder = DeviceBuilder::new().mtu(mtu as u16);
         if let Some(name) = &config.name {
             builder = builder.name(name.clone());
@@ -178,23 +178,24 @@ impl TunDevice {
 /// stop flag, which the loop head sorts.
 fn io_loop(shared: Arc<Shared>, mut device: SyncDevice, writes: Receiver<Vec<BytesMut>>) {
     let mut sizes = vec![0usize; BATCH];
-    // The buffers the kernel read fills; they grow to whatever a merged
-    // burst needs and travel to the reader by ownership, the reader's
-    // empties flowing back the same way inside its next request.
-    // The kernel read needs each buffer pre-sized to the largest merge
-    // it may return; buffers that circulate back from a reader arrive
-    // at whatever capacity that side had, so every round tops them up
-    // (a resize inside capacity is free).
-    let need = VIRTIO_NET_HDR_LEN + 65535;
-    let mut bufs: Vec<BytesMut> = (0..BATCH).map(|_| BytesMut::zeroed(need)).collect();
+    // The buffers the kernel read fills hold one split segment each
+    // (the merged burst lands whole in the scratch above and the
+    // library slices it out), so an MTU-plus-slack length is the
+    // whole requirement — sizing them to the merge ceiling instead
+    // zeroed megabytes per cycle and crushed an offload run to
+    // single-digit Mbit/s. They travel to the reader by ownership;
+    // the reader's empties flow back and get topped up (free inside
+    // capacity).
+    let seg = 1514;
+    let mut bufs: Vec<BytesMut> = (0..BATCH).map(|_| BytesMut::zeroed(seg)).collect();
     let mut gro_table = tun_rs::GROTable::default();
     let mut staging: Vec<BytesMut> = Vec::new();
     let mut original = vec![0u8; VIRTIO_NET_HDR_LEN + 65535];
 
     loop {
         for buf in bufs.iter_mut() {
-            if buf.len() < need {
-                buf.resize(need, 0);
+            if buf.len() < seg {
+                buf.resize(seg, 0);
             }
         }
         loop {
