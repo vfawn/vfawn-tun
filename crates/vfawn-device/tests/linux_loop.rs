@@ -59,8 +59,11 @@ fn reads_kernel_traffic_writes_back_and_stops_cleanly() {
     let deadline = Instant::now() + Duration::from_secs(10);
     while seen < 4 && Instant::now() < deadline {
         let count = device.read_batch(&mut bufs).expect("read batch");
+        // Zero means nothing arrived in this window, not that the
+        // device is done: probes land every 200ms and the read's wait
+        // is shorter, so only the deadline ends the hunt.
         if count == 0 {
-            break;
+            continue;
         }
         for buf in bufs.iter().take(count) {
             if buf.len() >= 10 && buf[0] >> 4 == 4 && buf[9] == 1 {
