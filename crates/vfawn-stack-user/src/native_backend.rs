@@ -276,6 +276,22 @@ impl TcpSlot {
     }
 }
 
+impl TcpSlot {
+    /// One reaction onto the wire; the handshake's SYN-ACK is the only
+    /// segment that carries options.
+    fn emit(&mut self, reaction: &Reaction, out: &mut VecDeque<BytesMut>) {
+        let options = if reaction.flags & 0x02 != 0 {
+            self.connection.handshake_options()
+        } else {
+            Vec::new()
+        };
+        let frame = emit_v4(self.server, self.client, reaction, &options, &[]);
+        out.push_back(BytesMut::from(&frame[..]));
+        self.connection
+            .send_advance(u32::from(reaction.flags & 0x03 != 0));
+    }
+}
+
 impl SlotLogic for TcpSlot {
     fn on_packet(
         &mut self,
@@ -370,18 +386,11 @@ impl SlotLogic for TcpSlot {
             self.synack_at = Some(Instant::now());
             self.synack_retries = 0;
         }
+        // Every acknowledgment leaves with its segment: pooling them
+        // (tried, measured) starves the peer's ACK-clocked send window
+        // threefold on upload, which no saved frame ever repaid.
         if reaction.flags != 0 {
-            // Only the handshake's SYN-ACK carries options (the MSS
-            // and window-scale offers).
-            let options = if reaction.flags & 0x02 != 0 {
-                self.connection.handshake_options()
-            } else {
-                Vec::new()
-            };
-            let frame = emit_v4(self.server, self.client, &reaction, &options, &[]);
-            out.push_back(BytesMut::from(&frame[..]));
-            self.connection
-                .send_advance(u32::from(reaction.flags & 0x03 != 0));
+            self.emit(&reaction, out);
         }
 
         // Half-close (RFC 9293 §3.5): the peer's FIN ends its
@@ -542,21 +551,39 @@ impl TcpTransport for NativeTcpIo {
         loop {
             if !self.pending.is_empty() {
                 let take = self.pending.len().min(buf.len());
-                let bytes: Vec<u8> = self.pending.drain(..take).collect();
-                buf[..take].copy_from_slice(&bytes);
+                for (slot, byte) in self.pending.drain(..take).enumerate() {
+                    buf[slot] = byte;
+                }
                 return Ok(take);
             }
+            if self.closed {
+                return Ok(0);
+            }
             match self.events.recv().await {
-                Some(HostEvent::Bytes(bytes)) => self.pending.extend(bytes),
+                Some(HostEvent::Bytes(bytes)) => {
+                    self.pending.extend(bytes);
+                    // Carry whatever else already queued: one return
+                    // holds as many segments as fit the caller's
+                    // buffer, so a relay writes one large chunk instead
+                    // of waking and writing per segment. A close that
+                    // lands mid-drain is remembered, not swallowed:
+                    // the bytes already held leave first, the next read
+                    // reports the end.
+                    while self.pending.len() < buf.len() {
+                        match self.events.try_recv() {
+                            Ok(HostEvent::Bytes(more)) => self.pending.extend(more),
+                            Ok(HostEvent::Established) => {}
+                            Ok(HostEvent::Closed) => {
+                                self.closed = true;
+                                break;
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                }
                 Some(HostEvent::Established) => continue,
-                Some(HostEvent::Closed) => {
-                    self.closed = true;
-                    return Ok(0);
-                }
-                None => {
-                    self.closed = true;
-                    return Ok(0);
-                }
+                Some(HostEvent::Closed) => self.closed = true,
+                None => self.closed = true,
             }
         }
     }
