@@ -70,12 +70,13 @@ impl TunDevice {
     /// concern, not a framing one, and land with the route engine.
     pub fn create(config: &DeviceConfig) -> io::Result<Self> {
         let mtu = effective_mtu(config.mtu);
-        // The offload path is plumbed but not yet switched on: the
-        // multi-queue flag the queue-cloning split needs does not take
-        // effect through this builder yet (the clone answers
-        // "iff_multi_queue not enabled"), and a half-offloaded device
-        // cannot come up at all. The batched-send and merged-receive
-        // arms below stay ready for the day the flag does.
+        // The offload path is plumbed but switched off, and the reason
+        // is now sharp: splitting read and write across multi-queue
+        // clones lets the kernel steer inbound packets to the queue
+        // nobody reads (both stacks' connections died on the spot the
+        // moment the flags went live). The shape that fits is one
+        // queue and one device-internal I/O thread owning it; until
+        // that lands, the per-packet baseline below stays the truth.
         let mut builder = DeviceBuilder::new().mtu(mtu as u16);
         if let Some(name) = &config.name {
             builder = builder.name(name.clone());
@@ -87,9 +88,6 @@ impl TunDevice {
             builder = builder.ipv6(net.addr(), net.prefix_len());
         }
         let device = builder.build_sync()?;
-        // The caps say what this device can actually do: the offload
-        // path negotiated vnet headers, which is exactly GSO on send
-        // and GRO on receive.
         let caps = DeviceCaps::MINIMAL;
         Self::wrap(device, mtu as usize, caps, false)
     }
