@@ -345,6 +345,8 @@ struct ShardShared {
     outbox: Arc<Mutex<VecDeque<BytesMut>>>,
     wake: Arc<AtomicBool>,
     stopped: Arc<AtomicBool>,
+    /// One-shot backlog warning for this lane's outbox.
+    wrote_warning: Arc<AtomicBool>,
 }
 
 /// The pipeline-wide stop: every thread honors it, including the
@@ -390,6 +392,7 @@ impl Shards {
             let outbox = Arc::new(Mutex::new(VecDeque::new()));
             let wake = Arc::new(AtomicBool::new(false));
             let stopped = Arc::new(AtomicBool::new(false));
+            let wrote_warning = Arc::new(AtomicBool::new(false));
             let counter = Arc::new(AtomicU64::new(0));
             let shard_pool = Arc::clone(&pool);
             let shard_logic = Arc::clone(&logic);
@@ -423,6 +426,7 @@ impl Shards {
                 outbox,
                 wake,
                 stopped,
+                wrote_warning,
             });
             processed.push(counter);
         }
@@ -503,6 +507,14 @@ impl Shards {
                         let mut any_stopped = false;
                         for lane in &writer_shared {
                             let mut outbox = lane.outbox.lock().expect("outbox lock");
+                            if outbox.len() > 8192
+                                && !lane.wrote_warning.swap(true, Ordering::Relaxed)
+                            {
+                                eprintln!(
+                                    "vfawn: outbox backlog {} packets; the writer cannot keep up",
+                                    outbox.len()
+                                );
+                            }
                             while let Some(packet) = outbox.pop_front() {
                                 batch.push(packet);
                             }
@@ -513,7 +525,15 @@ impl Shards {
                             }
                         }
                         if !batch.is_empty() {
-                            if device.write_batch(&batch).is_err() {
+                            if let Err(error) = device.write_batch(&batch) {
+                                // A device that refuses writes is a
+                                // dead pipeline: say so, stop every
+                                // thread, and release what was in
+                                // hand. Draining silently would turn
+                                // the outboxes into an unbounded sink
+                                // that nothing ever reads again.
+                                eprintln!("vfawn: device write failed ({error}); stopping");
+                                stop_all_for_writer.store(true, Ordering::Release);
                                 for packet in batch.drain(..) {
                                     writer_pool.release_packet(packet);
                                 }
