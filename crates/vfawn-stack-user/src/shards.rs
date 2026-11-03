@@ -46,6 +46,13 @@ pub struct BufferPool {
     batches: Mutex<Vec<Vec<BytesMut>>>,
 }
 
+/// How much the pool may retain. Circulation covers the working set;
+/// beyond this, releasing returns memory to the allocator instead of
+/// hoarding it (a pool that only ever receives is a leak with extra
+/// steps, which one very long iperf afternoon proved).
+const POOL_PACKET_CAP: usize = 4096;
+const POOL_BATCH_CAP: usize = 256;
+
 impl BufferPool {
     pub fn new() -> Self {
         Self::default()
@@ -67,7 +74,10 @@ impl BufferPool {
     }
 
     pub fn release_packet(&self, buffer: BytesMut) {
-        self.packets.lock().expect("packet pool lock").push(buffer);
+        let mut pool = self.packets.lock().expect("packet pool lock");
+        if pool.len() < POOL_PACKET_CAP {
+            pool.push(buffer);
+        }
     }
 
     pub fn batch(&self) -> Vec<BytesMut> {
@@ -79,7 +89,10 @@ impl BufferPool {
     }
 
     pub fn release_batch(&self, batch: Vec<BytesMut>) {
-        self.batches.lock().expect("batch pool lock").push(batch);
+        let mut pool = self.batches.lock().expect("batch pool lock");
+        if pool.len() < POOL_BATCH_CAP {
+            pool.push(batch);
+        }
     }
 }
 
@@ -434,6 +447,8 @@ impl Shards {
         // The single producer: reads device batches, splits them per
         // flow hash, and hands each sub-batch to its shard inbox.
         let stop_all_for_producer = Arc::clone(&stop_all);
+        let producer_pool = Arc::clone(&pool);
+        let producer_mtu = config.mtu;
         let producer_shared: Vec<ShardShared> = shared.clone();
         let mut staging: Vec<Vec<Option<BytesMut>>> =
             (0..shard_count).map(|_| Vec::new()).collect();
@@ -468,6 +483,11 @@ impl Shards {
                                         lane.reserve_exact(16);
                                     }
                                     lane.push(Some(std::mem::take(buf)));
+                                    // The reader's slot refills from the
+                                    // pool: the buffer the writer released
+                                    // comes back around instead of the pool
+                                    // growing into a one-way sink.
+                                    *buf = producer_pool.packet(producer_mtu);
                                 }
                                 for shard in 0..shard_count {
                                     if !staging[shard].is_empty()
