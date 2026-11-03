@@ -36,8 +36,11 @@ const DEFAULT_MTU: u32 = 65535;
 const READ_DEPTH: usize = 64;
 const WRITE_DEPTH: usize = 64;
 
-/// Frames handed between the I/O thread and a caller in one batch.
-const BATCH: usize = 8;
+/// Frames handed between the I/O thread and a caller in one batch:
+/// the library's own ideal, because a merged GRO burst under bulk load
+/// arrives as many segments at once and a short buffer array turns
+/// that into a fatal "too many GSO segments".
+const BATCH: usize = tun_rs::IDEAL_BATCH_SIZE;
 
 /// The MTU in force for buffer sizing, after platform derivation.
 fn effective_mtu(explicit: u32) -> u32 {
@@ -86,7 +89,13 @@ impl TunDevice {
     /// concern, not a framing one, and land with the route engine.
     pub fn create(config: &DeviceConfig) -> io::Result<Self> {
         let mtu = effective_mtu(config.mtu);
-        let mut builder = DeviceBuilder::new().mtu(mtu as u16).offload(true);
+        // Vnet headers stay off this phase: the write batching they
+        // buy is real, but the read side then receives kernel-merged
+        // GSO bursts that both stacks above mis-handle (measured: an
+        // eight-stream upload collapses from 200 to 6-18 Mbit/s with
+        // the merge active). That integration is its own work; the
+        // stable truth today is the plain-frame path.
+        let mut builder = DeviceBuilder::new().mtu(mtu as u16);
         if let Some(name) = &config.name {
             builder = builder.name(name.clone());
         }
@@ -97,13 +106,7 @@ impl TunDevice {
             builder = builder.ipv6(net.addr(), net.prefix_len());
         }
         let device = builder.build_sync()?;
-        // A device the builder configured carries the vnet header, which
-        // is exactly GSO on send and GRO on receive.
-        let caps = DeviceCaps {
-            gso: true,
-            gro: true,
-            queues: 1,
-        };
+        let caps = DeviceCaps::MINIMAL;
         Self::spawn_io(device, caps)
     }
 
@@ -197,7 +200,8 @@ fn io_loop(shared: Arc<Shared>, mut device: SyncDevice, writes: Receiver<Vec<Byt
         loop {
             match writes.try_recv() {
                 Ok(batch) => {
-                    if let Err(error) = send_batch(&mut device, &mut gro_table, &mut staging, &batch)
+                    if let Err(error) =
+                        send_batch(&mut device, &mut gro_table, &mut staging, &batch)
                     {
                         // A queue that cannot take the batch right now
                         // is backpressure, not death: the drop behaves
@@ -207,13 +211,17 @@ fn io_loop(shared: Arc<Shared>, mut device: SyncDevice, writes: Receiver<Vec<Byt
                         // kernel removes the device with the last fd,
                         // and every route falls through to a bypass.
                         if error.kind() == ErrorKind::NotConnected {
+                            eprintln!("vfawn: tun I/O stopped: device down");
                             shared.stopped.store(true, Ordering::Release);
                             return;
                         }
                     }
                 }
                 Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => return,
+                Err(TryRecvError::Disconnected) => {
+                    eprintln!("vfawn: tun I/O stopped: writers gone");
+                    return;
+                }
             }
         }
         if shared.stopped.load(Ordering::Acquire) {
@@ -226,6 +234,7 @@ fn io_loop(shared: Arc<Shared>, mut device: SyncDevice, writes: Receiver<Vec<Byt
                     frames.push(std::mem::take(buf));
                 }
                 if shared.reads.send(frames).is_err() {
+                    eprintln!("vfawn: tun I/O stopped: reader gone");
                     return;
                 }
             }
@@ -240,9 +249,18 @@ fn io_loop(shared: Arc<Shared>, mut device: SyncDevice, writes: Receiver<Vec<Byt
                 let _ = shared.event.reset();
                 continue;
             }
-            Err(_) => {
+            Err(error) if error.kind() == ErrorKind::NotConnected => {
+                eprintln!("vfawn: tun I/O stopped: device down");
                 shared.stopped.store(true, Ordering::Release);
                 return;
+            }
+            // Any other read failure — a burst that still does not fit,
+            // a hiccup in the merge path — loses that one read, not the
+            // interface: the kernel retries, the flows retransmit, and
+            // the descriptor staying alive keeps the routes owning the
+            // namespace.
+            Err(error) => {
+                eprintln!("vfawn: tun read failed ({error}); continuing");
             }
         }
     }
