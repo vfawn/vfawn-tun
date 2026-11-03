@@ -197,9 +197,19 @@ fn io_loop(shared: Arc<Shared>, mut device: SyncDevice, writes: Receiver<Vec<Byt
         loop {
             match writes.try_recv() {
                 Ok(batch) => {
-                    if send_batch(&mut device, &mut gro_table, &mut staging, &batch).is_err() {
-                        shared.stopped.store(true, Ordering::Release);
-                        return;
+                    if let Err(error) = send_batch(&mut device, &mut gro_table, &mut staging, &batch)
+                    {
+                        // A queue that cannot take the batch right now
+                        // is backpressure, not death: the drop behaves
+                        // like a qdisc drop (TCP above retransmits,
+                        // UDP loses one datagram), which beats taking
+                        // the whole interface down mid-transfer — the
+                        // kernel removes the device with the last fd,
+                        // and every route falls through to a bypass.
+                        if error.kind() == ErrorKind::NotConnected {
+                            shared.stopped.store(true, Ordering::Release);
+                            return;
+                        }
                     }
                 }
                 Err(TryRecvError::Empty) => break,
@@ -220,10 +230,16 @@ fn io_loop(shared: Arc<Shared>, mut device: SyncDevice, writes: Receiver<Vec<Byt
                 }
             }
             Ok(_) => {}
-            // The wake is the write side's knock or the stop flag's;
-            // the loop head tells them apart. Treating it as an error
-            // would kill the descriptor on the first write.
-            Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+            // The wake is the write side's knock or the stop flag's.
+            // The event is level-triggered: it stays high until reset,
+            // so an unreset wake turns this loop into a spin that
+            // starves every reader. Reset first, then loop: the head
+            // drains whatever writes exist, and one landing later
+            // re-triggers the (now clear) event.
+            Err(error) if error.kind() == ErrorKind::Interrupted => {
+                let _ = shared.event.reset();
+                continue;
+            }
             Err(_) => {
                 shared.stopped.store(true, Ordering::Release);
                 return;
