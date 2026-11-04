@@ -209,6 +209,21 @@ impl TcpSlot {
     /// what is unacknowledged exceed the congestion window (RFC 5681
     /// §3.1: cwnd bounds SND.NXT minus SND.UNA).
     fn drain_writes(&mut self, out: &mut VecDeque<BytesMut>) {
+        // The registered-flow exit: frames build here (same sequence
+        // cursor, same window arithmetic) but leave through the TUN's
+        // write channel, skipping the outbox and the writer thread.
+        // The connection stays the single source of truth for the
+        // sequence space, which is the bug the relay-side fast path
+        // taught (its local cursor started at the wrong base).
+        if crate::splice_lane::SpliceLane::global()
+            .fd_for(&self.flow_key)
+            .is_some()
+        {
+            let drained = self.drain_writes_fast();
+            if drained > 0 {
+                return;
+            }
+        }
         let inflight = self
             .connection
             .send_nxt()
@@ -291,6 +306,56 @@ impl TcpSlot {
         out.push_back(BytesMut::from(&frame[..]));
         self.connection
             .send_advance(u32::from(reaction.flags & 0x03 != 0));
+    }
+}
+
+impl TcpSlot {
+    /// The downlink fast path's drain: same frame construction, same
+    /// sequence advance, but the exit is the TUN channel rather than
+    /// the shard's outbox. Returns bytes moved.
+    fn drain_writes_fast(&mut self) -> usize {
+        let inflight = self
+            .connection
+            .send_nxt()
+            .wrapping_sub(self.connection.send_una());
+        let sendable = self.cc.window().min(self.connection.peer_window());
+        let mut budget = sendable.saturating_sub(inflight) as usize;
+        let mut lane = self.write_lane.lock().expect("write lane");
+        let mut frames: Vec<BytesMut> = Vec::new();
+        let mut moved = 0usize;
+        while let Some(write) = lane.writes.front_mut() {
+            if write.is_empty() {
+                break; // the FIN marker: the slow path owns the close
+            }
+            if budget == 0 {
+                break;
+            }
+            let take = write.len().min(budget).min(self.connection.mss() as usize);
+            let more_after = write.len() > take;
+            let reaction = Reaction {
+                seq: self.connection.send_nxt(),
+                ack: self.connection.recv_nxt(),
+                flags: if more_after { 0x10 } else { 0x18 },
+                window: self.connection.advertised_window(),
+                delivered: Vec::new(),
+                held: false,
+                gap_filled: false,
+            };
+            let frame = emit_v4(self.server, self.client, &reaction, &[], &write[..take]);
+            frames.push(BytesMut::from(&frame[..]));
+            self.connection.send_advance(take as u32);
+            write.drain(..take);
+            moved += take;
+            budget -= take;
+            if write.is_empty() {
+                lane.writes.pop_front();
+            }
+        }
+        drop(lane);
+        if moved > 0 && !crate::splice_lane::SpliceLane::global().push_to_tun(frames) {
+            return 0; // channel gone: the slow path must take over
+        }
+        moved
     }
 }
 

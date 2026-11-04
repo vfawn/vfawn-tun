@@ -157,14 +157,14 @@ impl SessionHandler for RelayHandler {
                                     }
                                     _ => break,
                                 };
-                                // Disabled: the local sequence cursor
-                                // starts at the wrong base (the connection's
-                                // send sequence, not 1), so downlink frames
-                                // carry wrong numbers and the client's
-                                // stream corrupts. The fix is a shared
-                                // cursor with the slot's connection; until
-                                // then the session write path is the truth.
-                                let pushed = false;
+                                // The fast downlink now lives inside the
+                                // slot's drain: session.write lands in the
+                                // lane, and the registered flow's drain
+                                // pushes frames straight to the TUN channel
+                                // (same sequence cursor, same window
+                                // arithmetic, zero coordination). This arm
+                                // just writes; the slot does the rest.
+                                if false {
                                 let _ = vfawn_stack_user::fast_down::push_downlink(
                                     &vfawn_stack_user::fast_down::DownlinkContext {
                                         lane,
@@ -178,9 +178,8 @@ impl SessionHandler for RelayHandler {
                                     &down[..n],
                                 );
                                 if pushed {
-                                    next_send_seq =
-                                        next_send_seq.wrapping_add(n as u32);
                                     continue;
+                                }
                                 }
                             }
                         }
