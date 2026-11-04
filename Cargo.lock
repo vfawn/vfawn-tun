@@ -1446,6 +1446,7 @@ dependencies = [
  "async-trait",
  "bytes",
  "ipstack",
+ "libc",
  "tokio",
  "vfawn-core",
  "vfawn-testsuite",

@@ -44,6 +44,8 @@ pub use congestion::{CongestionAlgo, Cubic, Reno, Signal};
 pub use icmp::{ECHO_REPLY, ECHO_REQUEST, IcmpTable, IcmpVerdict, TIME_EXCEEDED, UNREACHABLE};
 #[cfg(feature = "backend-native")]
 pub use icmp_slot::IcmpSlot;
+#[cfg(feature = "backend-native")]
+pub mod splice_lane;
 #[cfg(feature = "backend-ipstack")]
 pub use ipstack_backend::IpstackBackend;
 #[cfg(feature = "backend-native")]
@@ -54,3 +56,5 @@ pub use native_tcp::{Inbound, NativeTcpConnection, Reaction, ServerConnection, T
 #[cfg(feature = "backend-native")]
 #[cfg(feature = "backend-native")]
 pub use shards::{ShardConfig, Shards, SlotLogic, UdpEcho};
+#[cfg(all(feature = "backend-native", target_os = "linux"))]
+pub use splice_lane::SpliceLane;
