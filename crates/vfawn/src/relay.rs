@@ -157,7 +157,15 @@ impl SessionHandler for RelayHandler {
                                     }
                                     _ => break,
                                 };
-                                let pushed = vfawn_stack_user::fast_down::push_downlink(
+                                // Disabled: the local sequence cursor
+                                // starts at the wrong base (the connection's
+                                // send sequence, not 1), so downlink frames
+                                // carry wrong numbers and the client's
+                                // stream corrupts. The fix is a shared
+                                // cursor with the slot's connection; until
+                                // then the session write path is the truth.
+                                let pushed = false;
+                                let _ = vfawn_stack_user::fast_down::push_downlink(
                                     &vfawn_stack_user::fast_down::DownlinkContext {
                                         lane,
                                         src: std::net::SocketAddrV4::new(src_v4, flow.destination.port()),
