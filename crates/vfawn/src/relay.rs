@@ -80,7 +80,14 @@ impl SessionHandler for RelayHandler {
         let destination = session.flow().destination;
         let mut outbound = match dial_tcp(&self.protect, destination).await {
             Ok(stream) => stream,
-            Err(_) => {
+            Err(error) => {
+                // The flow is live on the client side and dead on the
+                // origin side; saying nothing here strands the client
+                // waiting for an answer that will never come. The
+                // line names the dial's refusal in the log; the
+                // session's drop closes the event channel, which is
+                // the slot's signal to reset the flow.
+                eprintln!("vfawn: relay dial failed to {destination} ({error})");
                 return;
             }
         };
@@ -97,45 +104,18 @@ impl SessionHandler for RelayHandler {
                 vfawn_stack_user::splice_lane::SpliceLane::global().register(key, fd);
             }
         }
-        // The downlink fast path's context: the flow's addresses and
-        // the lane, captured for the read loop below.
-        #[cfg(all(feature = "backend-native", target_os = "linux"))]
-        let fast_down = relay_flow_key(session.flow()).map(|key| {
-            let flow = session.flow();
-            (
-                key,
-                vfawn_stack_user::splice_lane::SpliceLane::global(),
-                flow,
-            )
-        });
 
-        // Four kilobytes per direction: the fast path carries bulk
+        // Two kilobytes per direction: the fast path carries bulk
         // through the lane, so the relay's buffers only need to cover
         // the slow flows. Thirty-two-kilobyte buffers were the
         // measured thirty-six-kilobyte session's biggest piece.
         let mut up = [0u8; 2048];
         let mut down = [0u8; 2048];
-        // The fast path's send-sequence cursor: starts at the
-        // connection's established sequence (the relay's first byte
-        // rides at the handshake's next sequence number, which the
-        // fast path tracks locally; the slow path's cursor stays in
-        // the shard slot, and the two converge because every byte
-        // passes through exactly one of them).
-        #[cfg(all(feature = "backend-native", target_os = "linux"))]
-        let mut next_send_seq: u32 = 1;
-        #[cfg(all(feature = "backend-native", target_os = "linux"))]
-        let mut flow_ack: u32 = 1;
         loop {
             tokio::select! {
                 from_client = session.read(&mut up) => match from_client {
                     Ok(0) | Err(_) => break,
                     Ok(n) => {
-                        #[cfg(all(feature = "backend-native", target_os = "linux"))]
-                        {
-                            // The client's data advances the ack we
-                            // stamp on downlink frames.
-                            flow_ack = flow_ack.wrapping_add(n as u32);
-                        }
                         if outbound.write_all(&up[..n]).await.is_err() {
                             break;
                         }
@@ -144,49 +124,15 @@ impl SessionHandler for RelayHandler {
                 from_origin = outbound.read(&mut down) => match from_origin {
                     Ok(0) | Err(_) => break,
                     Ok(n) => {
-                        // The downlink fast path: build the frames here
-                        // and push straight to the TUN, skipping the
-                        // session's write lane and the shard's drain.
-                        // Falls back to the session when the lane is
-                        // absent or the device is gone.
-                        #[cfg(all(feature = "backend-native", target_os = "linux"))]
-                        {
-                            if let Some((_, lane, flow)) = &fast_down {
-                                let (src_v4, dst_v4) = match (
-                                    flow.destination.ip(),
-                                    flow.source.ip(),
-                                ) {
-                                    (std::net::IpAddr::V4(a), std::net::IpAddr::V4(b)) => {
-                                        (a, b)
-                                    }
-                                    _ => break,
-                                };
-                                // The fast downlink now lives inside the
-                                // slot's drain: session.write lands in the
-                                // lane, and the registered flow's drain
-                                // pushes frames straight to the TUN channel
-                                // (same sequence cursor, same window
-                                // arithmetic, zero coordination). This arm
-                                // just writes; the slot does the rest.
-                                if false {
-                                let _ = vfawn_stack_user::fast_down::push_downlink(
-                                    &vfawn_stack_user::fast_down::DownlinkContext {
-                                        lane,
-                                        src: std::net::SocketAddrV4::new(src_v4, flow.destination.port()),
-                                        dst: std::net::SocketAddrV4::new(dst_v4, flow.source.port()),
-                                        seq: next_send_seq,
-                                        ack: flow_ack,
-                                        window: 65535,
-                                        mss: 1460,
-                                    },
-                                    &down[..n],
-                                );
-                                if pushed {
-                                    continue;
-                                }
-                                }
-                            }
-                        }
+                        // Downlink rides the session's write lane into
+                        // the slot's drain. The relay-side frame builder
+                        // this arm once carried was parked on evidence
+                        // twice over: its local sequence cursor desynced
+                        // from the connection's (the client saw out-of-
+                        // order frames), and re-pointing it at the TUN
+                        // channel made the channel multi-producer, which
+                        // collapsed both directions. The drain owns
+                        // downlink; this side only moves bytes.
                         if session.write(&down[..n]).await.is_err() {
                             break;
                         }

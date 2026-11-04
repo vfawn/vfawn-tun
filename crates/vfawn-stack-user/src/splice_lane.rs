@@ -3,44 +3,156 @@
 
 //! The payload fast path: once a relay flow is established, its data
 //! segments skip the TCP state machine's session machinery entirely.
-//! The shard parses just enough header to identify the flow and the
-//! payload range, then the bytes move through a kernel pipe to the
-//! outbound socket (Linux `splice(2)`, the mechanism behind the go
-//! stack's 39.5 Gbit/s: the payload never crosses into a second
-//! userspace buffer, and no per-segment task wakeups happen).
+//! The dispatch parses just enough header to identify the flow and the
+//! payload range, then the bytes move to the outbound socket with one
+//! write syscall (the v0 lane; the kernel-pipe `splice(2)` variant
+//! replaces the write once the PoC's numbers justify the pipe pair's
+//! setup, and both shapes skip the session channel and the relay task).
 //!
 //! The state machine stays in charge of the connection's control
-//! plane: handshake, window accounting, ACK generation, teardown.
-//! What bypass removes is the payload's trip through the session
-//! channel, the relay task's wakeup, and the outbound write syscall.
-//! The ACK clock still runs: the lane tells the connection how many
-//! payload bytes it moved so the sequence space advances exactly as
-//! the slow path would have it.
+//! plane: handshake, window accounting, teardown. What bypass removes
+//! is the payload's trip through the read channel, the producer, the
+//! shard ring, the slot, the session channel, and the relay task's
+//! wakeup. The ACK clock still runs — the dispatch stamps it from the
+//! shared cursors below, and the machine adopts their position when a
+//! slow-path segment next arrives, so the two views of the sequence
+//! space converge by construction rather than by coordination.
 
 use std::collections::HashMap;
 use std::io;
+use std::net::IpAddr;
 use std::os::fd::RawFd;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, Ordering};
+use std::sync::{Arc, RwLock};
 
-/// A registered outbound socket for one bypassed flow: the kernel fd
-/// the lane splices into, plus the flow identity the shard dispatches
-/// on.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct SpliceTarget {
-    pub flow: vfawn_wire::flow::FlowKey,
-    pub fd: RawFd,
+use vfawn_wire::flow::FlowKey;
+use vfawn_wire::ipv4::Ipv4Header;
+use vfawn_wire::protocol::IpProtocol;
+use vfawn_wire::tcp::{TcpFlags, TcpHeader};
+
+/// A registered fast-path flow: the outbound socket the payload
+/// writes to, plus the shared sequence view the two halves of the
+/// path maintain together. The io thread's dispatch advances
+/// `recv_nxt` atomically as it claims segments; the slot's state
+/// machine reads it to catch up before judging any segment that
+/// reached it the slow way, and refreshes `send_nxt`/`window` after
+/// its own emissions so the dispatch's ACK stamps stay current.
+///
+/// The entry owns its descriptor: registration duplicates the relay's
+/// fd, and the last reference closing releases it. That decouples the
+/// lane's right to write from the relay handle's lifetime — a dispatch
+/// holding an entry can never write into an fd number the kernel has
+/// already recycled into an unrelated socket.
+pub struct SpliceEntry {
+    outbound_fd: RawFd,
+    /// RCV.NXT as the dispatch advances it (Release on advance,
+    /// Acquire on read; the slot adopts values it sees here).
+    recv_nxt: AtomicU32,
+    /// SND.NXT for ACK stamps; written by the slot only. A stale value
+    /// merely lowers the dispatch's hit rate — the eligibility check
+    /// fails and the segment rides the slot — never its correctness.
+    send_nxt: AtomicU32,
+    /// The 16-bit window field the dispatch stamps, matching what the
+    /// machine's own reactions carry.
+    window: AtomicU16,
+    /// Whether the shared cursors hold the connection's truth. The
+    /// relay's register knows only the fd; the slot, which owns the
+    /// connection, activates the entry when it first sees the flow.
+    active: AtomicBool,
+}
+
+impl SpliceEntry {
+    fn new(fd: RawFd) -> Self {
+        Self {
+            outbound_fd: fd,
+            recv_nxt: AtomicU32::new(0),
+            send_nxt: AtomicU32::new(0),
+            window: AtomicU16::new(0),
+            active: AtomicBool::new(false),
+        }
+    }
+
+    /// Seed the shared cursors from the machine's state. Called once,
+    /// by the slot, on the first segment it sees for a registered
+    /// flow; after this the io thread's dispatch claims the flow's
+    /// steady segments before they enter the read channel.
+    pub fn activate(&self, recv_nxt: u32, send_nxt: u32, window: u16) {
+        self.recv_nxt.store(recv_nxt, Ordering::Release);
+        self.send_nxt.store(send_nxt, Ordering::Release);
+        self.window.store(window, Ordering::Release);
+        self.active.store(true, Ordering::Release);
+    }
+
+    /// Whether the shared cursors are live.
+    pub fn is_active(&self) -> bool {
+        self.active.load(Ordering::Acquire)
+    }
+
+    /// Take the flow off the fast path. The slot does this when the
+    /// outbound socket refuses writes: the non-blocking fd under
+    /// backpressure would otherwise turn each refused payload into an
+    /// acknowledged-but-undelivered byte, and the peer at the far end
+    /// waits for data that never comes. After this, the dispatch
+    /// declines the flow's segments and the session channel carries
+    /// them, with the relay's async write to wait out the pressure.
+    pub fn deactivate(&self) {
+        self.active.store(false, Ordering::Release);
+    }
+
+    /// The current shared receive cursor.
+    pub fn recv_nxt_value(&self) -> u32 {
+        self.recv_nxt.load(Ordering::Acquire)
+    }
+
+    /// The outbound descriptor the payload writes to.
+    pub fn outbound_fd(&self) -> RawFd {
+        self.outbound_fd
+    }
+
+    /// Advance the shared receive cursor from the machine's known
+    /// position. A failed compare means the dispatch already moved it
+    /// — the machine's value is stale by less than this segment, which
+    /// its next catch-up absorbs — so the failure is left alone.
+    pub fn advance_recv(&self, expected: u32, new: u32) {
+        let _ = self.recv_nxt.compare_exchange(
+            expected,
+            new,
+            Ordering::AcqRel,
+            Ordering::Relaxed,
+        );
+    }
+
+    /// Restamp the fields the dispatch reads: the send cursor and
+    /// window move when the machine emits, and the dispatch's stamps
+    /// should track them.
+    pub fn refresh(&self, send_nxt: u32, window: u16) {
+        self.send_nxt.store(send_nxt, Ordering::Release);
+        self.window.store(window, Ordering::Release);
+    }
+}
+
+impl Drop for SpliceEntry {
+    fn drop(&mut self) {
+        // SAFETY: the entry owns this descriptor outright (the
+        // register-side dup); the last Arc reference is gone, so no
+        // dispatch can hold it mid-write.
+        #[expect(unsafe_code)]
+        unsafe {
+            libc::close(self.outbound_fd);
+        }
+    }
 }
 
 /// The lane's shared registry: flows opt in by registering their
-/// outbound fd; the shard's dispatch consults this before running the
-/// full state machine.
+/// outbound fd; the device's read loop and the shard's dispatch
+/// consult this before running the full pipeline.
 #[derive(Default)]
 pub struct SpliceLane {
-    targets: Mutex<HashMap<vfawn_wire::flow::FlowKey, RawFd>>,
-    /// The TUN's direct write handle: frames pushed here reach the
-    /// wire without the shard's drain path. The io bridge installs it
-    /// at spawn; the relay reads it for the downlink fast path.
-    tun_write: Mutex<Option<std::sync::mpsc::SyncSender<Vec<bytes::BytesMut>>>>,
+    /// Reader-heavy by far: the device's read loop and every shard
+    /// consult it per packet, while only session setup and teardown
+    /// write. The reader lock keeps those lookups off each other's
+    /// way; the writer lock is the rare relay spawn/exit.
+    targets: RwLock<HashMap<FlowKey, Arc<SpliceEntry>>>,
 }
 
 impl SpliceLane {
@@ -48,55 +160,138 @@ impl SpliceLane {
         Self::default()
     }
 
-    /// The process-wide lane: the relay handler's side and the shard's
-    /// side meet here without threading an Arc through the session
-    /// contract. One process runs one stack; the singleton is the
-    /// honest shape for that.
+    /// The process-wide lane: the relay handler's side, the shard's
+    /// side, and the device's read loop meet here without threading an
+    /// Arc through the session contract. One process runs one stack;
+    /// the singleton is the honest shape for that.
     pub fn global() -> &'static SpliceLane {
         static LANE: std::sync::OnceLock<SpliceLane> = std::sync::OnceLock::new();
         LANE.get_or_init(SpliceLane::new)
     }
 
-    /// Install the TUN's direct write handle (the io bridge's channel).
-    pub fn set_tun_write(&self, sender: std::sync::mpsc::SyncSender<Vec<bytes::BytesMut>>) {
-        *self.tun_write.lock().expect("tun write") = Some(sender);
-    }
-
-    /// Push constructed frames straight to the TUN without blocking:
-    /// the downlink fast path's exit. A full channel returns the
-    /// frames (the caller routes them through the slow exit); a dead
-    /// device does the same. Blocking here would stall the shard
-    /// thread, which is the whole pipeline.
-    pub fn try_push_to_tun(
-        &self,
-        frames: Vec<bytes::BytesMut>,
-    ) -> Result<(), Vec<bytes::BytesMut>> {
-        let guard = self.tun_write.lock().expect("tun write");
-        match guard.as_ref() {
-            Some(sender) => match sender.try_send(frames) {
-                Ok(()) => Ok(()),
-                Err(std::sync::mpsc::TrySendError::Full(frames)) => Err(frames),
-                Err(std::sync::mpsc::TrySendError::Disconnected(frames)) => Err(frames),
-            },
-            None => Err(frames),
+    /// Register a flow for the fast path. The lane keeps its own
+    /// descriptor — a dup of the relay's fd — so the entry's right to
+    /// write survives the relay handle's lifetime; a registration that
+    /// cannot dup does not ride the lane.
+    pub fn register(&self, flow: FlowKey, fd: RawFd) {
+        // SAFETY: fcntl(2) duplicating a live descriptor the caller
+        // owns; the result is a fresh fd this entry exclusively owns.
+        #[expect(unsafe_code)]
+        let owned = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
+        if owned < 0 {
+            return;
         }
+        self.targets
+            .write()
+            .expect("splice lane")
+            .insert(flow, Arc::new(SpliceEntry::new(owned)));
     }
 
-    /// Register a flow for the fast path. After this call, the shard
-    /// sends the flow's data segments here instead of through the
-    /// slot's session channel.
-    pub fn register(&self, flow: vfawn_wire::flow::FlowKey, fd: RawFd) {
-        self.targets.lock().expect("splice lane").insert(flow, fd);
+    /// Remove a flow (teardown or fallback). The entry's descriptor
+    /// closes when the last in-flight dispatch lets go of it.
+    pub fn unregister(&self, flow: &FlowKey) {
+        self.targets.write().expect("splice lane").remove(flow);
     }
 
-    /// Remove a flow (teardown or fallback).
-    pub fn unregister(&self, flow: &vfawn_wire::flow::FlowKey) {
-        self.targets.lock().expect("splice lane").remove(flow);
+    /// The entry for a flow, if it rides the lane.
+    pub fn entry_for(&self, flow: &FlowKey) -> Option<Arc<SpliceEntry>> {
+        self.targets
+            .read()
+            .expect("splice lane")
+            .get(flow)
+            .cloned()
     }
 
     /// The outbound fd for a flow, if it rides the lane.
-    pub fn fd_for(&self, flow: &vfawn_wire::flow::FlowKey) -> Option<RawFd> {
-        self.targets.lock().expect("splice lane").get(flow).copied()
+    pub fn fd_for(&self, flow: &FlowKey) -> Option<RawFd> {
+        self.entry_for(flow).map(|entry| entry.outbound_fd())
+    }
+
+    /// The io-loop dispatch: try to handle a packet entirely inside
+    /// the device's read loop, before it enters the read channel. A
+    /// claimed segment costs a header parse, an atomic compare, one
+    /// outbound write, and one staged ACK — zero thread crossings,
+    /// against the six the channel-producer-ring-shard chain crosses.
+    ///
+    /// The ACK lands in `produced`, which the device's I/O loop sends
+    /// through its own write path at the end of the read batch: the
+    /// dispatch never touches a queue or a thread it does not own —
+    /// the write channel keeps its single producer, which the
+    /// multi-pusher experiment measured into both a downlink collapse
+    /// (2432 to 121 Mbit/s) and intermittent end-of-test stalls.
+    ///
+    /// False is a plain "not mine": unregistered flow, control
+    /// segment, gap, or an outbound socket under backpressure — the
+    /// packet then rides the normal path unchanged. The cursor moves
+    /// only after the payload write succeeded, so the dispatch never
+    /// acknowledges what it did not deliver.
+    pub fn try_dispatch(&self, packet: &[u8], produced: &mut Vec<bytes::BytesMut>) -> bool {
+        let Ok((ip, rest)) = Ipv4Header::parse(packet) else {
+            return false;
+        };
+        if ip.protocol != IpProtocol::Tcp {
+            return false;
+        }
+        let Ok((tcp, payload)) = TcpHeader::parse(rest) else {
+            return false;
+        };
+        // The steady shape only: pure data (an ACK carrying payload,
+        // no control flags). Everything else belongs to the machine.
+        // The empty-payload test comes first and costs nothing beyond
+        // the parses: the downlink's whole acknowledgment stream takes
+        // this exit, and it must not pay for a key it will never use.
+        let control = TcpFlags::SYN.union(TcpFlags::RST).union(TcpFlags::FIN);
+        if payload.is_empty()
+            || !tcp.flags.contains(TcpFlags::ACK)
+            || (tcp.flags.bits() & control.bits()) != 0
+        {
+            return false;
+        }
+        let key = FlowKey {
+            src: IpAddr::V4(ip.src),
+            src_port: tcp.src_port,
+            dst: IpAddr::V4(ip.dst),
+            dst_port: tcp.dst_port,
+            protocol: IpProtocol::Tcp,
+        };
+        let Some(entry) = self.entry_for(&key) else {
+            return false;
+        };
+        if !entry.is_active() {
+            return false;
+        }
+        // The same admission the slot's fast path makes, against the
+        // shared cursor instead of the machine's field: in-order
+        // (seq == RCV.NXT) and current (ack == SND.NXT, so the
+        // machine owes this segment no acknowledgment processing).
+        let expected = entry.recv_nxt.load(Ordering::Acquire);
+        if tcp.seq != expected {
+            return false;
+        }
+        let stamp_seq = entry.send_nxt.load(Ordering::Acquire);
+        if tcp.ack != stamp_seq {
+            return false;
+        }
+        // A non-blocking outbound socket under pressure refuses the
+        // write: hand the segment to the slot, whose relay side has
+        // the async write that waits out the pressure.
+        if send_payload(entry.outbound_fd(), payload).is_err() {
+            return false;
+        }
+        let advanced = tcp.seq.wrapping_add(payload.len() as u32);
+        entry.recv_nxt.store(advanced, Ordering::Release);
+        let ack = crate::native_tcp::Reaction::segment(
+            stamp_seq,
+            advanced,
+            crate::native_tcp::ctl::ACK,
+            entry.window.load(Ordering::Acquire),
+        );
+        // The answer leaves from the address the client aimed at.
+        let server = std::net::SocketAddrV4::new(ip.dst, tcp.dst_port);
+        let client = std::net::SocketAddrV4::new(ip.src, tcp.src_port);
+        let frame = crate::native_tcp::emit_v4(server, client, &ack, &[], &[]);
+        produced.push(bytes::BytesMut::from(&frame[..]));
+        true
     }
 }
 
@@ -109,7 +304,7 @@ impl SpliceLane {
 /// this process owns.
 pub fn send_payload(fd: RawFd, payload: &[u8]) -> io::Result<usize> {
     // SAFETY: write(2) on a live socket fd the process owns; the
-    // buffer is a borrowed slice of the shard's packet buffer.
+    // buffer is a borrowed slice of the packet buffer.
     #[expect(unsafe_code)]
     let sent = unsafe { libc::write(fd, payload.as_ptr() as *const _, payload.len()) };
     if sent < 0 {
@@ -245,4 +440,151 @@ fn splice_syscall(_pipe_fd: RawFd, _socket_fd: RawFd, _len: usize) -> io::Result
         io::ErrorKind::Unsupported,
         "splice is the Linux lane",
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A minimal TCP-in-IPv4 packet: valid header shapes, no options,
+    /// checksums blank (neither parser nor dispatch validates them).
+    #[expect(clippy::too_many_arguments)]
+    fn v4_tcp_packet(
+        src: std::net::Ipv4Addr,
+        sport: u16,
+        dst: std::net::Ipv4Addr,
+        dport: u16,
+        seq: u32,
+        ack: u32,
+        flags: u8,
+        payload: &[u8],
+    ) -> Vec<u8> {
+        let total = 20 + 20 + payload.len();
+        let mut packet = Vec::with_capacity(total);
+        packet.extend_from_slice(&[0x45, 0x00]);
+        packet.extend_from_slice(&(total as u16).to_be_bytes());
+        packet.extend_from_slice(&[0, 0, 0, 0, 64, 6, 0, 0]);
+        packet.extend_from_slice(&src.octets());
+        packet.extend_from_slice(&dst.octets());
+        packet.extend_from_slice(&sport.to_be_bytes());
+        packet.extend_from_slice(&dport.to_be_bytes());
+        packet.extend_from_slice(&seq.to_be_bytes());
+        packet.extend_from_slice(&ack.to_be_bytes());
+        packet.push(5 << 4);
+        packet.push(flags);
+        packet.extend_from_slice(&65535u16.to_be_bytes());
+        packet.extend_from_slice(&[0; 4]);
+        packet.extend_from_slice(payload);
+        packet
+    }
+
+    #[test]
+    fn dispatch_moves_payload_and_declines_the_rest() {
+        let lane = SpliceLane::new();
+        let key = FlowKey {
+            src: IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 2)),
+            src_port: 44444,
+            dst: IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 1)),
+            dst_port: 443,
+            protocol: IpProtocol::Tcp,
+        };
+        let mut fds = [0i32; 2];
+        // SAFETY: socketpair(2) fills the array with two live fds this
+        // test owns.
+        #[expect(unsafe_code)]
+        unsafe {
+            assert_eq!(libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()), 0);
+        }
+        lane.register(key, fds[0]);
+        let mut staged: Vec<bytes::BytesMut> = Vec::new();
+        // Before activation the dispatch stays out of the way.
+        let packet = v4_tcp_packet(
+            std::net::Ipv4Addr::new(10, 0, 0, 2),
+            44444,
+            std::net::Ipv4Addr::new(10, 0, 0, 1),
+            443,
+            500,
+            900,
+            0x10,
+            b"steady",
+        );
+        assert!(!lane.try_dispatch(&packet, &mut staged));
+
+        let entry = lane.entry_for(&key).expect("registered");
+        entry.activate(500, 900, 65535);
+
+        // In-order current segment: claimed, payload delivered, cursor
+        // advanced.
+        assert!(lane.try_dispatch(&packet, &mut staged));
+        let mut got = [0u8; 16];
+        // SAFETY: read(2) from the test-owned peer socket.
+        #[expect(unsafe_code)]
+        let n = unsafe { libc::read(fds[1], got.as_mut_ptr() as *mut _, got.len()) };
+        assert_eq!(n as usize, b"steady".len());
+        assert_eq!(&got[..n as usize], b"steady");
+        assert_eq!(entry.recv_nxt_value(), 500 + b"steady".len() as u32);
+        // Exactly one answer was staged: the ACK from the server the
+        // client aimed at, carrying the advanced cursor, with nothing
+        // claimed-but-unanswered and nothing answered-unclaimed.
+        assert_eq!(staged.len(), 1);
+        let frame = &staged[0];
+        let answer = TcpHeader::parse(&frame[20..]).expect("staged frame parses");
+        assert_eq!(answer.0.src_port, 443);
+        assert_eq!(answer.0.dst_port, 44444);
+        assert_eq!(answer.0.ack, 500 + b"steady".len() as u32);
+        assert!(answer.0.flags.contains(TcpFlags::ACK));
+        staged.clear();
+
+        // A gap (seq ahead) is not the dispatch's to sort.
+        let gap = v4_tcp_packet(
+            std::net::Ipv4Addr::new(10, 0, 0, 2),
+            44444,
+            std::net::Ipv4Addr::new(10, 0, 0, 1),
+            443,
+            9000,
+            900,
+            0x10,
+            b"ahead",
+        );
+        assert!(!lane.try_dispatch(&gap, &mut staged));
+
+        // A control flag (FIN) belongs to the machine.
+        let fin = v4_tcp_packet(
+            std::net::Ipv4Addr::new(10, 0, 0, 2),
+            44444,
+            std::net::Ipv4Addr::new(10, 0, 0, 1),
+            443,
+            507,
+            900,
+            0x11,
+            b"",
+        );
+        assert!(!lane.try_dispatch(&fin, &mut staged));
+
+        // A stale acknowledgment (behind SND.NXT) is the machine's
+        // news, not the dispatch's.
+        let stale = v4_tcp_packet(
+            std::net::Ipv4Addr::new(10, 0, 0, 2),
+            44444,
+            std::net::Ipv4Addr::new(10, 0, 0, 1),
+            443,
+            507,
+            800,
+            0x10,
+            b"stale",
+        );
+        assert!(!lane.try_dispatch(&stale, &mut staged));
+
+        // Unregistering drops the entry; the dispatch declines and the
+        // caller's fd is untouched (its dup closed with the entry).
+        lane.unregister(&key);
+        assert!(lane.entry_for(&key).is_none());
+        assert!(!lane.try_dispatch(&packet, &mut staged));
+        // SAFETY: both test sockets are ours to close.
+        #[expect(unsafe_code)]
+        unsafe {
+            libc::close(fds[0]);
+            libc::close(fds[1]);
+        }
+    }
 }

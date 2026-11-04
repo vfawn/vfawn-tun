@@ -17,6 +17,7 @@ use std::io;
 use std::io::ErrorKind;
 use std::os::fd::RawFd;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError};
 use std::thread;
@@ -24,6 +25,7 @@ use std::thread;
 use bytes::BytesMut;
 use tun_rs::{DeviceBuilder, InterruptEvent, SyncDevice, VIRTIO_NET_HDR_LEN};
 use vfawn_core::{DeviceCaps, DeviceConfig, PacketDevice};
+use vfawn_core::device::ReadDispatch;
 
 /// Frame budget when the configuration leaves the MTU to the platform.
 /// Large frames keep the syscall rate down; the kernel never reads past
@@ -53,6 +55,11 @@ struct Shared {
     writes: SyncSender<Vec<BytesMut>>,
     event: InterruptEvent,
     stopped: AtomicBool,
+    /// The read-side fast dispatch, installed once at stack spawn: a
+    /// claimed packet never enters the read channel. The lock is taken
+    /// once per read batch, not per packet, and is otherwise
+    /// uncontended.
+    dispatch: Mutex<Option<ReadDispatch>>,
 }
 
 /// One end of the device: the reader's half by construction, the
@@ -156,6 +163,7 @@ impl TunDevice {
             writes: write_tx,
             event,
             stopped: AtomicBool::new(false),
+            dispatch: Mutex::new(None),
         });
         let io_shared = Arc::clone(&shared);
         thread::Builder::new()
@@ -177,6 +185,7 @@ impl TunDevice {
 /// budget, or a wake arrives; a wake is either a write enqueue or the
 /// stop flag, which the loop head sorts.
 fn io_loop(shared: Arc<Shared>, mut device: SyncDevice, writes: Receiver<Vec<BytesMut>>) {
+    let mut drop_counter = 0u64;
     let mut sizes = vec![0usize; BATCH];
     // The buffers the kernel read fills hold one split segment each
     // (the merged burst lands whole in the scratch above and the
@@ -216,6 +225,12 @@ fn io_loop(shared: Arc<Shared>, mut device: SyncDevice, writes: Receiver<Vec<Byt
                             shared.stopped.store(true, Ordering::Release);
                             return;
                         }
+                        drop_counter = drop_counter.wrapping_add(1);
+                        if drop_counter == 1 || drop_counter % 10_000 == 0 {
+                            eprintln!(
+                                "vfawn: tun write refused ({error}); dropped {drop_counter} batches"
+                            );
+                        }
                     }
                 }
                 Err(TryRecvError::Empty) => break,
@@ -230,9 +245,38 @@ fn io_loop(shared: Arc<Shared>, mut device: SyncDevice, writes: Receiver<Vec<Byt
         }
         match device.recv_multiple_intr(&mut original, &mut bufs, &mut sizes, 0, &shared.event) {
             Ok(count) if count > 0 => {
+                // The fast dispatch first: a claimed packet is answered
+                // here — payload out through the claim, answer frames
+                // staged for this loop's own write path — and its
+                // buffer stays in rotation (no take, no
+                // channel, no re-zeroing). What declines rides the
+                // read channel exactly as before.
+                let dispatch = shared.dispatch.lock().expect("dispatch").clone();
                 let mut frames = Vec::with_capacity(count);
+                let mut answers: Vec<BytesMut> = Vec::new();
                 for buf in bufs.iter_mut().take(count) {
-                    frames.push(std::mem::take(buf));
+                    match &dispatch {
+                        Some(claim) if claim(&buf[..], &mut answers) => {}
+                        _ => frames.push(std::mem::take(buf)),
+                    }
+                }
+                // The staged answers leave the same way the write
+                // channel's batches do — one send per read batch, on
+                // this thread, with no queue between. A send failure
+                // is qdisc-shaped loss (the peer's loss recovery
+                // re-asks and the slot answers); only the device's
+                // death stops the loop.
+                if !answers.is_empty()
+                    && let Err(error) =
+                        send_batch(&mut device, &mut gro_table, &mut staging, &answers)
+                    && error.kind() == ErrorKind::NotConnected
+                {
+                    eprintln!("vfawn: tun I/O stopped: device down");
+                    shared.stopped.store(true, Ordering::Release);
+                    return;
+                }
+                if frames.is_empty() {
+                    continue;
                 }
                 // A full read channel drops the batch (a qdisc-shaped
                 // loss: TCP retransmits, UDP loses one datagram).
@@ -358,6 +402,10 @@ impl PacketDevice for TunDevice {
             caps: self.caps,
             name: self.name.clone(),
         }))
+    }
+
+    fn set_read_dispatch(&self, dispatch: ReadDispatch) {
+        *self.shared.dispatch.lock().expect("dispatch") = Some(dispatch);
     }
 }
 

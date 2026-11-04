@@ -656,6 +656,26 @@ impl ServerConnection {
         self.recv.nxt
     }
 
+    /// Adopt a receive cursor the io-loop dispatch advanced: the shared
+    /// atomic runs ahead of the machine while steady segments ride the
+    /// lane, and the machine catches up before judging any segment that
+    /// reached it the slow way. Only a forward move within half the
+    /// sequence space applies — anything else is a stale or corrupt
+    /// view and changes nothing.
+    pub fn catchup_recv(&mut self, nxt: u32) {
+        let delta = nxt.wrapping_sub(self.recv.nxt);
+        if delta > 0 && delta < u32::MAX / 2 {
+            self.recv.nxt = nxt;
+        }
+    }
+
+    /// The raw 16-bit window field the fast paths stamp on their ACKs —
+    /// the same value the machine's own established-state reactions
+    /// carry, so both paths advertise one window.
+    pub fn fast_window(&self) -> u16 {
+        self.recv.window
+    }
+
     /// Advance the send space over a segment just emitted: data length
     /// plus one for a SYN or FIN (RFC 9293 §3.3.4: each consumes
     /// sequence space).
@@ -808,6 +828,39 @@ fn payload_len_u32(inbound: &Inbound<'_>) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn catchup_adopts_forward_cursors_only() {
+        let mut connection = established();
+        let base = connection.recv_nxt();
+        // A dispatch ahead of the machine: adopted.
+        connection.catchup_recv(base.wrapping_add(1400));
+        assert_eq!(connection.recv_nxt(), base.wrapping_add(1400));
+        // A view behind the machine (stale) or across the wrap edge
+        // (corrupt): ignored, the machine keeps its position.
+        connection.catchup_recv(base);
+        assert_eq!(connection.recv_nxt(), base.wrapping_add(1400));
+        connection.catchup_recv(base.wrapping_add(u32::MAX / 2 + 1400));
+        assert_eq!(connection.recv_nxt(), base.wrapping_add(1400));
+        // The no-op case.
+        connection.catchup_recv(base.wrapping_add(1400));
+        assert_eq!(connection.recv_nxt(), base.wrapping_add(1400));
+    }
+
+    #[test]
+    fn fast_window_matches_the_reactions_field() {
+        let mut connection = established();
+        let syn = Inbound {
+            seq: connection.recv_nxt(),
+            ack: connection.send_nxt(),
+            flags: ctl::ACK,
+            window: 65535,
+            options: Default::default(),
+            payload: &[1, 2, 3],
+        };
+        let reaction = connection.fast_accept(&syn);
+        assert_eq!(reaction.window, connection.fast_window());
+    }
 
     /// Drive one data segment into a fresh established connection.
     fn established() -> ServerConnection {

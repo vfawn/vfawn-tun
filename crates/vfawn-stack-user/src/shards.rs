@@ -663,6 +663,14 @@ fn shard_loop(
     // timer again after the fire.
     let mut scheduled: std::collections::HashSet<FlowKey> = std::collections::HashSet::new();
     let mut next_scan = Instant::now();
+    // The idle sweep's own clock: a quiet flow's host writes (the
+    // tail of a teardown, an answer that outran its packet) have no
+    // packet to ride, and their only exit is this sweep. Gating it on
+    // the shard having been idle that iteration lets one busy
+    // sibling — a retrying flow, a probe exchange — starve a quiet
+    // flow's delivery indefinitely, so the sweep keeps its own
+    // cadence whether or not the shard did work.
+    let mut next_sweep = Instant::now();
     let mut pending: VecDeque<BytesMut> = VecDeque::new();
     loop {
         if stopped.load(Ordering::Acquire) || stop_all.load(Ordering::Acquire) {
@@ -732,9 +740,14 @@ fn shard_loop(
             outbox.extend(pending.drain(..));
         }
 
-        if !did_work {
-            // Idle sweep: host writes that arrived without a packet to
-            // ride still deserve their turn on the wire.
+        // The idle sweep on its own clock: host writes that arrived
+        // without a packet to ride still deserve their turn on the
+        // wire, and a quiet flow must not wait for every sibling to
+        // fall silent first. Idle iterations sweep as before; busy
+        // ones still sweep every so often, so a quiet flow riding a
+        // busy shard waits milliseconds, not forever.
+        if !did_work || now >= next_sweep {
+            next_sweep = now + Duration::from_millis(20);
             for slot in connections.values_mut() {
                 slot.logic.on_idle(&mut pending);
             }

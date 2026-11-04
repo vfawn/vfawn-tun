@@ -48,7 +48,7 @@ use vfawn_wire::tcp::TcpHeader;
 
 use crate::accept::{AcceptQueue, FixedSecret};
 use crate::congestion::{CongestionAlgo, Cubic, Reno, Signal};
-use crate::native_tcp::{Inbound, Reaction, ServerConnection, TcpState, emit_v4};
+use crate::native_tcp::{Inbound, Reaction, ServerConnection, TcpState, ctl, emit_v4};
 use crate::shards::{BufferPool, LogicFactory, ShardConfig, Shards, SlotLogic};
 
 /// The fallback segment size when the backend is constructed without
@@ -129,6 +129,17 @@ struct TcpSlot {
     synack_retries: u32,
     /// Our FIN's sequence while LAST-ACK waits for its acknowledgment.
     fin_at: Option<u32>,
+    /// The zero-window persist clock (RFC 9293 §3.8.2): when the peer
+    /// advertised nothing and output is waiting, only our probe can
+    /// learn whether the window reopened — the peer, believing its
+    /// side healthy, owes us no packet that would tell us.
+    persist_at: Option<Instant>,
+    persist_retries: u32,
+    /// Rate limit for the stalled-drain alarm below.
+    diag_at: Option<Instant>,
+    /// The queue depth the last alarm saw: a real stall holds the
+    /// same depth a second later, while a healthy trickle moves.
+    diag_queued: usize,
     /// The flow's dispatch key, for the splice lane's lookup.
     flow_key: vfawn_wire::flow::FlowKey,
     /// Fast-path payload accumulator: segments in one batch share a
@@ -156,6 +167,11 @@ fn rto_backoff(retries: u32) -> Duration {
 /// gets in this volume.
 const SYNACK_RETRY_MAX: u32 = 5;
 const DATA_RETRY_MAX: u32 = 15;
+/// How many persist probes a closed window gets before the flow is
+/// written off. A window that never reopens while output waits is a
+/// peer that will not read us again; the probes back off alongside
+/// the retransmission timer and the give-up resets the peer.
+const PERSIST_RETRY_MAX: u32 = 12;
 
 impl TcpSlot {
     fn announce(&mut self) {
@@ -299,6 +315,56 @@ impl TcpSlot {
                 lane.writes.pop_front();
             }
         }
+        // The stalled-drain alarm: output this drain left behind. A
+        // rate-limited line per flow per second, paid inside the lock
+        // the drain already holds — a real stall names its bounds; a
+        // healthy trickle moves between lines and never prints.
+        if lane.bytes > 0
+            && lane.bytes == self.diag_queued
+            && self
+                .diag_at
+                .is_none_or(|at| at.elapsed() >= Duration::from_secs(1))
+        {
+            self.diag_at = Some(Instant::now());
+            self.diag_queued = lane.bytes;
+            eprintln!(
+                "vfawn: stalled drain flow={:?} state={:?} queued={} mss={} cc={} peer_win={} inflight={} flight={} retries={} persist={} fin_at={}",
+                self.flow_key,
+                self.connection.state(),
+                lane.bytes,
+                self.connection.mss(),
+                self.cc.window(),
+                self.connection.peer_window(),
+                self.connection.send_nxt().wrapping_sub(self.connection.send_una()),
+                self.flight.len(),
+                self.data_retries,
+                self.persist_at.is_some(),
+                self.fin_at.is_some(),
+            );
+        } else if lane.bytes == 0 {
+            self.diag_queued = 0;
+        }
+        // Output waiting with nothing in flight and no sendable budget:
+        // arm the persist clock. Whichever bound closed — the peer's
+        // window (which it may believe open, owing us no packet that
+        // says so) or the congestion window (collapsed by loss) — the
+        // probe is the only thing that ever reopens it from our side
+        // (RFC 9293 §3.8.2, generalized past the literal zero window:
+        // a small positive window with no room is the same silence).
+        let inflight = self
+            .connection
+            .send_nxt()
+            .wrapping_sub(self.connection.send_una());
+        if lane.bytes > 0
+            && self.flight.is_empty()
+            && inflight == 0
+            && self.cc.window().min(self.connection.peer_window()) == 0
+            && self.persist_at.is_none()
+            && self.persist_retries < PERSIST_RETRY_MAX
+        {
+            self.persist_at = Some(Instant::now());
+            self.persist_retries = 0;
+        }
     }
 }
 
@@ -319,61 +385,46 @@ impl TcpSlot {
 }
 
 impl TcpSlot {
-    /// The downlink fast path's drain: same frame construction, same
-    /// sequence advance, but the exit is the TUN channel rather than
-    /// the shard's outbox. Returns bytes moved.
-    #[expect(dead_code)]
-    fn drain_writes_fast(&mut self, out: &mut VecDeque<BytesMut>) -> usize {
-        let inflight = self
-            .connection
-            .send_nxt()
-            .wrapping_sub(self.connection.send_una());
-        let sendable = self.cc.window().min(self.connection.peer_window());
-        let mut budget = sendable.saturating_sub(inflight) as usize;
-        let mut lane = self.write_lane.lock().expect("write lane");
-        let mut frames: Vec<BytesMut> = Vec::new();
-        let mut moved = 0usize;
-        while let Some(write) = lane.writes.front_mut() {
-            if write.is_empty() {
-                break; // the FIN marker: the slow path owns the close
-            }
-            if budget == 0 {
-                break;
-            }
-            let take = write.len().min(budget).min(self.connection.mss() as usize);
-            let more_after = write.len() > take;
-            let reaction = Reaction {
-                seq: self.connection.send_nxt(),
-                ack: self.connection.recv_nxt(),
-                flags: if more_after { 0x10 } else { 0x18 },
-                window: self.connection.advertised_window(),
-                delivered: Vec::new(),
-                held: false,
-                gap_filled: false,
-            };
-            let frame = emit_v4(self.server, self.client, &reaction, &[], &write[..take]);
-            frames.push(BytesMut::from(&frame[..]));
-            self.connection.send_advance(take as u32);
-            write.drain(..take);
-            moved += take;
-            budget -= take;
-            if write.is_empty() {
-                lane.writes.pop_front();
-            }
+    /// Pronounce the flow dead and TELL the peer. A flow that goes
+    /// silent leaves the far end's read waiting forever, which is
+    /// a hang wearing a timeout's clothes; the reset carries the last
+    /// cursor we hold (RFC 9293 §3.4.3's "send a reset" for an
+    /// aborted connection), the host learns the flow is gone, and the
+    /// slot goes inert instead of paying retries forever.
+    fn give_up(&mut self, out: &mut VecDeque<BytesMut>) {
+        let reset = Reaction::segment(
+            self.connection.send_nxt(),
+            self.connection.recv_nxt(),
+            ctl::RST | ctl::ACK,
+            0,
+        );
+        let frame = emit_v4(self.server, self.client, &reset, &[], &[]);
+        out.push_back(BytesMut::from(&frame[..]));
+        self.connection.abandon();
+        self.flight.clear();
+        self.data_sent_at = None;
+        self.fin_at = None;
+        self.persist_at = None;
+        if let Some(to_host) = &self.to_host {
+            let _ = to_host.send(HostEvent::Closed);
         }
-        drop(lane);
-        if moved == 0 {
-            return 0;
+    }
+
+    /// Hand the fast path's accumulated bytes to the session channel.
+    /// They left the fast path already acknowledged — the refusal of a
+    /// non-blocking write must not turn them into acknowledged-but-
+    /// undelivered bytes — and the relay's async write is the one
+    /// place that can wait out the socket's pressure. Without a
+    /// session (the flow folded after teardown), nobody downstream
+    /// wants them and the accumulator just empties.
+    fn fold_back_to_session(&mut self) {
+        let bytes = std::mem::take(&mut self.fast_payload);
+        if bytes.is_empty() {
+            return;
         }
-        // The sequence is already advanced — the frames WILL reach the
-        // wire. A full TUN channel is backpressure, not loss: the
-        // frames fall through to the caller's output queue (the slow
-        // exit) so the writer still drains them in order. Blocking
-        // here would stall the shard thread, which is the pipeline.
-        if let Err(overflow) = crate::splice_lane::SpliceLane::global().try_push_to_tun(frames) {
-            out.extend(overflow);
+        if let Some(to_host) = &self.to_host {
+            let _ = to_host.send(HostEvent::Bytes(bytes));
         }
-        moved
     }
 }
 
@@ -402,37 +453,93 @@ impl SlotLogic for TcpSlot {
         }
         let inbound = Inbound::parse(&header, payload);
 
-        // The payload fast path: a registered relay flow's steady
-        // data segment skips the session channel and the relay task
+        // The lane entry, when the relay registered this flow. Its
+        // shared receive cursor runs ahead of the machine while the
+        // device's read dispatch claims steady segments: catch the
+        // machine up before any acceptance test reads its cursor, or
+        // the first slow-path segment after a fast burst (a window
+        // update, a teardown) looks out of order against stale state.
+        let lane = crate::splice_lane::SpliceLane::global();
+        let entry = lane.entry_for(&self.flow_key);
+        if let Some(entry) = &entry
+            && entry.is_active()
+        {
+            self.connection.catchup_recv(entry.recv_nxt_value());
+        }
+
+        // The payload fast path: a registered relay flow's steady data
+        // segment skips the session channel and the relay task
         // entirely. The state machine's role shrinks to the two
         // sequence-cursor lines inside fast_accept; the ACK leaves
-        // exactly as the slow path's would.
-        if crate::splice_lane::SpliceLane::global()
-            .fd_for(&self.flow_key)
-            .is_some()
+        // exactly as the slow path's would. What still arrives here
+        // is the bootstrap segment (before the entry activates for
+        // the read dispatch) or a dispatch fallback — outbound
+        // backpressure or a contested TUN channel.
+        if let Some(entry) = &entry
             && self.connection.fast_acceptable(&inbound)
         {
-            self.fast_payload.extend_from_slice(inbound.payload);
-            // A full-enough accumulator flushes now instead of waiting
-            // for the idle sweep: the batch's bulk cost amortizes the
-            // syscall without adding idle latency to small bursts.
-            if self.fast_payload.len() >= 64 * 1024 {
-                if let Some(fd) = crate::splice_lane::SpliceLane::global().fd_for(&self.flow_key) {
-                    let _ = crate::splice_lane::send_payload(fd, &self.fast_payload);
+            // Backpressure honesty: the outbound fd is non-blocking,
+            // and a socket the peer is not draining refuses writes.
+            // Every byte already acknowledged must still reach the
+            // relay, so a refused flush hands the accumulator to the
+            // session channel (whose write waits out the pressure)
+            // and the flow leaves the fast path — this segment then
+            // rides the slow path below, unacknowledged until it is
+            // actually deliverable.
+            if !self.fast_payload.is_empty()
+                && crate::splice_lane::send_payload(
+                    entry.outbound_fd(),
+                    &self.fast_payload,
+                )
+                .is_err()
+            {
+                self.fold_back_to_session();
+                entry.deactivate();
+            } else {
+                if !entry.is_active() {
+                    entry.activate(
+                        self.connection.recv_nxt(),
+                        self.connection.send_nxt(),
+                        self.connection.fast_window(),
+                    );
                 }
-                self.fast_payload.clear();
+                self.fast_payload.extend_from_slice(inbound.payload);
+                // A full-enough accumulator flushes now instead of waiting
+                // for the idle sweep: the batch's bulk cost amortizes the
+                // syscall without adding idle latency to small bursts.
+                // A refusal here folds the whole accumulator (this
+                // segment's bytes included) to the session channel —
+                // delivered either way, so the acceptance below is
+                // honest in both outcomes.
+                if self.fast_payload.len() >= 64 * 1024
+                    && crate::splice_lane::send_payload(
+                        entry.outbound_fd(),
+                        &self.fast_payload,
+                    )
+                    .is_err()
+                {
+                    self.fold_back_to_session();
+                    entry.deactivate();
+                }
+                let seq_before = self.connection.recv_nxt();
+                let ack = self.connection.fast_accept(&inbound);
+                // Keep the shared cursor in step for the read dispatch:
+                // the compare fails only if the dispatch itself already
+                // moved past, which the machine's next catch-up absorbs.
+                entry.advance_recv(seq_before, self.connection.recv_nxt());
+                entry.refresh(
+                    self.connection.send_nxt(),
+                    self.connection.fast_window(),
+                );
+                // This branch is the bootstrap and the fallback now (the
+                // read dispatch claims the steady segments), so its ACK
+                // rides the ordinary outbox-and-writer exit — the write
+                // channel keeps its single producer, which the
+                // multi-pusher experiment measured into both a downlink
+                // collapse and end-of-test stalls.
+                self.emit(&ack, out);
+                return;
             }
-            let ack = self.connection.fast_accept(&inbound);
-            // The ACK rides the TUN write channel directly: the
-            // outbox-and-writer chain it would otherwise traverse
-            // adds three thread crossings per segment, which at
-            // hundreds of segments per second is the fast path's own
-            // bottleneck. A full channel drops the ACK (the peer
-            // retransmits and the slow path picks it up).
-            let frame = emit_v4(self.server, self.client, &ack, &[], &[]);
-            let _ = crate::splice_lane::SpliceLane::global()
-                .try_push_to_tun(vec![BytesMut::from(&frame[..])]);
-            return;
         }
 
         let una_before = self.connection.send_una();
@@ -493,10 +600,22 @@ impl SlotLogic for TcpSlot {
         // data, and those bytes need the channel the handshake just
         // earned.
         self.announce();
-        if let Some(to_host) = &self.to_host
-            && !reaction.delivered.is_empty()
-        {
-            let _ = to_host.send(HostEvent::Bytes(reaction.delivered.clone()));
+        if !reaction.delivered.is_empty() {
+            let mut session_gone = false;
+            if let Some(to_host) = &self.to_host {
+                // A refused send means the session side is gone — the
+                // relay's dial failed or its task died. Acknowledging
+                // further bytes into a dead service is the silent
+                // forever-wait this flow must not become: it resets
+                // now, with the peer told (RFC 9293 §3.4.3).
+                session_gone = to_host
+                    .send(HostEvent::Bytes(reaction.delivered.clone()))
+                    .is_err();
+            }
+            if session_gone {
+                self.give_up(out);
+                return;
+            }
         }
 
         if reaction.flags & 0x02 != 0 {
@@ -526,6 +645,25 @@ impl SlotLogic for TcpSlot {
                 self.drain_writes(out);
             }
         }
+
+        // The read dispatch stamps its ACKs from the entry's view of
+        // the send cursor; the slow path just moved that cursor (data,
+        // FIN, window arithmetic), so the view re-syncs here. A stale
+        // view costs only hit rate — the dispatch declines, the next
+        // segment rides this same path — never correctness.
+        if let Some(entry) = &entry
+            && entry.is_active()
+        {
+            entry.refresh(self.connection.send_nxt(), self.connection.fast_window());
+        }
+
+        // News about the peer's window retires the persist clock: the
+        // drain that stalled behind the closed window runs on the next
+        // idle sweep, a millisecond away.
+        if self.persist_at.is_some() && self.connection.peer_window() > 0 {
+            self.persist_at = None;
+            self.persist_retries = 0;
+        }
     }
 
     fn timer_wanted(&self) -> Option<Duration> {
@@ -546,6 +684,17 @@ impl SlotLogic for TcpSlot {
             TcpState::LastAck if self.data_retries < DATA_RETRY_MAX => {
                 self.data_sent_at.map(|at| {
                     (at + rto_backoff(self.data_retries)).saturating_duration_since(Instant::now())
+                })
+            }
+            // The persist clock runs beside the retransmit one: a
+            // closed window with output waiting owes the wire a
+            // probe, whether or not anything is in flight.
+            TcpState::Established | TcpState::CloseWait
+                if self.persist_at.is_some() && self.persist_retries < PERSIST_RETRY_MAX =>
+            {
+                self.persist_at.map(|at| {
+                    (at + rto_backoff(self.persist_retries))
+                        .saturating_duration_since(Instant::now())
                 })
             }
             _ => None,
@@ -570,14 +719,67 @@ impl SlotLogic for TcpSlot {
                     // Dead, pronounced: the wire has had every chance,
                     // the host learns the flow is gone, and the slot
                     // goes inert instead of paying retries forever.
-                    self.connection.abandon();
-                    self.flight.clear();
-                    self.data_sent_at = None;
-                    self.fin_at = None;
-                    if let Some(to_host) = &self.to_host {
-                        let _ = to_host.send(HostEvent::Closed);
-                    }
+                    self.give_up(out);
                     return;
+                }
+                // The persist probe: a closed window with output
+                // waiting is a deadlock the peer cannot break — it
+                // believes its side healthy and owes us no packet —
+                // so one byte of the waiting output goes out to ask
+                // (RFC 9293 §3.8.2). The answer's window field is the
+                // news; the normal drain takes it from there.
+                if self.persist_at.is_some() {
+                    if self.connection.peer_window() > 0 {
+                        self.persist_at = None;
+                        self.persist_retries = 0;
+                    } else {
+                        self.persist_retries = self.persist_retries.saturating_add(1);
+                        self.persist_at = Some(Instant::now());
+                        if self.persist_retries >= PERSIST_RETRY_MAX {
+                            // Written off: the peer will not read us
+                            // again; the shared give-up resets it.
+                            self.give_up(out);
+                            return;
+                        }
+                        let mut lane = self.write_lane.lock().expect("write lane");
+                        let front_nonempty = lane
+                            .writes
+                            .front()
+                            .is_some_and(|write| !write.is_empty());
+                        if front_nonempty {
+                            let probe;
+                            {
+                                let front = lane.writes.front_mut().expect("front held data");
+                                probe = front[0];
+                                front.drain(..1);
+                                if front.is_empty() {
+                                    lane.writes.pop_front();
+                                }
+                            }
+                            lane.bytes -= 1;
+                            drop(lane);
+                            let reaction = Reaction {
+                                seq: self.connection.send_nxt(),
+                                ack: self.connection.recv_nxt(),
+                                flags: 0x18,
+                                window: self.connection.advertised_window(),
+                                delivered: Vec::new(),
+                                held: false,
+                                gap_filled: false,
+                            };
+                            let frame =
+                                emit_v4(self.server, self.client, &reaction, &[], &[probe]);
+                            out.push_back(BytesMut::from(&frame[..]));
+                            if self.flight.is_empty() {
+                                self.flight_base = self.connection.send_nxt();
+                            }
+                            self.flight.push(probe);
+                            self.connection.send_advance(1);
+                            self.data_sent_at = Some(Instant::now());
+                            self.data_retries = 0;
+                        }
+                        return;
+                    }
                 }
                 if self.flight.is_empty() {
                     // With no data owed, the only outstanding thing can
@@ -644,12 +846,27 @@ impl SlotLogic for TcpSlot {
 
     fn on_idle(&mut self, out: &mut VecDeque<BytesMut>) {
         // The fast path's batched payload leaves now: one write for
-        // the whole burst instead of one per segment.
+        // the whole burst instead of one per segment. A refusal folds
+        // the bytes to the session channel and deactivates the lane
+        // entry — the same honesty as the in-packet path.
         if !self.fast_payload.is_empty() {
-            if let Some(fd) = crate::splice_lane::SpliceLane::global().fd_for(&self.flow_key) {
-                let _ = crate::splice_lane::send_payload(fd, &self.fast_payload);
+            let lane = crate::splice_lane::SpliceLane::global();
+            match lane.entry_for(&self.flow_key) {
+                Some(entry)
+                    if crate::splice_lane::send_payload(
+                        entry.outbound_fd(),
+                        &self.fast_payload,
+                    )
+                    .is_ok() =>
+                {
+                    self.fast_payload.clear();
+                }
+                Some(entry) => {
+                    self.fold_back_to_session();
+                    entry.deactivate();
+                }
+                None => self.fast_payload.clear(),
             }
-            self.fast_payload.clear();
         }
         // Host writes that arrived after the last packet: their only
         // ride is this idle sweep; CLOSE-WAIT writes still leave
@@ -823,6 +1040,15 @@ impl StackBackend for NativeBackend {
         let handle = StackHandle::new();
         let write_device = device.duplicate()?;
 
+        // The read dispatch: a registered flow's steady segments are
+        // claimed inside the device's own I/O loop — the channel,
+        // producer, ring, and shard crossings the slow path pays per
+        // segment become none, and the answers leave through the
+        // device's own write path at the end of the read batch.
+        device.set_read_dispatch(Arc::new(|packet: &[u8], produced: &mut Vec<BytesMut>| {
+            crate::splice_lane::SpliceLane::global().try_dispatch(packet, produced)
+        }));
+
         let (sessions_tx, sessions_rx) = mpsc::sync_channel::<SessionHandoff>(1024);
         let shared = Arc::new(SpawnShared {
             handler,
@@ -898,6 +1124,10 @@ impl StackBackend for NativeBackend {
                 synack_at: None,
                 synack_retries: 0,
                 fin_at: None,
+                persist_at: None,
+                persist_retries: 0,
+                diag_at: None,
+                diag_queued: 0,
             })
         });
 
@@ -988,5 +1218,125 @@ impl SlotLogic for SinkSlot {
         _pool: &BufferPool,
         _mtu: usize,
     ) {
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use vfawn_core::{Action, IcmpPacket, TcpSession, UdpSession, Verdict};
+
+    struct NoHandler;
+
+    #[async_trait::async_trait]
+    impl vfawn_core::SessionHandler for NoHandler {
+        fn judge_flow(&self, _flow: &FlowInfo, _first: &[u8]) -> Verdict {
+            Verdict::Accept
+        }
+        async fn on_tcp(&self, _session: TcpSession) {}
+        async fn on_udp(&self, _session: UdpSession) {}
+        async fn on_icmp(&self, _packet: IcmpPacket) -> Action {
+            Action::Drop
+        }
+    }
+
+    fn slot_with_waiting_output(bytes: &[u8]) -> TcpSlot {
+        let client = std::net::SocketAddrV4::new(std::net::Ipv4Addr::new(10, 0, 0, 2), 44444);
+        let server = std::net::SocketAddrV4::new(std::net::Ipv4Addr::new(10, 0, 0, 1), 443);
+        let write_lane = Arc::new(std::sync::Mutex::new(WriteLane::new()));
+        {
+            let mut lane = write_lane.lock().expect("write lane");
+            lane.bytes = bytes.len();
+            lane.writes.push_back(bytes.to_vec());
+        }
+        let (sessions_tx, _sessions_rx) = mpsc::sync_channel(4);
+        let mut slot = TcpSlot {
+            connection: ServerConnection::new(1000, 1460),
+            flow_key: vfawn_wire::flow::FlowKey {
+                src: std::net::IpAddr::V4(*client.ip()),
+                src_port: client.port(),
+                dst: std::net::IpAddr::V4(*server.ip()),
+                dst_port: server.port(),
+                protocol: IpProtocol::Tcp,
+            },
+            fast_payload: Vec::new(),
+            client,
+            server,
+            handler: Arc::new(NoHandler),
+            accept: Arc::new(std::sync::Mutex::new(AcceptQueue::new(
+                true,
+                64,
+                Box::new(FixedSecret(0)),
+            ))),
+            sessions: sessions_tx,
+            flow: FlowInfo {
+                network: Network::Tcp,
+                source: std::net::SocketAddr::V4(client),
+                destination: std::net::SocketAddr::V4(server),
+            },
+            write_lane,
+            cc: Box::new(crate::congestion::Cubic::new(1460)),
+            to_host: None,
+            judged: false,
+            refused: false,
+            flight: Vec::new(),
+            flight_base: 0,
+            data_sent_at: None,
+            data_retries: 0,
+            synack_at: None,
+            synack_retries: 0,
+            fin_at: None,
+            persist_at: None,
+            persist_retries: 0,
+            diag_at: None,
+            diag_queued: 0,
+        };
+        // Drive the slot to ESTABLISHED with a handshake like the
+        // machine's own tests use.
+        let syn = Inbound {
+            seq: 5000,
+            ack: 0,
+            flags: ctl::SYN,
+            window: 64256,
+            options: Default::default(),
+            payload: &[],
+        };
+        let _ = slot.connection.on_segment(&syn);
+        slot.connection.send_advance(1);
+        let ack = Inbound {
+            seq: 5001,
+            ack: 1001,
+            flags: ctl::ACK,
+            window: 64256,
+            options: Default::default(),
+            payload: &[],
+        };
+        let _ = slot.connection.on_segment(&ack);
+        slot
+    }
+
+    #[test]
+    fn a_single_waiting_byte_leaves_on_the_sweep() {
+        let mut slot = slot_with_waiting_output(b"x");
+        let mut out: VecDeque<BytesMut> = VecDeque::new();
+        slot.on_idle(&mut out);
+        assert!(!out.is_empty(), "the sweep must move the waiting byte");
+        assert_eq!(
+            slot.write_lane.lock().expect("write lane").bytes,
+            0,
+            "the lane empties"
+        );
+    }
+
+    #[test]
+    fn bulk_waiting_output_drains_one_window_per_sweep() {
+        let mut slot = slot_with_waiting_output(&[7u8; 32 * 1024]);
+        let mut out: VecDeque<BytesMut> = VecDeque::new();
+        slot.on_idle(&mut out);
+        assert!(!out.is_empty());
+        // One sweep moves one congestion window; the rest waits for
+        // the acknowledgments the real wire would send.
+        let left = slot.write_lane.lock().expect("write lane").bytes;
+        assert!(left < 32 * 1024 && left > 0);
     }
 }

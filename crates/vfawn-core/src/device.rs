@@ -11,6 +11,7 @@
 
 use bytes::BytesMut;
 use std::io;
+use std::sync::Arc;
 
 /// Read and write capability facts reported by a device.
 ///
@@ -36,6 +37,13 @@ impl DeviceCaps {
         queues: 1,
     };
 }
+
+/// A read-side fast-path claim the device's owner installs: true
+/// takes the packet out of the read path entirely, and any frames the
+/// claim produced (its answer traffic) append to the second argument —
+/// the device's own I/O loop sends them with its write path, so the
+/// claim never touches a queue or a thread it does not own.
+pub type ReadDispatch = Arc<dyn Fn(&[u8], &mut Vec<BytesMut>) -> bool + Send + Sync>;
 
 /// Batched raw-packet I/O against a TUN-style device.
 ///
@@ -69,4 +77,14 @@ pub trait PacketDevice: Send {
     /// wakes both. On a real device this is a duplicate of the file
     /// descriptor; on in-memory devices it is a clone of the queues.
     fn duplicate(&self) -> io::Result<Box<dyn PacketDevice>>;
+
+    /// Install a per-packet read-side dispatch that the device's owner
+    /// runs before frames enter the read path. Returning true claims
+    /// the packet entirely — it never reaches
+    /// [`PacketDevice::read_batch`] — and any answer frames it
+    /// produced leave through the device's own write path. The
+    /// default installs nothing, so reads deliver everything; the
+    /// claim is a device-side fast path, never a filter the stack
+    /// above may rely on for correctness.
+    fn set_read_dispatch(&self, _dispatch: ReadDispatch) {}
 }
