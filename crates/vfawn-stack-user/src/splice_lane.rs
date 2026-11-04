@@ -114,12 +114,9 @@ impl SpliceEntry {
     /// — the machine's value is stale by less than this segment, which
     /// its next catch-up absorbs — so the failure is left alone.
     pub fn advance_recv(&self, expected: u32, new: u32) {
-        let _ = self.recv_nxt.compare_exchange(
-            expected,
-            new,
-            Ordering::AcqRel,
-            Ordering::Relaxed,
-        );
+        let _ = self
+            .recv_nxt
+            .compare_exchange(expected, new, Ordering::AcqRel, Ordering::Relaxed);
     }
 
     /// Restamp the fields the dispatch reads: the send cursor and
@@ -195,11 +192,7 @@ impl SpliceLane {
 
     /// The entry for a flow, if it rides the lane.
     pub fn entry_for(&self, flow: &FlowKey) -> Option<Arc<SpliceEntry>> {
-        self.targets
-            .read()
-            .expect("splice lane")
-            .get(flow)
-            .cloned()
+        self.targets.read().expect("splice lane").get(flow).cloned()
     }
 
     /// The outbound fd for a flow, if it rides the lane.
@@ -493,7 +486,10 @@ mod tests {
         // test owns.
         #[expect(unsafe_code)]
         unsafe {
-            assert_eq!(libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()), 0);
+            assert_eq!(
+                libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()),
+                0
+            );
         }
         lane.register(key, fds[0]);
         let mut staged: Vec<bytes::BytesMut> = Vec::new();

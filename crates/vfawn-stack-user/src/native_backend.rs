@@ -335,7 +335,9 @@ impl TcpSlot {
                 self.connection.mss(),
                 self.cc.window(),
                 self.connection.peer_window(),
-                self.connection.send_nxt().wrapping_sub(self.connection.send_una()),
+                self.connection
+                    .send_nxt()
+                    .wrapping_sub(self.connection.send_una()),
                 self.flight.len(),
                 self.data_retries,
                 self.persist_at.is_some(),
@@ -487,11 +489,8 @@ impl SlotLogic for TcpSlot {
             // rides the slow path below, unacknowledged until it is
             // actually deliverable.
             if !self.fast_payload.is_empty()
-                && crate::splice_lane::send_payload(
-                    entry.outbound_fd(),
-                    &self.fast_payload,
-                )
-                .is_err()
+                && crate::splice_lane::send_payload(entry.outbound_fd(), &self.fast_payload)
+                    .is_err()
             {
                 self.fold_back_to_session();
                 entry.deactivate();
@@ -512,11 +511,8 @@ impl SlotLogic for TcpSlot {
                 // delivered either way, so the acceptance below is
                 // honest in both outcomes.
                 if self.fast_payload.len() >= 64 * 1024
-                    && crate::splice_lane::send_payload(
-                        entry.outbound_fd(),
-                        &self.fast_payload,
-                    )
-                    .is_err()
+                    && crate::splice_lane::send_payload(entry.outbound_fd(), &self.fast_payload)
+                        .is_err()
                 {
                     self.fold_back_to_session();
                     entry.deactivate();
@@ -527,10 +523,7 @@ impl SlotLogic for TcpSlot {
                 // the compare fails only if the dispatch itself already
                 // moved past, which the machine's next catch-up absorbs.
                 entry.advance_recv(seq_before, self.connection.recv_nxt());
-                entry.refresh(
-                    self.connection.send_nxt(),
-                    self.connection.fast_window(),
-                );
+                entry.refresh(self.connection.send_nxt(), self.connection.fast_window());
                 // This branch is the bootstrap and the fallback now (the
                 // read dispatch claims the steady segments), so its ACK
                 // rides the ordinary outbox-and-writer exit — the write
@@ -742,10 +735,8 @@ impl SlotLogic for TcpSlot {
                             return;
                         }
                         let mut lane = self.write_lane.lock().expect("write lane");
-                        let front_nonempty = lane
-                            .writes
-                            .front()
-                            .is_some_and(|write| !write.is_empty());
+                        let front_nonempty =
+                            lane.writes.front().is_some_and(|write| !write.is_empty());
                         if front_nonempty {
                             let probe;
                             {
@@ -767,8 +758,7 @@ impl SlotLogic for TcpSlot {
                                 held: false,
                                 gap_filled: false,
                             };
-                            let frame =
-                                emit_v4(self.server, self.client, &reaction, &[], &[probe]);
+                            let frame = emit_v4(self.server, self.client, &reaction, &[], &[probe]);
                             out.push_back(BytesMut::from(&frame[..]));
                             if self.flight.is_empty() {
                                 self.flight_base = self.connection.send_nxt();

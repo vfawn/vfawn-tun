@@ -24,8 +24,8 @@ use std::thread;
 
 use bytes::BytesMut;
 use tun_rs::{DeviceBuilder, InterruptEvent, SyncDevice, VIRTIO_NET_HDR_LEN};
-use vfawn_core::{DeviceCaps, DeviceConfig, PacketDevice};
 use vfawn_core::device::ReadDispatch;
+use vfawn_core::{DeviceCaps, DeviceConfig, PacketDevice};
 
 /// Frame budget when the configuration leaves the MTU to the platform.
 /// Large frames keep the syscall rate down; the kernel never reads past
