@@ -402,7 +402,15 @@ impl SlotLogic for TcpSlot {
         {
             let _ = crate::splice_lane::send_payload(fd, inbound.payload);
             let ack = self.connection.fast_accept(&inbound);
-            self.emit(&ack, out);
+            // The ACK rides the TUN write channel directly: the
+            // outbox-and-writer chain it would otherwise traverse
+            // adds three thread crossings per segment, which at
+            // hundreds of segments per second is the fast path's own
+            // bottleneck. A full channel drops the ACK (the peer
+            // retransmits and the slow path picks it up).
+            let frame = emit_v4(self.server, self.client, &ack, &[], &[]);
+            let _ = crate::splice_lane::SpliceLane::global()
+                .try_push_to_tun(vec![BytesMut::from(&frame[..])]);
             return;
         }
 
