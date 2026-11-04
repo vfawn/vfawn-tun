@@ -131,6 +131,9 @@ struct TcpSlot {
     fin_at: Option<u32>,
     /// The flow's dispatch key, for the splice lane's lookup.
     flow_key: vfawn_wire::flow::FlowKey,
+    /// Fast-path payload accumulator: segments in one batch share a
+    /// single write syscall instead of one each.
+    fast_payload: Vec<u8>,
 }
 
 /// The first retransmission timeout and its ceiling (RFC 6298 §2's
@@ -397,10 +400,12 @@ impl SlotLogic for TcpSlot {
         // entirely. The state machine's role shrinks to the two
         // sequence-cursor lines inside fast_accept; the ACK leaves
         // exactly as the slow path's would.
-        if let Some(fd) = crate::splice_lane::SpliceLane::global().fd_for(&self.flow_key)
+        if crate::splice_lane::SpliceLane::global()
+            .fd_for(&self.flow_key)
+            .is_some()
             && self.connection.fast_acceptable(&inbound)
         {
-            let _ = crate::splice_lane::send_payload(fd, inbound.payload);
+            self.fast_payload.extend_from_slice(inbound.payload);
             let ack = self.connection.fast_accept(&inbound);
             // The ACK rides the TUN write channel directly: the
             // outbox-and-writer chain it would otherwise traverse
@@ -622,6 +627,14 @@ impl SlotLogic for TcpSlot {
     }
 
     fn on_idle(&mut self, out: &mut VecDeque<BytesMut>) {
+        // The fast path's batched payload leaves now: one write for
+        // the whole burst instead of one per segment.
+        if !self.fast_payload.is_empty() {
+            if let Some(fd) = crate::splice_lane::SpliceLane::global().fd_for(&self.flow_key) {
+                let _ = crate::splice_lane::send_payload(fd, &self.fast_payload);
+            }
+            self.fast_payload.clear();
+        }
         // Host writes that arrived after the last packet: their only
         // ride is this idle sweep; CLOSE-WAIT writes still leave
         // (half-close: the answer direction stays ours).
@@ -846,6 +859,7 @@ impl StackBackend for NativeBackend {
             Box::new(TcpSlot {
                 connection: ServerConnection::new(isn, factory_shared.mss),
                 flow_key: *flow,
+                fast_payload: Vec::new(),
                 client,
                 server,
                 handler: Arc::clone(&factory_shared.handler),
