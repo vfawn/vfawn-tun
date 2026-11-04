@@ -62,14 +62,23 @@ impl SpliceLane {
         *self.tun_write.lock().expect("tun write") = Some(sender);
     }
 
-    /// Push constructed frames straight to the TUN: the downlink fast
-    /// path's exit. Returns false when the write handle is absent or
-    /// the device is down (the caller falls back to the session).
-    pub fn push_to_tun(&self, frames: Vec<bytes::BytesMut>) -> bool {
+    /// Push constructed frames straight to the TUN without blocking:
+    /// the downlink fast path's exit. A full channel returns the
+    /// frames (the caller routes them through the slow exit); a dead
+    /// device does the same. Blocking here would stall the shard
+    /// thread, which is the whole pipeline.
+    pub fn try_push_to_tun(
+        &self,
+        frames: Vec<bytes::BytesMut>,
+    ) -> Result<(), Vec<bytes::BytesMut>> {
         let guard = self.tun_write.lock().expect("tun write");
         match guard.as_ref() {
-            Some(sender) => sender.send(frames).is_ok(),
-            None => false,
+            Some(sender) => match sender.try_send(frames) {
+                Ok(()) => Ok(()),
+                Err(std::sync::mpsc::TrySendError::Full(frames)) => Err(frames),
+                Err(std::sync::mpsc::TrySendError::Disconnected(frames)) => Err(frames),
+            },
+            None => Err(frames),
         }
     }
 

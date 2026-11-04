@@ -219,7 +219,7 @@ impl TcpSlot {
             .fd_for(&self.flow_key)
             .is_some()
         {
-            let drained = self.drain_writes_fast();
+            let drained = self.drain_writes_fast(out);
             if drained > 0 {
                 return;
             }
@@ -313,7 +313,7 @@ impl TcpSlot {
     /// The downlink fast path's drain: same frame construction, same
     /// sequence advance, but the exit is the TUN channel rather than
     /// the shard's outbox. Returns bytes moved.
-    fn drain_writes_fast(&mut self) -> usize {
+    fn drain_writes_fast(&mut self, out: &mut VecDeque<BytesMut>) -> usize {
         let inflight = self
             .connection
             .send_nxt()
@@ -352,8 +352,16 @@ impl TcpSlot {
             }
         }
         drop(lane);
-        if moved > 0 && !crate::splice_lane::SpliceLane::global().push_to_tun(frames) {
-            return 0; // channel gone: the slow path must take over
+        if moved == 0 {
+            return 0;
+        }
+        // The sequence is already advanced — the frames WILL reach the
+        // wire. A full TUN channel is backpressure, not loss: the
+        // frames fall through to the caller's output queue (the slow
+        // exit) so the writer still drains them in order. Blocking
+        // here would stall the shard thread, which is the pipeline.
+        if let Err(overflow) = crate::splice_lane::SpliceLane::global().try_push_to_tun(frames) {
+            out.extend(overflow);
         }
         moved
     }

@@ -58,5 +58,5 @@ pub fn push_downlink(ctx: &DownlinkContext, payload: &[u8]) -> bool {
         seq = seq.wrapping_add(take as u32);
         offset += take;
     }
-    ctx.lane.push_to_tun(frames)
+    ctx.lane.try_push_to_tun(frames).is_ok()
 }
