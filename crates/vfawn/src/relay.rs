@@ -113,8 +113,8 @@ impl SessionHandler for RelayHandler {
         // through the lane, so the relay's buffers only need to cover
         // the slow flows. Thirty-two-kilobyte buffers were the
         // measured thirty-six-kilobyte session's biggest piece.
-        let mut up = [0u8; 4096];
-        let mut down = [0u8; 4096];
+        let mut up = [0u8; 2048];
+        let mut down = [0u8; 2048];
         // The fast path's send-sequence cursor: starts at the
         // connection's established sequence (the relay's first byte
         // rides at the handshake's next sequence number, which the

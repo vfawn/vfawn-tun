@@ -406,6 +406,15 @@ impl SlotLogic for TcpSlot {
             && self.connection.fast_acceptable(&inbound)
         {
             self.fast_payload.extend_from_slice(inbound.payload);
+            // A full-enough accumulator flushes now instead of waiting
+            // for the idle sweep: the batch's bulk cost amortizes the
+            // syscall without adding idle latency to small bursts.
+            if self.fast_payload.len() >= 64 * 1024 {
+                if let Some(fd) = crate::splice_lane::SpliceLane::global().fd_for(&self.flow_key) {
+                    let _ = crate::splice_lane::send_payload(fd, &self.fast_payload);
+                }
+                self.fast_payload.clear();
+            }
             let ack = self.connection.fast_accept(&inbound);
             // The ACK rides the TUN write channel directly: the
             // outbox-and-writer chain it would otherwise traverse
