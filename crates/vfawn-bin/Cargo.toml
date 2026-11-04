@@ -28,3 +28,7 @@ vfawn-testsuite = { path = "../vfawn-testsuite" }
 [[bench]]
 name = "dispatch"
 harness = false
+
+[[bench]]
+name = "stack"
+harness = false

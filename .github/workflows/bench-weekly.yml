@@ -1,0 +1,39 @@
+name: bench-weekly
+
+on:
+  schedule:
+    # Mondays 03:00 UTC, off the workday's heat.
+    - cron: "0 3 * * 1"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  baseline:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install criterion
+        run: cargo install cargo-criterion --locked || true
+      - name: Run the fixed benches
+        run: |
+          cargo bench -p vfawn-bin --bench wire -- --save-baseline weekly
+          cargo bench -p vfawn-bin --bench dispatch -- --save-baseline weekly
+          cargo bench -p vfawn-bin --bench stack -- --save-baseline weekly
+      - name: Compare against last week
+        run: |
+          mkdir -p bench-artifacts
+          for bench in wire dispatch stack; do
+            cargo criterion -p vfawn-bin --bench "$bench" --baseline weekly \
+              > "bench-artifacts/$bench.txt" 2>&1 || true
+          done
+      - name: Regression report (>5%)
+        run: |
+          python3 .github/scripts/bench_report.py bench-artifacts
+      - uses: actions/upload-artifact@v4
+        with:
+          name: weekly-baseline
+          path: bench-artifacts/
+          retention-days: 90
