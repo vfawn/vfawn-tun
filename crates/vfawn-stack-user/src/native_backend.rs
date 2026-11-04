@@ -225,6 +225,13 @@ impl TcpSlot {
         // win: +36% and zero retransmissions) writes its payload to
         // the outbound socket, but its ACKs still ride this channel;
         // arbitrating the two is a design piece, not a flag.
+        // The downlink fast drain stays parked: re-enabled with the
+        // 1024-deep channel, it still degrades both directions (466
+        // up to 364, 2432 down to 1990, measured). The TUN write
+        // channel is a shared resource; the uplink's direct ACK and
+        // the downlink's frames interleaving through it costs more
+        // than the outbox-and-writer hop it saves. A separate write
+        // lane (or io-thread arbitration) is the design piece.
         let _ = out;
         let inflight = self
             .connection
