@@ -33,8 +33,8 @@ const DEFAULT_MTU: u32 = 65535;
 /// How many read batches may wait for the reader, and how many write
 /// batches may wait for the I/O thread, before the sending side blocks:
 /// the pipeline's backpressure is the channel depth.
-const READ_DEPTH: usize = 64;
-const WRITE_DEPTH: usize = 64;
+const READ_DEPTH: usize = 1024;
+const WRITE_DEPTH: usize = 1024;
 
 /// Frames handed between the I/O thread and a caller in one batch:
 /// the library's own ideal, because a merged GRO burst under bulk load
