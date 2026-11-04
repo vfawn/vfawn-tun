@@ -215,15 +215,14 @@ impl TcpSlot {
         // The connection stays the single source of truth for the
         // sequence space, which is the bug the relay-side fast path
         // taught (its local cursor started at the wrong base).
-        if crate::splice_lane::SpliceLane::global()
-            .fd_for(&self.flow_key)
-            .is_some()
-        {
-            let drained = self.drain_writes_fast(out);
-            if drained > 0 {
-                return;
-            }
-        }
+        // The downlink fast drain is parked: the uplink's ACKs and
+        // the downlink's data both land in the TUN write channel, and
+        // the competition dropped the uplink from 271 to 37 Mbit/s
+        // (measured, three rounds). The uplink fast path (the proven
+        // win: +36% and zero retransmissions) writes its payload to
+        // the outbound socket, but its ACKs still ride this channel;
+        // arbitrating the two is a design piece, not a flag.
+        let _ = out;
         let inflight = self
             .connection
             .send_nxt()
@@ -313,6 +312,7 @@ impl TcpSlot {
     /// The downlink fast path's drain: same frame construction, same
     /// sequence advance, but the exit is the TUN channel rather than
     /// the shard's outbox. Returns bytes moved.
+    #[expect(dead_code)]
     fn drain_writes_fast(&mut self, out: &mut VecDeque<BytesMut>) -> usize {
         let inflight = self
             .connection
