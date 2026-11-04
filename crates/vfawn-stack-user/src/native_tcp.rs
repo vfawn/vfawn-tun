@@ -674,6 +674,28 @@ impl ServerConnection {
         self.state = TcpState::Closed;
     }
 
+    /// The payload fast path's question: may this segment skip the
+    /// full state machine? True only for the common steady shape, an
+    /// in-order pure-data ACK segment in ESTABLISHED; everything
+    /// else, control, gaps, window news, teardown, belongs to the
+    /// machine.
+    pub fn fast_acceptable(&self, inbound: &Inbound) -> bool {
+        self.state == TcpState::Established
+            && inbound.flags == ctl::ACK | ctl::PSH
+            && !inbound.payload.is_empty()
+            && inbound.seq == self.recv.nxt
+            && inbound.ack == self.send.nxt
+    }
+
+    /// The fast path's bookkeeping: advance the receive cursor over
+    /// the payload and answer with the acknowledgment the full machine
+    /// would have built. The payload itself never enters a buffer
+    /// here; the caller moves it straight to the outbound socket.
+    pub fn fast_accept(&mut self, inbound: &Inbound) -> Reaction {
+        self.recv.nxt = inbound.seq.wrapping_add(inbound.payload.len() as u32);
+        Reaction::segment(self.send.nxt, self.recv.nxt, ctl::ACK, self.recv.window)
+    }
+
     pub fn fin_reaction(&self) -> Reaction {
         if self.fin_sent || !matches!(self.state, TcpState::Established | TcpState::CloseWait) {
             return Reaction::silent();

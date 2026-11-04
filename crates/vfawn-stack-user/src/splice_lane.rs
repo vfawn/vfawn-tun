@@ -44,6 +44,15 @@ impl SpliceLane {
         Self::default()
     }
 
+    /// The process-wide lane: the relay handler's side and the shard's
+    /// side meet here without threading an Arc through the session
+    /// contract. One process runs one stack; the singleton is the
+    /// honest shape for that.
+    pub fn global() -> &'static SpliceLane {
+        static LANE: std::sync::OnceLock<SpliceLane> = std::sync::OnceLock::new();
+        LANE.get_or_init(SpliceLane::new)
+    }
+
     /// Register a flow for the fast path. After this call, the shard
     /// sends the flow's data segments here instead of through the
     /// slot's session channel.

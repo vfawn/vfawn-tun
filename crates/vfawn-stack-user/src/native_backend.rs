@@ -129,6 +129,8 @@ struct TcpSlot {
     synack_retries: u32,
     /// Our FIN's sequence while LAST-ACK waits for its acknowledgment.
     fin_at: Option<u32>,
+    /// The flow's dispatch key, for the splice lane's lookup.
+    flow_key: vfawn_wire::flow::FlowKey,
 }
 
 /// The first retransmission timeout and its ceiling (RFC 6298 §2's
@@ -316,6 +318,21 @@ impl SlotLogic for TcpSlot {
             return;
         }
         let inbound = Inbound::parse(&header, payload);
+
+        // The payload fast path: a registered relay flow's steady
+        // data segment skips the session channel and the relay task
+        // entirely. The state machine's role shrinks to the two
+        // sequence-cursor lines inside fast_accept; the ACK leaves
+        // exactly as the slow path's would.
+        if let Some(fd) = crate::splice_lane::SpliceLane::global().fd_for(&self.flow_key)
+            && self.connection.fast_acceptable(&inbound)
+        {
+            let _ = crate::splice_lane::send_payload(fd, inbound.payload);
+            let ack = self.connection.fast_accept(&inbound);
+            self.emit(&ack, out);
+            return;
+        }
+
         let una_before = self.connection.send_una();
         let reaction = self.connection.on_segment(&inbound);
 
@@ -747,6 +764,7 @@ impl StackBackend for NativeBackend {
             let write_lane = Arc::new(std::sync::Mutex::new(WriteLane::new()));
             Box::new(TcpSlot {
                 connection: ServerConnection::new(isn, factory_shared.mss),
+                flow_key: *flow,
                 client,
                 server,
                 handler: Arc::clone(&factory_shared.handler),

@@ -84,6 +84,19 @@ impl SessionHandler for RelayHandler {
                 return;
             }
         };
+        // The fast path's registration: the outbound socket's fd goes
+        // into the splice lane under the flow's key, so the shard can
+        // send payload bytes straight to it without the session
+        // channel's hop. The registration lives as long as the
+        // connection (removed on return from this function).
+        #[cfg(all(feature = "backend-native", target_os = "linux"))]
+        {
+            let flow = session.flow();
+            if let Some(key) = relay_flow_key(flow) {
+                let fd = outbound.as_raw_fd();
+                vfawn_stack_user::splice_lane::SpliceLane::global().register(key, fd);
+            }
+        }
 
         let mut up = [0u8; 16384];
         let mut down = [0u8; 16384];
@@ -108,6 +121,13 @@ impl SessionHandler for RelayHandler {
             }
         }
         let _ = session.shutdown_write().await;
+        #[cfg(all(feature = "backend-native", target_os = "linux"))]
+        {
+            let flow = session.flow();
+            if let Some(key) = relay_flow_key(flow) {
+                vfawn_stack_user::splice_lane::SpliceLane::global().unregister(&key);
+            }
+        }
     }
 
     async fn on_udp(&self, mut session: UdpSession) {
@@ -154,4 +174,24 @@ impl SessionHandler for RelayHandler {
     async fn on_icmp(&self, _packet: IcmpPacket) -> vfawn_core::Action {
         vfawn_core::Action::Drop
     }
+}
+
+/// Derive the shard's dispatch key from the session's flow info.
+/// The key is the five-tuple the wire layer parses out of packets;
+/// the session's FlowInfo carries the same addresses in its source
+/// and destination.
+#[cfg(all(feature = "backend-native", target_os = "linux"))]
+fn relay_flow_key(flow: &vfawn_core::FlowInfo) -> Option<vfawn_wire::flow::FlowKey> {
+    use std::net::IpAddr;
+    let (src, dst) = match (flow.source.ip(), flow.destination.ip()) {
+        (IpAddr::V4(a), IpAddr::V4(b)) => (a, b),
+        _ => return None,
+    };
+    Some(vfawn_wire::flow::FlowKey {
+        src: IpAddr::V4(src),
+        src_port: flow.source.port(),
+        dst: IpAddr::V4(dst),
+        dst_port: flow.destination.port(),
+        protocol: vfawn_wire::protocol::IpProtocol::Tcp,
+    })
 }
