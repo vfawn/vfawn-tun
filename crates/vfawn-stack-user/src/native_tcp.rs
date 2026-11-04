@@ -680,8 +680,13 @@ impl ServerConnection {
     /// else, control, gaps, window news, teardown, belongs to the
     /// machine.
     pub fn fast_acceptable(&self, inbound: &Inbound) -> bool {
+        // PSH is advisory: the kernel sets it on burst tails, not on
+        // every bulk segment, so the fast path takes both shapes.
         self.state == TcpState::Established
-            && inbound.flags == ctl::ACK | ctl::PSH
+            && inbound.flags & ctl::ACK != 0
+            && inbound.flags & ctl::RST == 0
+            && inbound.flags & ctl::SYN == 0
+            && inbound.flags & ctl::FIN == 0
             && !inbound.payload.is_empty()
             && inbound.seq == self.recv.nxt
             && inbound.ack == self.send.nxt
