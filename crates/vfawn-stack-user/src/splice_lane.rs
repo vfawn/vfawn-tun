@@ -37,6 +37,10 @@ pub struct SpliceTarget {
 #[derive(Default)]
 pub struct SpliceLane {
     targets: Mutex<HashMap<vfawn_wire::flow::FlowKey, RawFd>>,
+    /// The TUN's direct write handle: frames pushed here reach the
+    /// wire without the shard's drain path. The io bridge installs it
+    /// at spawn; the relay reads it for the downlink fast path.
+    tun_write: Mutex<Option<std::sync::mpsc::SyncSender<Vec<bytes::BytesMut>>>>,
 }
 
 impl SpliceLane {
@@ -51,6 +55,22 @@ impl SpliceLane {
     pub fn global() -> &'static SpliceLane {
         static LANE: std::sync::OnceLock<SpliceLane> = std::sync::OnceLock::new();
         LANE.get_or_init(SpliceLane::new)
+    }
+
+    /// Install the TUN's direct write handle (the io bridge's channel).
+    pub fn set_tun_write(&self, sender: std::sync::mpsc::SyncSender<Vec<bytes::BytesMut>>) {
+        *self.tun_write.lock().expect("tun write") = Some(sender);
+    }
+
+    /// Push constructed frames straight to the TUN: the downlink fast
+    /// path's exit. Returns false when the write handle is absent or
+    /// the device is down (the caller falls back to the session).
+    pub fn push_to_tun(&self, frames: Vec<bytes::BytesMut>) -> bool {
+        let guard = self.tun_write.lock().expect("tun write");
+        match guard.as_ref() {
+            Some(sender) => sender.send(frames).is_ok(),
+            None => false,
+        }
     }
 
     /// Register a flow for the fast path. After this call, the shard

@@ -97,14 +97,41 @@ impl SessionHandler for RelayHandler {
                 vfawn_stack_user::splice_lane::SpliceLane::global().register(key, fd);
             }
         }
+        // The downlink fast path's context: the flow's addresses and
+        // the lane, captured for the read loop below.
+        #[cfg(all(feature = "backend-native", target_os = "linux"))]
+        let fast_down = relay_flow_key(session.flow()).map(|key| {
+            let flow = session.flow();
+            (
+                key,
+                vfawn_stack_user::splice_lane::SpliceLane::global(),
+                flow,
+            )
+        });
 
         let mut up = [0u8; 16384];
         let mut down = [0u8; 16384];
+        // The fast path's send-sequence cursor: starts at the
+        // connection's established sequence (the relay's first byte
+        // rides at the handshake's next sequence number, which the
+        // fast path tracks locally; the slow path's cursor stays in
+        // the shard slot, and the two converge because every byte
+        // passes through exactly one of them).
+        #[cfg(all(feature = "backend-native", target_os = "linux"))]
+        let mut next_send_seq: u32 = 1;
+        #[cfg(all(feature = "backend-native", target_os = "linux"))]
+        let mut flow_ack: u32 = 1;
         loop {
             tokio::select! {
                 from_client = session.read(&mut up) => match from_client {
                     Ok(0) | Err(_) => break,
                     Ok(n) => {
+                        #[cfg(all(feature = "backend-native", target_os = "linux"))]
+                        {
+                            // The client's data advances the ack we
+                            // stamp on downlink frames.
+                            flow_ack = flow_ack.wrapping_add(n as u32);
+                        }
                         if outbound.write_all(&up[..n]).await.is_err() {
                             break;
                         }
@@ -113,6 +140,42 @@ impl SessionHandler for RelayHandler {
                 from_origin = outbound.read(&mut down) => match from_origin {
                     Ok(0) | Err(_) => break,
                     Ok(n) => {
+                        // The downlink fast path: build the frames here
+                        // and push straight to the TUN, skipping the
+                        // session's write lane and the shard's drain.
+                        // Falls back to the session when the lane is
+                        // absent or the device is gone.
+                        #[cfg(all(feature = "backend-native", target_os = "linux"))]
+                        {
+                            if let Some((_, lane, flow)) = &fast_down {
+                                let (src_v4, dst_v4) = match (
+                                    flow.destination.ip(),
+                                    flow.source.ip(),
+                                ) {
+                                    (std::net::IpAddr::V4(a), std::net::IpAddr::V4(b)) => {
+                                        (a, b)
+                                    }
+                                    _ => break,
+                                };
+                                let pushed = vfawn_stack_user::fast_down::push_downlink(
+                                    &vfawn_stack_user::fast_down::DownlinkContext {
+                                        lane,
+                                        src: std::net::SocketAddrV4::new(src_v4, flow.destination.port()),
+                                        dst: std::net::SocketAddrV4::new(dst_v4, flow.source.port()),
+                                        seq: next_send_seq,
+                                        ack: flow_ack,
+                                        window: 65535,
+                                        mss: 1460,
+                                    },
+                                    &down[..n],
+                                );
+                                if pushed {
+                                    next_send_seq =
+                                        next_send_seq.wrapping_add(n as u32);
+                                    continue;
+                                }
+                            }
+                        }
                         if session.write(&down[..n]).await.is_err() {
                             break;
                         }
