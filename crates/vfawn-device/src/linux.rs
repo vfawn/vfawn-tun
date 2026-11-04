@@ -234,9 +234,20 @@ fn io_loop(shared: Arc<Shared>, mut device: SyncDevice, writes: Receiver<Vec<Byt
                 for buf in bufs.iter_mut().take(count) {
                     frames.push(std::mem::take(buf));
                 }
-                if shared.reads.send(frames).is_err() {
-                    eprintln!("vfawn: tun I/O stopped: reader gone");
-                    return;
+                // A full read channel drops the batch (a qdisc-shaped
+                // loss: TCP retransmits, UDP loses one datagram).
+                // Blocking here would freeze the device: the single
+                // I/O thread is the only reader AND the only writer,
+                // so a blocked send stalls both directions, which is
+                // the intermittent whole-pipeline death the multi-
+                // round bench kept hitting.
+                match shared.reads.try_send(frames) {
+                    Ok(()) => {}
+                    Err(std::sync::mpsc::TrySendError::Full(_dropped)) => {}
+                    Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                        eprintln!("vfawn: tun I/O stopped: reader gone");
+                        return;
+                    }
                 }
             }
             Ok(_) => {}
