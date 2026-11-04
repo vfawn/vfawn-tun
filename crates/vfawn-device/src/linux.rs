@@ -226,7 +226,7 @@ fn io_loop(shared: Arc<Shared>, mut device: SyncDevice, writes: Receiver<Vec<Byt
                             return;
                         }
                         drop_counter = drop_counter.wrapping_add(1);
-                        if drop_counter == 1 || drop_counter % 10_000 == 0 {
+                        if drop_counter == 1 || drop_counter.is_multiple_of(10_000) {
                             eprintln!(
                                 "vfawn: tun write refused ({error}); dropped {drop_counter} batches"
                             );
