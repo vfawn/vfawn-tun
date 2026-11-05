@@ -489,6 +489,18 @@ impl SlotLogic for TcpSlot {
             // actually deliverable.
             {
                 if !entry.is_active() {
+                    // Adoption before activation: a deactivation (an
+                    // outbound write refused under pressure) left the
+                    // shared cursor ahead of the machine — the bytes
+                    // the dispatch claimed, staged, and acknowledged.
+                    // Re-arming the entry from the machine's stale
+                    // position rewound the wire's truth, and every
+                    // in-flight successor then mismatched ahead into
+                    // the slow path: a quarter of all segments, and
+                    // the throughput's sawtooth. The machine takes the
+                    // wire's position first; the entry arms at the
+                    // truth.
+                    self.connection.catchup_recv(entry.recv_nxt_value());
                     entry.activate(
                         self.connection.recv_nxt(),
                         self.connection.send_nxt(),

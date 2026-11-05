@@ -271,7 +271,21 @@ impl SpliceLane {
         // machine owes this segment no acknowledgment processing).
         let expected = entry.recv_nxt.load(Ordering::Acquire);
         if tcp.seq != expected {
-            self.declines.seq_mismatch.fetch_add(1, Ordering::Relaxed);
+            // The distance sign names the story: ahead is a gap the
+            // slow path assembles, behind is a duplicate it answers.
+            let delta = tcp.seq.wrapping_sub(expected);
+            if delta > 0 && delta < u32::MAX / 2 {
+                if self.declines.seq_ahead.fetch_add(1, Ordering::Relaxed) < 3
+                    && std::env::var_os("VFAWN_TRACE_FAST").is_some()
+                {
+                    eprintln!(
+                        "vfawn-trace: ahead sample expected={expected} seq={} delta={delta} sport={} dport={}",
+                        tcp.seq, tcp.src_port, tcp.dst_port
+                    );
+                }
+            } else {
+                self.declines.seq_behind.fetch_add(1, Ordering::Relaxed);
+            }
             return false;
         }
         let stamp_seq = entry.send_nxt.load(Ordering::Acquire);
@@ -372,7 +386,13 @@ struct StagedOutbound {
 pub struct DeclineHistogram {
     pub no_entry: AtomicU64,
     pub inactive: AtomicU64,
-    pub seq_mismatch: AtomicU64,
+    /// Sequence mismatch with the shared cursor ahead of the segment
+    /// (a gap: bytes the dispatch hasn't seen arrived later than their
+    /// successors) — the slow path sorts and delivers.
+    pub seq_ahead: AtomicU64,
+    /// Sequence mismatch with the cursor behind (a retransmission or
+    /// duplicate) — the slow path answers from its machine state.
+    pub seq_behind: AtomicU64,
     pub ack_mismatch: AtomicU64,
     pub staging_full: AtomicU64,
     pub claimed: AtomicU64,
@@ -388,12 +408,13 @@ impl DeclineHistogram {
             *last = Some(Instant::now());
             drop(last);
             eprintln!(
-                "vfawn: dispatch registered={} claimed={} no_entry={} inactive={} seq={} ack={} staging={}",
+                "vfawn: dispatch registered={} claimed={} no_entry={} inactive={} seq_ahead={} seq_behind={} ack={} staging={}",
                 self.registered.load(Ordering::Relaxed),
                 self.claimed.load(Ordering::Relaxed),
                 self.no_entry.load(Ordering::Relaxed),
                 self.inactive.load(Ordering::Relaxed),
-                self.seq_mismatch.load(Ordering::Relaxed),
+                self.seq_ahead.load(Ordering::Relaxed),
+                self.seq_behind.load(Ordering::Relaxed),
                 self.ack_mismatch.load(Ordering::Relaxed),
                 self.staging_full.load(Ordering::Relaxed),
             );
