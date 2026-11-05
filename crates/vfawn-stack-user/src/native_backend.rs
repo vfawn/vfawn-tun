@@ -248,7 +248,6 @@ impl TcpSlot {
         // the downlink's frames interleaving through it costs more
         // than the outbox-and-writer hop it saves. A separate write
         // lane (or io-thread arbitration) is the design piece.
-        let _ = out;
         let inflight = self
             .connection
             .send_nxt()
