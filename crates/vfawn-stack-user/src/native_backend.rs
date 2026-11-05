@@ -880,6 +880,56 @@ struct NativeTcpIo {
 
 #[async_trait::async_trait]
 impl TcpTransport for NativeTcpIo {
+    async fn read_owned(&mut self) -> io::Result<Vec<u8>> {
+        // The parked wait owns nothing: the channel carries the bytes,
+        // and the Vec below lives only until the caller finishes with
+        // it — an idle session between reads holds no buffer at all.
+        // The first chunk arrives as its own Vec and carries whatever
+        // else is queued onto it, so one return still holds a relay's
+        // worth of segments rather than waking the writer per segment.
+        const CHUNK_TARGET: usize = 2048;
+        loop {
+            if !self.pending.is_empty() {
+                let mut chunk = std::mem::take(&mut self.pending);
+                while chunk.len() < CHUNK_TARGET {
+                    match self.events.try_recv() {
+                        Ok(HostEvent::Bytes(more)) => chunk.extend(more),
+                        Ok(HostEvent::Established) => {}
+                        Ok(HostEvent::Closed) => {
+                            self.closed = true;
+                            break;
+                        }
+                        Err(_) => break,
+                    }
+                }
+                return Ok(chunk.into());
+            }
+            if self.closed {
+                return Ok(Vec::new());
+            }
+            match self.events.recv().await {
+                Some(HostEvent::Bytes(bytes)) => {
+                    let mut chunk = bytes;
+                    while chunk.len() < CHUNK_TARGET {
+                        match self.events.try_recv() {
+                            Ok(HostEvent::Bytes(more)) => chunk.extend(more),
+                            Ok(HostEvent::Established) => {}
+                            Ok(HostEvent::Closed) => {
+                                self.closed = true;
+                                break;
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                    return Ok(chunk);
+                }
+                Some(HostEvent::Established) => continue,
+                Some(HostEvent::Closed) => self.closed = true,
+                None => self.closed = true,
+            }
+        }
+    }
+
     async fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         loop {
             if !self.pending.is_empty() {

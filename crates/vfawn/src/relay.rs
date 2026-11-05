@@ -15,6 +15,8 @@
 //! service on Android) and every dial passes through it.
 
 use std::io;
+
+use bytes::BytesMut;
 use std::os::fd::{AsRawFd, RawFd};
 use std::sync::Arc;
 use vfawn_core::{FlowInfo, IcmpPacket, Network, SessionHandler, TcpSession, UdpSession, Verdict};
@@ -76,7 +78,7 @@ impl SessionHandler for RelayHandler {
     }
 
     async fn on_tcp(&self, mut session: TcpSession) {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::io::AsyncWriteExt;
         let destination = session.flow().destination;
         let mut outbound = match dial_tcp(&self.protect, destination).await {
             Ok(stream) => stream,
@@ -105,25 +107,28 @@ impl SessionHandler for RelayHandler {
             }
         }
 
-        // Two kilobytes per direction: the fast path carries bulk
-        // through the lane, so the relay's buffers only need to cover
-        // the slow flows. Thirty-two-kilobyte buffers were the
-        // measured thirty-six-kilobyte session's biggest piece.
-        let mut up = [0u8; 2048];
-        let mut down = [0u8; 2048];
+        // Both directions park holding nothing: the client side waits
+        // on the session's channel (the bytes it carries ARE the
+        // buffer), and the origin side waits on readiness alone — the
+        // read's storage lives only inside the arm that uses it. A
+        // parked relay therefore costs no buffers, which was half of
+        // the measured eight-kilobyte session. The allocator is the
+        // pool: a burst allocates, the write's completion frees, and
+        // an idle session owns neither.
         loop {
             tokio::select! {
-                from_client = session.read(&mut up) => match from_client {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => {
-                        if outbound.write_all(&up[..n]).await.is_err() {
+                from_client = session.read_owned() => match from_client {
+                    Ok(bytes) if bytes.is_empty() => break,
+                    Err(_) => break,
+                    Ok(bytes) => {
+                        if outbound.write_all(&bytes).await.is_err() {
                             break;
                         }
                     }
                 },
-                from_origin = outbound.read(&mut down) => match from_origin {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => {
+                ready = outbound.readable() => match ready {
+                    Err(_) => break,
+                    Ok(()) => {
                         // Downlink rides the session's write lane into
                         // the slot's drain. The relay-side frame builder
                         // this arm once carried was parked on evidence
@@ -133,8 +138,22 @@ impl SessionHandler for RelayHandler {
                         // channel made the channel multi-producer, which
                         // collapsed both directions. The drain owns
                         // downlink; this side only moves bytes.
-                        if session.write(&down[..n]).await.is_err() {
-                            break;
+                        let mut down = BytesMut::with_capacity(2048);
+                        match outbound.try_read_buf(&mut down) {
+                            // A readiness race, not an error: the socket
+                            // said readable, the read found nothing, and
+                            // the answer is to wait again — treating it
+                            // as an exit killed every relay at its first
+                            // spurious wake.
+                            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                                continue;
+                            }
+                            Ok(0) | Err(_) => break,
+                            Ok(_) => {
+                                if session.write(&down).await.is_err() {
+                                    break;
+                                }
+                            }
                         }
                     }
                 },

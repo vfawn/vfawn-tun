@@ -63,6 +63,13 @@ impl TcpTransport for MockTcp {
         }
     }
 
+    async fn read_owned(&mut self) -> io::Result<Vec<u8>> {
+        match self.chunks.pop_front() {
+            Some(chunk) => Ok(chunk),
+            None => Ok(Vec::new()),
+        }
+    }
+
     async fn write(&mut self, data: &[u8]) -> io::Result<usize> {
         let n = data.len().min(self.quota);
         self.accepted += n;

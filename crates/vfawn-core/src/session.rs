@@ -134,6 +134,12 @@ pub trait TcpTransport: Send {
     /// Read up to `buf.len()` bytes. `Ok(0)` means the peer closed its
     /// write side; reads may still follow nothing further.
     async fn read(&mut self, buf: &mut [u8]) -> io::Result<usize>;
+    /// Read whatever is ready into freshly owned storage. The
+    /// allocation lives only between this call and the caller
+    /// finishing with it, so a task parked between reads holds no
+    /// buffer — the transport's own channel carries the bytes while it
+    /// waits. `Ok(empty)` matches `read`'s `Ok(0)`.
+    async fn read_owned(&mut self) -> io::Result<Vec<u8>>;
     /// Write as much as the send buffer accepts.
     async fn write(&mut self, data: &[u8]) -> io::Result<usize>;
     /// Send our FIN; the read direction stays open.
@@ -200,6 +206,18 @@ impl TcpSession {
             t.count_reverse(n as u64);
         }
         Ok(n)
+    }
+
+    /// See [`TcpTransport::read_owned`]; the reverse-direction
+    /// accounting matches [`TcpSession::read`].
+    pub async fn read_owned(&mut self) -> io::Result<Vec<u8>> {
+        let bytes = self.transport.read_owned().await?;
+        if !bytes.is_empty()
+            && let Some(ref t) = self.tracker
+        {
+            t.count_reverse(bytes.len() as u64);
+        }
+        Ok(bytes)
     }
 
     /// See [`TcpTransport::write`]. Bytes accepted count toward the

@@ -16,6 +16,7 @@ ipnet.workspace = true
 socket2 = { workspace = true, features = ["all"] }
 vfawn-core = { path = "../vfawn-core" }
 vfawn-device = { path = "../vfawn-device" }
+bytes.workspace = true
 vfawn-stack-user = { path = "../vfawn-stack-user", optional = true }
 vfawn-route = { path = "../vfawn-route" }
 
@@ -29,4 +30,3 @@ backend-native = ["dep:vfawn-stack-user", "vfawn-stack-user/backend-native"]
 
 [dev-dependencies]
 vfawn-testsuite = { path = "../vfawn-testsuite" }
-bytes.workspace = true

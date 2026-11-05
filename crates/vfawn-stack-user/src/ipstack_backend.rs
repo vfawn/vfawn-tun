@@ -361,6 +361,13 @@ impl TcpTransport for TcpIo {
         self.stream.read(buf).await
     }
 
+    async fn read_owned(&mut self) -> io::Result<Vec<u8>> {
+        let mut scratch = vec![0u8; 2048];
+        let n = self.stream.read(&mut scratch).await?;
+        scratch.truncate(n);
+        Ok(scratch)
+    }
+
     async fn write(&mut self, data: &[u8]) -> io::Result<usize> {
         self.stream.write(data).await
     }
