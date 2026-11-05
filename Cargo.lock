@@ -1354,6 +1354,7 @@ dependencies = [
  "vfawn-route",
  "vfawn-stack-user",
  "vfawn-testsuite",
+ "vfawn-wire",
 ]
 
 [[package]]

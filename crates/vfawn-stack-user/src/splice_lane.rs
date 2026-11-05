@@ -22,8 +22,9 @@ use std::collections::HashMap;
 use std::io;
 use std::net::IpAddr;
 use std::os::fd::RawFd;
-use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
+use std::time::{Duration, Instant};
 
 use vfawn_wire::flow::FlowKey;
 use vfawn_wire::ipv4::Ipv4Header;
@@ -156,6 +157,8 @@ pub struct SpliceLane {
     /// finish run on that thread — so the mutex is uncontended
     /// insurance, not synchronization.
     staged: Mutex<HashMap<RawFd, StagedOutbound>>,
+    /// Decline accounting, dumped once a second while claims run.
+    declines: DeclineHistogram,
 }
 
 impl SpliceLane {
@@ -184,6 +187,7 @@ impl SpliceLane {
         if owned < 0 {
             return;
         }
+        self.declines.registered.fetch_add(1, Ordering::Relaxed);
         self.targets
             .write()
             .expect("splice lane")
@@ -244,7 +248,7 @@ impl SpliceLane {
             || !tcp.flags.contains(TcpFlags::ACK)
             || (tcp.flags.bits() & control.bits()) != 0
         {
-            return false;
+            return false; // the machine's traffic: not a decline
         }
         let key = FlowKey {
             src: IpAddr::V4(ip.src),
@@ -254,9 +258,11 @@ impl SpliceLane {
             protocol: IpProtocol::Tcp,
         };
         let Some(entry) = self.entry_for(&key) else {
+            self.declines.no_entry.fetch_add(1, Ordering::Relaxed);
             return false;
         };
         if !entry.is_active() {
+            self.declines.inactive.fetch_add(1, Ordering::Relaxed);
             return false;
         }
         // The same admission the slot's fast path makes, against the
@@ -265,10 +271,12 @@ impl SpliceLane {
         // machine owes this segment no acknowledgment processing).
         let expected = entry.recv_nxt.load(Ordering::Acquire);
         if tcp.seq != expected {
+            self.declines.seq_mismatch.fetch_add(1, Ordering::Relaxed);
             return false;
         }
         let stamp_seq = entry.send_nxt.load(Ordering::Acquire);
         if tcp.ack != stamp_seq {
+            self.declines.ack_mismatch.fetch_add(1, Ordering::Relaxed);
             return false;
         }
         // The payload joins this batch's outbound staging rather than
@@ -282,6 +290,7 @@ impl SpliceLane {
             match staged.entry(entry.outbound_fd()) {
                 std::collections::hash_map::Entry::Occupied(mut slot) => {
                     if slot.get_mut().buffer.len() >= STAGE_FLUSH {
+                        self.declines.staging_full.fetch_add(1, Ordering::Relaxed);
                         return false;
                     }
                     slot.get_mut().buffer.extend_from_slice(payload);
@@ -309,6 +318,7 @@ impl SpliceLane {
         let client = std::net::SocketAddrV4::new(ip.src, tcp.src_port);
         let frame = crate::native_tcp::emit_v4(server, client, &ack, &[], &[]);
         produced.push(bytes::BytesMut::from(&frame[..]));
+        self.declines.claimed.fetch_add(1, Ordering::Relaxed);
         true
     }
 
@@ -320,6 +330,9 @@ impl SpliceLane {
     /// dropped: the flow is going away and the entry's descriptor
     /// closes with its last reference.
     pub fn flush_staged(&self) {
+        if std::env::var_os("VFAWN_TRACE_FAST").is_some() {
+            self.declines.dump();
+        }
         let mut staged = self.staged.lock().expect("outbound staging");
         let keys: Vec<RawFd> = staged.keys().copied().collect();
         for fd in keys {
@@ -350,6 +363,42 @@ impl SpliceLane {
 struct StagedOutbound {
     entry: Arc<SpliceEntry>,
     buffer: Vec<u8>,
+}
+
+/// The dispatch's decline histogram: which door said no, counted per
+/// packet. The numbers name the next fix; the dump rides the batch's
+/// end once a second and costs nothing on the claim path itself.
+#[derive(Default)]
+pub struct DeclineHistogram {
+    pub no_entry: AtomicU64,
+    pub inactive: AtomicU64,
+    pub seq_mismatch: AtomicU64,
+    pub ack_mismatch: AtomicU64,
+    pub staging_full: AtomicU64,
+    pub claimed: AtomicU64,
+    pub registered: AtomicU64,
+    last_dump: std::sync::Mutex<Option<Instant>>,
+}
+
+impl DeclineHistogram {
+    fn dump(&self) {
+        let mut last = self.last_dump.lock().expect("dump gate");
+        let due = last.is_none_or(|at| at.elapsed() >= Duration::from_secs(1));
+        if due {
+            *last = Some(Instant::now());
+            drop(last);
+            eprintln!(
+                "vfawn: dispatch registered={} claimed={} no_entry={} inactive={} seq={} ack={} staging={}",
+                self.registered.load(Ordering::Relaxed),
+                self.claimed.load(Ordering::Relaxed),
+                self.no_entry.load(Ordering::Relaxed),
+                self.inactive.load(Ordering::Relaxed),
+                self.seq_mismatch.load(Ordering::Relaxed),
+                self.ack_mismatch.load(Ordering::Relaxed),
+                self.staging_full.load(Ordering::Relaxed),
+            );
+        }
+    }
 }
 
 /// How much outbound staging one socket may hold before the dispatch

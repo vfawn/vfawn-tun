@@ -19,6 +19,7 @@ vfawn-device = { path = "../vfawn-device" }
 bytes.workspace = true
 vfawn-stack-user = { path = "../vfawn-stack-user", optional = true }
 vfawn-route = { path = "../vfawn-route" }
+vfawn-wire = { path = "../vfawn-wire", optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 vfawn-platform = { path = "../vfawn-platform" }
@@ -26,7 +27,7 @@ vfawn-platform = { path = "../vfawn-platform" }
 [features]
 default = ["backend-ipstack"]
 backend-ipstack = ["dep:vfawn-stack-user", "vfawn-stack-user/backend-ipstack"]
-backend-native = ["dep:vfawn-stack-user", "vfawn-stack-user/backend-native"]
+backend-native = ["dep:vfawn-stack-user", "vfawn-stack-user/backend-native", "dep:vfawn-wire"]
 
 [dev-dependencies]
 vfawn-testsuite = { path = "../vfawn-testsuite" }
