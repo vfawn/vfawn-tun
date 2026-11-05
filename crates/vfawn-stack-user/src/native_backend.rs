@@ -31,6 +31,7 @@
 use std::collections::VecDeque;
 use std::io;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -110,6 +111,8 @@ struct TcpSlot {
     flow: FlowInfo,
     /// The lane this slot's host writes arrive on.
     write_lane: Arc<std::sync::Mutex<WriteLane>>,
+    /// The shard's wake flag this slot's lane rings on host writes.
+    shard_wake: Arc<AtomicBool>,
     cc: Box<dyn CongestionAlgo>,
     /// The host channel, created when the handshake completes. A SYN
     /// that never completes (a spoofed flood) costs nothing here.
@@ -142,9 +145,6 @@ struct TcpSlot {
     diag_queued: usize,
     /// The flow's dispatch key, for the splice lane's lookup.
     flow_key: vfawn_wire::flow::FlowKey,
-    /// Fast-path payload accumulator: segments in one batch share a
-    /// single write syscall instead of one each.
-    fast_payload: Vec<u8>,
 }
 
 /// The first retransmission timeout and its ceiling (RFC 6298 §2's
@@ -187,6 +187,7 @@ impl TcpSlot {
             flow: self.flow.clone(),
             events: event_rx,
             write_lane: Arc::clone(&self.write_lane),
+            shard_wake: Arc::clone(&self.shard_wake),
         };
         if self.sessions.send(handoff).is_ok() {
             let _ = event_tx.send(HostEvent::Established);
@@ -418,13 +419,12 @@ impl TcpSlot {
     /// place that can wait out the socket's pressure. Without a
     /// session (the flow folded after teardown), nobody downstream
     /// wants them and the accumulator just empties.
-    fn fold_back_to_session(&mut self) {
-        let bytes = std::mem::take(&mut self.fast_payload);
+    fn fold_back_to_session(&mut self, bytes: &[u8]) {
         if bytes.is_empty() {
             return;
         }
         if let Some(to_host) = &self.to_host {
-            let _ = to_host.send(HostEvent::Bytes(bytes));
+            let _ = to_host.send(HostEvent::Bytes(bytes.to_vec()));
         }
     }
 }
@@ -487,13 +487,7 @@ impl SlotLogic for TcpSlot {
             // and the flow leaves the fast path — this segment then
             // rides the slow path below, unacknowledged until it is
             // actually deliverable.
-            if !self.fast_payload.is_empty()
-                && crate::splice_lane::send_payload(entry.outbound_fd(), &self.fast_payload)
-                    .is_err()
             {
-                self.fold_back_to_session();
-                entry.deactivate();
-            } else {
                 if !entry.is_active() {
                     entry.activate(
                         self.connection.recv_nxt(),
@@ -501,19 +495,16 @@ impl SlotLogic for TcpSlot {
                         self.connection.fast_window(),
                     );
                 }
-                self.fast_payload.extend_from_slice(inbound.payload);
-                // A full-enough accumulator flushes now instead of waiting
-                // for the idle sweep: the batch's bulk cost amortizes the
-                // syscall without adding idle latency to small bursts.
-                // A refusal here folds the whole accumulator (this
-                // segment's bytes included) to the session channel —
-                // delivered either way, so the acceptance below is
-                // honest in both outcomes.
-                if self.fast_payload.len() >= 64 * 1024
-                    && crate::splice_lane::send_payload(entry.outbound_fd(), &self.fast_payload)
-                        .is_err()
-                {
-                    self.fold_back_to_session();
+                // Write through, never accumulate: this branch sees the
+                // bootstrap and the fallback, and the read dispatch
+                // writes the same socket from the I/O loop. An
+                // accumulator here held a four-byte length prefix while
+                // the dispatch wrote the segment after it — the server
+                // read the prefix's duplicate inside the next burst and
+                // tore the connection down. One segment, one write,
+                // order follows arrival.
+                if crate::splice_lane::send_payload(entry.outbound_fd(), inbound.payload).is_err() {
+                    self.fold_back_to_session(inbound.payload);
                     entry.deactivate();
                 }
                 let seq_before = self.connection.recv_nxt();
@@ -834,29 +825,6 @@ impl SlotLogic for TcpSlot {
     }
 
     fn on_idle(&mut self, out: &mut VecDeque<BytesMut>) {
-        // The fast path's batched payload leaves now: one write for
-        // the whole burst instead of one per segment. A refusal folds
-        // the bytes to the session channel and deactivates the lane
-        // entry — the same honesty as the in-packet path.
-        if !self.fast_payload.is_empty() {
-            let lane = crate::splice_lane::SpliceLane::global();
-            match lane.entry_for(&self.flow_key) {
-                Some(entry)
-                    if crate::splice_lane::send_payload(
-                        entry.outbound_fd(),
-                        &self.fast_payload,
-                    )
-                    .is_ok() =>
-                {
-                    self.fast_payload.clear();
-                }
-                Some(entry) => {
-                    self.fold_back_to_session();
-                    entry.deactivate();
-                }
-                None => self.fast_payload.clear(),
-            }
-        }
         // Host writes that arrived after the last packet: their only
         // ride is this idle sweep; CLOSE-WAIT writes still leave
         // (half-close: the answer direction stays ours).
@@ -874,6 +842,13 @@ impl SlotLogic for TcpSlot {
 struct NativeTcpIo {
     events: tokio::sync::mpsc::UnboundedReceiver<HostEvent>,
     write_lane: Arc<std::sync::Mutex<WriteLane>>,
+    /// The shard's wake flag: a host write sets it so the loop wakes
+    /// from its idle sleep and the drain runs now, not at the next
+    /// sweep. Without it, a small interactive write (four bytes of a
+    /// protocol length prefix) sat in the lane for the sleep cadence —
+    /// forty milliseconds of silence that the far end's protocol timer
+    /// read as death.
+    shard_wake: Arc<AtomicBool>,
     pending: VecDeque<u8>,
     closed: bool,
 }
@@ -981,6 +956,9 @@ impl TcpTransport for NativeTcpIo {
         let mut lane = self.write_lane.lock().expect("write lane");
         lane.bytes += data.len();
         lane.writes.push_back(data.to_vec());
+        drop(lane);
+        self.shard_wake
+            .store(true, std::sync::atomic::Ordering::Release);
         Ok(data.len())
     }
 
@@ -1061,6 +1039,10 @@ struct SpawnShared {
     accept: Arc<std::sync::Mutex<AcceptQueue>>,
     cc_factory: Arc<dyn Fn() -> Box<dyn CongestionAlgo> + Send + Sync>,
     mss: u16,
+    /// Each shard's wake flag, filled once the shards exist: a slot's
+    /// lane sets its own shard's flag on host writes, so an
+    /// interactive write drains immediately.
+    shard_wakes: Arc<std::sync::OnceLock<Vec<Arc<AtomicBool>>>>,
 }
 
 /// A ready session handed to the runtime side.
@@ -1068,6 +1050,7 @@ struct SessionHandoff {
     flow: FlowInfo,
     events: tokio::sync::mpsc::UnboundedReceiver<HostEvent>,
     write_lane: Arc<std::sync::Mutex<WriteLane>>,
+    shard_wake: Arc<AtomicBool>,
 }
 
 impl StackBackend for NativeBackend {
@@ -1093,6 +1076,9 @@ impl StackBackend for NativeBackend {
         });
 
         let (sessions_tx, sessions_rx) = mpsc::sync_channel::<SessionHandoff>(1024);
+        let shard_wakes: Arc<std::sync::OnceLock<Vec<Arc<AtomicBool>>>> =
+            Arc::new(std::sync::OnceLock::new());
+
         let shared = Arc::new(SpawnShared {
             handler,
             sessions: sessions_tx,
@@ -1103,6 +1089,7 @@ impl StackBackend for NativeBackend {
             ))),
             cc_factory: Self::cc_factory(self.congestion, self.mss),
             mss: self.mss,
+            shard_wakes: Arc::clone(&shard_wakes),
         });
 
         let factory_shared = Arc::clone(&shared);
@@ -1141,10 +1128,19 @@ impl StackBackend for NativeBackend {
                 return Box::new(SinkSlot) as Box<dyn SlotLogic>;
             };
             let write_lane = Arc::new(std::sync::Mutex::new(WriteLane::new()));
+            let shard_wake = factory_shared
+                .shard_wakes
+                .get()
+                .and_then(|flags| {
+                    flags
+                        .get(crate::shards::shard_hash_of(flow, flags.len()))
+                        .cloned()
+                })
+                .unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
+
             Box::new(TcpSlot {
                 connection: ServerConnection::new(isn, factory_shared.mss),
                 flow_key: *flow,
-                fast_payload: Vec::new(),
                 client,
                 server,
                 handler: Arc::clone(&factory_shared.handler),
@@ -1156,6 +1152,7 @@ impl StackBackend for NativeBackend {
                     destination: std::net::SocketAddr::new(flow.dst, flow.dst_port),
                 },
                 write_lane,
+                shard_wake,
                 cc: (factory_shared.cc_factory)(),
                 to_host: None,
                 judged: false,
@@ -1174,15 +1171,21 @@ impl StackBackend for NativeBackend {
             })
         });
 
+        let shard_count = self.shards;
         let shards = Shards::start(
             device,
             write_device,
             ShardConfig {
-                shards: self.shards,
+                shards: shard_count,
                 mtu: 1500,
                 ..ShardConfig::default()
             },
             logic_factory,
+        );
+        let _ = shard_wakes.set(
+            (0..shard_count)
+                .filter_map(|i| shards.wake_flag(i))
+                .collect::<Vec<_>>(),
         );
 
         // Hand established sessions to the host. One shared runtime,
@@ -1209,6 +1212,7 @@ impl StackBackend for NativeBackend {
                         let transport = NativeTcpIo {
                             events: handoff.events,
                             write_lane: Arc::clone(&handoff.write_lane),
+                            shard_wake: Arc::clone(&handoff.shard_wake),
                             pending: VecDeque::new(),
                             closed: false,
                         };
@@ -1302,7 +1306,6 @@ mod tests {
                 dst_port: server.port(),
                 protocol: IpProtocol::Tcp,
             },
-            fast_payload: Vec::new(),
             client,
             server,
             handler: Arc::new(NoHandler),
@@ -1318,6 +1321,7 @@ mod tests {
                 destination: std::net::SocketAddr::V4(server),
             },
             write_lane,
+            shard_wake: Arc::new(AtomicBool::new(false)),
             cc: Box::new(crate::congestion::Cubic::new(1460)),
             to_host: None,
             judged: false,

@@ -43,6 +43,7 @@ async fn dial_tcp(
     let connected = tokio::task::spawn_blocking(move || -> io::Result<std::net::TcpStream> {
         let address = socket2::SockAddr::from(destination);
         socket.connect(&address)?;
+        socket.set_nodelay(true)?;
         socket.set_nonblocking(true)?;
         Ok(std::net::TcpStream::from(socket))
     })
@@ -118,16 +119,26 @@ impl SessionHandler for RelayHandler {
         loop {
             tokio::select! {
                 from_client = session.read_owned() => match from_client {
-                    Ok(bytes) if bytes.is_empty() => break,
-                    Err(_) => break,
+                    Ok(bytes) if bytes.is_empty() => {
+                        eprintln!("vfawn: relay exit: client EOF");
+                        break;
+                    }
+                    Err(error) => {
+                        eprintln!("vfawn: relay exit: client read error {error}");
+                        break;
+                    }
                     Ok(bytes) => {
-                        if outbound.write_all(&bytes).await.is_err() {
+                        if let Err(error) = outbound.write_all(&bytes).await {
+                            eprintln!("vfawn: relay exit: outbound write {error}");
                             break;
                         }
                     }
                 },
                 ready = outbound.readable() => match ready {
-                    Err(_) => break,
+                    Err(error) => {
+                        eprintln!("vfawn: relay exit: origin readable {error}");
+                        break;
+                    }
                     Ok(()) => {
                         // Downlink rides the session's write lane into
                         // the slot's drain. The relay-side frame builder
@@ -148,9 +159,17 @@ impl SessionHandler for RelayHandler {
                             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                                 continue;
                             }
-                            Ok(0) | Err(_) => break,
+                            Ok(0) => {
+                                eprintln!("vfawn: relay exit: origin EOF");
+                                break;
+                            }
+                            Err(error) => {
+                                eprintln!("vfawn: relay exit: origin read {error}");
+                                break;
+                            }
                             Ok(_) => {
-                                if session.write(&down).await.is_err() {
+                                if let Err(error) = session.write(&down).await {
+                                    eprintln!("vfawn: relay exit: session write {error}");
                                     break;
                                 }
                             }

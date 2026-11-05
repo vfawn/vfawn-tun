@@ -382,6 +382,10 @@ impl PipelineStop {
 /// thread; the device close is the caller's business as elsewhere.
 pub struct Shards {
     shared: Vec<ShardShared>,
+    /// Each shard's wake flag, indexed like `shared`: the host-side
+    /// write path sets its flow's flag so an interactive write drains
+    /// now instead of at the idle cadence.
+    wake_flags: Vec<Arc<AtomicBool>>,
     stop_all: PipelineStop,
     pool: Arc<BufferPool>,
     /// Count of packets each shard processed, for affinity tests.
@@ -408,10 +412,12 @@ impl Shards {
         let mut processed = Vec::with_capacity(shard_count);
         let mut threads = Vec::with_capacity(shard_count + 2);
 
+        let mut wake_flags: Vec<Arc<AtomicBool>> = Vec::with_capacity(shard_count);
         for _ in 0..shard_count {
             let inbox = Arc::new(Ring::new(config.inbox_batches));
             let outbox = Arc::new(Mutex::new(VecDeque::new()));
             let wake = Arc::new(AtomicBool::new(false));
+            wake_flags.push(Arc::clone(&wake));
             let stopped = Arc::new(AtomicBool::new(false));
             let wrote_warning = Arc::new(AtomicBool::new(false));
             let counter = Arc::new(AtomicU64::new(0));
@@ -610,6 +616,7 @@ impl Shards {
 
         Self {
             shared,
+            wake_flags,
             stop_all: PipelineStop(Arc::clone(&stop_all)),
             pool,
             processed,
@@ -620,6 +627,12 @@ impl Shards {
     /// Wake a shard that has pending timers due within `horizon`; the
     /// shard loop itself checks the clock on every batch, so this is an
     /// optimization hook for idle periods.
+    /// The wake flag of one shard, for host-side signalling that
+    /// targets a specific flow's shard.
+    pub fn wake_flag(&self, shard: usize) -> Option<Arc<AtomicBool>> {
+        self.wake_flags.get(shard).cloned()
+    }
+
     pub fn wake(&self, shard: usize) {
         if let Some(shared) = self.shared.get(shard) {
             shared.wake.store(true, Ordering::Release);
