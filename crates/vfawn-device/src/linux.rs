@@ -101,7 +101,17 @@ impl TunDevice {
         // buffer sizing already corrected ,  the merged-burst semantics
         // need dedicated integration work in the stacks, tracked as
         // its own item). The plain-frame path is the stable truth.
-        let mut builder = DeviceBuilder::new().mtu(mtu as u16);
+        // The transmit queue is the burst shock absorber: the peer's
+        // kernel pumps eight streams at line rate and the reader
+        // drains in batches — a shallow queue (the library's 1000
+        // default) overflowed at every burst seam, and the kernel
+        // dropped whole segments before the process ever saw them
+        // (nine thousand drops and a hundred sixty thousand
+        // retransmissions inside ten seconds, measured). The deep
+        // queue needs the lane catch-up fix beside it — with it, the
+        // uplink sustains two and a half gigabits where the shallow
+        // queue held six hundred megabits.
+        let mut builder = DeviceBuilder::new().mtu(mtu as u16).tx_queue_len(10_000);
         if let Some(name) = &config.name {
             builder = builder.name(name.clone());
         }

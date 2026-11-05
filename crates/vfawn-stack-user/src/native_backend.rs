@@ -462,9 +462,16 @@ impl SlotLogic for TcpSlot {
         // update, a teardown) looks out of order against stale state.
         let lane = crate::splice_lane::SpliceLane::global();
         let entry = lane.entry_for(&self.flow_key);
-        if let Some(entry) = &entry
-            && entry.is_active()
-        {
+        // The catch-up does not wait for the entry's activation: an
+        // inactive entry (deactivated under outbound pressure) with a
+        // machine behind the shared cursor is exactly the window where
+        // a retransmission of already-claimed bytes re-delivered —
+        // the dispatch had written them and acknowledged them, the
+        // machine never learned, the slot's fast path wrote them
+        // again, and the server read a duplicated stream. Adopting
+        // the wire's position whenever the flow rides the lane closes
+        // the hole for every entry state.
+        if let Some(entry) = &entry {
             self.connection.catchup_recv(entry.recv_nxt_value());
         }
 
