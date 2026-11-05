@@ -48,6 +48,7 @@ impl DeviceCaps {
 /// for instance), because no further claim arrives before it. Both
 /// run on the I/O loop's thread, so the pair may share staging state
 /// without locks against each other.
+#[derive(Clone)]
 pub struct ReadDispatch {
     pub claim: ClaimFn,
     pub finish: FinishFn,
