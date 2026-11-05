@@ -1035,9 +1035,13 @@ impl StackBackend for NativeBackend {
         // producer, ring, and shard crossings the slow path pays per
         // segment become none, and the answers leave through the
         // device's own write path at the end of the read batch.
-        device.set_read_dispatch(Arc::new(|packet: &[u8], produced: &mut Vec<BytesMut>| {
-            crate::splice_lane::SpliceLane::global().try_dispatch(packet, produced)
-        }));
+        let lane = crate::splice_lane::SpliceLane::global();
+        device.set_read_dispatch(vfawn_core::device::ReadDispatch {
+            claim: Arc::new(|packet: &[u8], produced: &mut Vec<BytesMut>| {
+                lane.try_dispatch(packet, produced)
+            }),
+            finish: Arc::new(|| lane.flush_staged()),
+        });
 
         let (sessions_tx, sessions_rx) = mpsc::sync_channel::<SessionHandoff>(1024);
         let shared = Arc::new(SpawnShared {

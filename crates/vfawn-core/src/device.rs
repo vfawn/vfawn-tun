@@ -38,12 +38,25 @@ impl DeviceCaps {
     };
 }
 
-/// A read-side fast-path claim the device's owner installs: true
-/// takes the packet out of the read path entirely, and any frames the
-/// claim produced (its answer traffic) append to the second argument —
-/// the device's own I/O loop sends them with its write path, so the
-/// claim never touches a queue or a thread it does not own.
-pub type ReadDispatch = Arc<dyn Fn(&[u8], &mut Vec<BytesMut>) -> bool + Send + Sync>;
+/// The read-side fast path a stack installs in the device's I/O loop.
+///
+/// `claim` runs per packet, before anything enters the read path:
+/// true takes the packet out of it entirely, and any answer frames it
+/// produced (its ACK traffic) append to the second argument. `finish`
+/// runs once at the end of each read batch — the one point a claiming
+/// side may batch what it accumulated (one outbound write per socket,
+/// for instance), because no further claim arrives before it. Both
+/// run on the I/O loop's thread, so the pair may share staging state
+/// without locks against each other.
+pub struct ReadDispatch {
+    pub claim: ClaimFn,
+    pub finish: FinishFn,
+}
+
+/// One packet's claim: true takes it out of the read path.
+pub type ClaimFn = Arc<dyn Fn(&[u8], &mut Vec<BytesMut>) -> bool + Send + Sync>;
+/// The read batch's end: whatever the claims accumulated leaves now.
+pub type FinishFn = Arc<dyn Fn() + Send + Sync>;
 
 /// Batched raw-packet I/O against a TUN-style device.
 ///

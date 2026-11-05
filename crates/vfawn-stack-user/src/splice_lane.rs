@@ -23,7 +23,7 @@ use std::io;
 use std::net::IpAddr;
 use std::os::fd::RawFd;
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
 use vfawn_wire::flow::FlowKey;
 use vfawn_wire::ipv4::Ipv4Header;
@@ -150,6 +150,12 @@ pub struct SpliceLane {
     /// write. The reader lock keeps those lookups off each other's
     /// way; the writer lock is the rare relay spawn/exit.
     targets: RwLock<HashMap<FlowKey, Arc<SpliceEntry>>>,
+    /// The read loop's outbound staging: claimed payloads accumulate
+    /// per socket through a read batch and leave as one write each at
+    /// its end. Only the I/O thread touches this — the claim and its
+    /// finish run on that thread — so the mutex is uncontended
+    /// insurance, not synchronization.
+    staged: Mutex<HashMap<RawFd, StagedOutbound>>,
 }
 
 impl SpliceLane {
@@ -265,11 +271,30 @@ impl SpliceLane {
         if tcp.ack != stamp_seq {
             return false;
         }
-        // A non-blocking outbound socket under pressure refuses the
-        // write: hand the segment to the slot, whose relay side has
-        // the async write that waits out the pressure.
-        if send_payload(entry.outbound_fd(), payload).is_err() {
-            return false;
+        // The payload joins this batch's outbound staging rather than
+        // paying a write per segment: the read batch's end flushes one
+        // write per socket, the same amortization the slow path's
+        // accumulator measured. A full-enough staging (an outbound
+        // socket under sustained pressure) declines further claims —
+        // the slot's fold-back path is the honest exit for overflow.
+        {
+            let mut staged = self.staged.lock().expect("outbound staging");
+            match staged.entry(entry.outbound_fd()) {
+                std::collections::hash_map::Entry::Occupied(mut slot) => {
+                    if slot.get_mut().buffer.len() >= STAGE_FLUSH {
+                        return false;
+                    }
+                    slot.get_mut().buffer.extend_from_slice(payload);
+                }
+                std::collections::hash_map::Entry::Vacant(slot) => {
+                    slot.insert(StagedOutbound {
+                        entry: Arc::clone(&entry),
+                        buffer: Vec::with_capacity(STAGE_FLUSH),
+                    })
+                    .buffer
+                    .extend_from_slice(payload);
+                }
+            }
         }
         let advanced = tcp.seq.wrapping_add(payload.len() as u32);
         entry.recv_nxt.store(advanced, Ordering::Release);
@@ -286,7 +311,52 @@ impl SpliceLane {
         produced.push(bytes::BytesMut::from(&frame[..]));
         true
     }
+
+    /// The read batch's end: one write per outbound socket. A socket
+    /// that refuses (a non-blocking fd the peer is not draining)
+    /// keeps its staging for the next batch's retry and the flow
+    /// leaves the fast path — the slot's session-side write is the
+    /// route that can wait out pressure. A dead socket's staging is
+    /// dropped: the flow is going away and the entry's descriptor
+    /// closes with its last reference.
+    pub fn flush_staged(&self) {
+        let mut staged = self.staged.lock().expect("outbound staging");
+        let keys: Vec<RawFd> = staged.keys().copied().collect();
+        for fd in keys {
+            let Some(staged_out) = staged.get_mut(&fd) else {
+                continue;
+            };
+            match send_payload(fd, &staged_out.buffer) {
+                Ok(_) => {
+                    staged.remove(&fd);
+                }
+                Err(error)
+                    if error.kind() == io::ErrorKind::WouldBlock
+                        || error.kind() == io::ErrorKind::Interrupted =>
+                {
+                    staged_out.entry.deactivate();
+                    // The staged bytes stay for the next batch's retry.
+                }
+                Err(_) => {
+                    staged.remove(&fd);
+                }
+            }
+        }
+    }
 }
+
+/// One socket's outbound staging: the entry (kept alive so a flush
+/// under way outlives an unregister) and the bytes themselves.
+struct StagedOutbound {
+    entry: Arc<SpliceEntry>,
+    buffer: Vec<u8>,
+}
+
+/// How much outbound staging one socket may hold before the dispatch
+/// declines further claims for it: enough to amortize the write
+/// syscall across a full read batch, little enough that a pressured
+/// socket sheds its flow to the session path quickly.
+const STAGE_FLUSH: usize = 64 * 1024;
 
 /// Move payload bytes to the outbound socket with one write syscall
 /// (the v0 lane). The splice(2) variant replaces this write with the
@@ -509,9 +579,11 @@ mod tests {
         let entry = lane.entry_for(&key).expect("registered");
         entry.activate(500, 900, 65535);
 
-        // In-order current segment: claimed, payload delivered, cursor
-        // advanced.
+        // In-order current segment: claimed, cursor advanced, the
+        // payload staged (nothing on the socket yet — the batch has
+        // not ended).
         assert!(lane.try_dispatch(&packet, &mut staged));
+        lane.flush_staged();
         let mut got = [0u8; 16];
         // SAFETY: read(2) from the test-owned peer socket.
         #[expect(unsafe_code)]

@@ -360,6 +360,12 @@ struct ShardShared {
     stopped: Arc<AtomicBool>,
     /// One-shot backlog warning for this lane's outbox.
     wrote_warning: Arc<AtomicBool>,
+    /// The writer's doorbell: a shard rings it after handing frames to
+    /// any outbox, so the writer parks instead of polling a cadence
+    /// and the first frame of a burst leaves in microseconds rather
+    /// than a poll interval. The wait carries a timeout as a
+    /// stop-check fallback, not as the wake path.
+    writer_ping: Arc<(Mutex<()>, std::sync::Condvar)>,
 }
 
 /// The pipeline-wide stop: every thread honors it, including the
@@ -396,6 +402,8 @@ impl Shards {
         let shard_count = config.shards.max(1);
         let pool = Arc::new(BufferPool::new());
         let stop_all = Arc::new(AtomicBool::new(false));
+        let writer_ping: Arc<(Mutex<()>, std::sync::Condvar)> =
+            Arc::new((Mutex::new(()), std::sync::Condvar::new()));
         let mut shared = Vec::with_capacity(shard_count);
         let mut processed = Vec::with_capacity(shard_count);
         let mut threads = Vec::with_capacity(shard_count + 2);
@@ -412,6 +420,7 @@ impl Shards {
             let config_snapshot = config.clone();
             let inbox_for_loop = Arc::clone(&inbox);
             let outbox_for_loop = Arc::clone(&outbox);
+            let writer_ping_for_loop = Arc::clone(&writer_ping);
             let wake_for_loop = Arc::clone(&wake);
             let stop_for_loop = Arc::clone(&stopped);
             let counter_for_loop = Arc::clone(&counter);
@@ -426,6 +435,7 @@ impl Shards {
                             outbox_for_loop,
                             wake_for_loop,
                             stop_for_loop,
+                            writer_ping_for_loop,
                             counter_for_loop,
                             shard_pool,
                             shard_logic,
@@ -437,6 +447,7 @@ impl Shards {
             shared.push(ShardShared {
                 inbox,
                 outbox,
+                writer_ping: Arc::clone(&writer_ping),
                 wake,
                 stopped,
                 wrote_warning,
@@ -511,6 +522,7 @@ impl Shards {
         // The single consumer of every outbox: batches them down into
         // the device.
         let writer_shared: Vec<ShardShared> = shared.clone();
+        let writer_ping_for_writer = Arc::clone(&writer_ping);
         let writer_pool = Arc::clone(&pool);
         let stop_all_for_writer = Arc::clone(&stop_all);
         threads.push(
@@ -581,7 +593,16 @@ impl Shards {
                             }
                             break;
                         }
-                        std::thread::sleep(Duration::from_micros(100));
+                        // Park on the doorbell rather than polling:
+                        // shards ring it as they hand frames over, and
+                        // the timeout is only the stop-check cadence.
+                        {
+                            let guard = writer_ping_for_writer.0.lock().expect("writer ping");
+                            let _ = writer_ping_for_writer
+                                .1
+                                .wait_timeout(guard, Duration::from_millis(2))
+                                .expect("writer ping");
+                        }
                     }
                 })
                 .expect("spawn writer"),
@@ -615,6 +636,12 @@ impl Shards {
 
     pub fn stop(&self) {
         self.stop_all.raise();
+        if let Some(lane) = self.shared.first()
+            && let Ok(guard) = lane.writer_ping.0.lock()
+        {
+            drop(guard);
+            lane.writer_ping.1.notify_all();
+        }
         for lane in &self.shared {
             lane.stopped.store(true, Ordering::Release);
             lane.wake.store(true, Ordering::Release);
@@ -652,6 +679,7 @@ fn shard_loop(
     outbox: Arc<Mutex<VecDeque<BytesMut>>>,
     wake: Arc<AtomicBool>,
     stopped: Arc<AtomicBool>,
+    writer_ping: Arc<(Mutex<()>, std::sync::Condvar)>,
     counter: Arc<AtomicU64>,
     pool: Arc<BufferPool>,
     logic: LogicFactory,
@@ -738,6 +766,10 @@ fn shard_loop(
             did_work = true;
             let mut outbox = outbox.lock().expect("outbox lock");
             outbox.extend(pending.drain(..));
+            if let Ok(guard) = writer_ping.0.lock() {
+                drop(guard);
+                writer_ping.1.notify_all();
+            }
         }
 
         // The idle sweep on its own clock: host writes that arrived
@@ -754,6 +786,10 @@ fn shard_loop(
             if !pending.is_empty() {
                 let mut outbox = outbox.lock().expect("outbox lock");
                 outbox.extend(pending.drain(..));
+                if let Ok(guard) = writer_ping.0.lock() {
+                    drop(guard);
+                    writer_ping.1.notify_all();
+                }
             }
         }
 

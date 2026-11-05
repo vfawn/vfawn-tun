@@ -59,7 +59,7 @@ struct Shared {
     /// claimed packet never enters the read channel. The lock is taken
     /// once per read batch, not per packet, and is otherwise
     /// uncontended.
-    dispatch: Mutex<Option<ReadDispatch>>,
+    dispatch: Mutex<Option<vfawn_core::device::ReadDispatch>>,
 }
 
 /// One end of the device: the reader's half by construction, the
@@ -254,10 +254,23 @@ fn io_loop(shared: Arc<Shared>, mut device: SyncDevice, writes: Receiver<Vec<Byt
                 let dispatch = shared.dispatch.lock().expect("dispatch").clone();
                 let mut frames = Vec::with_capacity(count);
                 let mut answers: Vec<BytesMut> = Vec::new();
-                for buf in bufs.iter_mut().take(count) {
-                    match &dispatch {
-                        Some(claim) if claim(&buf[..], &mut answers) => {}
-                        _ => frames.push(std::mem::take(buf)),
+                match &dispatch {
+                    Some(dispatch) => {
+                        for buf in bufs.iter_mut().take(count) {
+                            if (dispatch.claim)(&buf[..], &mut answers) {
+                                continue;
+                            }
+                            frames.push(std::mem::take(buf));
+                        }
+                        // The batch's end: whatever the claims
+                        // accumulated for their own sockets leaves
+                        // now, before the answers do.
+                        (dispatch.finish)();
+                    }
+                    None => {
+                        for buf in bufs.iter_mut().take(count) {
+                            frames.push(std::mem::take(buf));
+                        }
                     }
                 }
                 // The staged answers leave the same way the write
@@ -404,7 +417,7 @@ impl PacketDevice for TunDevice {
         }))
     }
 
-    fn set_read_dispatch(&self, dispatch: ReadDispatch) {
+    fn set_read_dispatch(&self, dispatch: vfawn_core::device::ReadDispatch) {
         *self.shared.dispatch.lock().expect("dispatch") = Some(dispatch);
     }
 }
