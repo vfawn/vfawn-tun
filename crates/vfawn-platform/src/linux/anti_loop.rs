@@ -39,7 +39,7 @@ pub fn protect(hook: &OutboundFdHook, fd: RawFd) -> io::Result<Option<String>> {
             vfawn_core::outbound::apply(hook, fd, Some(&interface))?;
             Ok(Some(interface))
         }
-        OutboundFdHook::HostCallback(_) => {
+        OutboundFdHook::Mark(_) | OutboundFdHook::HostCallback(_) => {
             vfawn_core::outbound::apply(hook, fd, None)?;
             Ok(None)
         }

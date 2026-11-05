@@ -14,6 +14,7 @@ fn test_desired() -> DesiredState {
         excluded: &["192.168.0.0/16".parse().unwrap()],
         table_index: 2022,
         rule_index: 9000,
+        mark: 0,
         strict_route: true,
         dns_leak_prevention: true,
     })
@@ -43,6 +44,7 @@ fn rule(prio: u32, tag: &str) -> PolicyRule {
             source: None,
             destination: None,
             incoming_interface: None,
+            fwmark: None,
             suppress_prefixlen: None,
             dport: None,
         },
@@ -266,6 +268,41 @@ fn desired_from_config_has_expected_shape() {
 }
 
 #[test]
+fn the_escape_rule_precedes_every_capture_rule() {
+    let d = desired_from_config(&RouteParams {
+        interface: "tun0",
+        addresses: &["198.18.0.1/15".parse().unwrap()],
+        captured: &["0.0.0.0/0".parse().unwrap()],
+        excluded: &[],
+        table_index: 2022,
+        rule_index: 9000,
+        mark: 0x2022,
+        strict_route: false,
+        dns_leak_prevention: false,
+    });
+    let first = d.rules.first().expect("the escape rule exists");
+    assert_eq!(first.selector.fwmark, Some(0x2022));
+    assert_eq!(first.action, RuleAction::Lookup(254));
+    assert_eq!(first.priority, 9000);
+    // Everything after it evaluates past the escape.
+    assert!(d.rules[1..].iter().all(|r| r.priority > first.priority));
+
+    // Zero mark: no escape rule, the chain starts with the exclusions.
+    let unmarked = desired_from_config(&RouteParams {
+        interface: "tun0",
+        addresses: &["198.18.0.1/15".parse().unwrap()],
+        captured: &[],
+        excluded: &[],
+        table_index: 2022,
+        rule_index: 9000,
+        mark: 0,
+        strict_route: false,
+        dns_leak_prevention: false,
+    });
+    assert!(unmarked.rules.iter().all(|r| r.selector.fwmark.is_none()));
+}
+
+#[test]
 fn strict_route_adds_unreachable_rule() {
     let strict = desired_from_config(&RouteParams {
         interface: "t",
@@ -274,6 +311,7 @@ fn strict_route_adds_unreachable_rule() {
         excluded: &[],
         table_index: 2022,
         rule_index: 9000,
+        mark: 0,
         strict_route: true,
         dns_leak_prevention: false,
     });
@@ -291,6 +329,7 @@ fn strict_route_adds_unreachable_rule() {
         excluded: &[],
         table_index: 2022,
         rule_index: 9000,
+        mark: 0,
         strict_route: false,
         dns_leak_prevention: false,
     });
@@ -311,6 +350,7 @@ fn dns_leak_prevention_adds_rule() {
         excluded: &[],
         table_index: 2022,
         rule_index: 9000,
+        mark: 0,
         strict_route: false,
         dns_leak_prevention: true,
     });
@@ -321,6 +361,7 @@ fn dns_leak_prevention_adds_rule() {
         excluded: &[],
         table_index: 2022,
         rule_index: 9000,
+        mark: 0,
         strict_route: false,
         dns_leak_prevention: false,
     });

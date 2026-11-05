@@ -134,6 +134,7 @@ fn rule_add_remove_by_priority() {
             source: None,
             destination: Some("172.16.0.0/12".parse().unwrap()),
             incoming_interface: None,
+            fwmark: None,
             suppress_prefixlen: None,
             dport: None,
         },

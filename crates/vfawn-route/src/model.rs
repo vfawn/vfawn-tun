@@ -59,6 +59,10 @@ pub struct RuleSelector {
     pub destination: Option<IpNet>,
     /// Incoming interface name; None matches any.
     pub incoming_interface: Option<String>,
+    /// Firewall mark; None matches any mark. The escape hatch for a
+    /// capture table's own process: its sockets carry the mark and the
+    /// rule above the capture sends them elsewhere.
+    pub fwmark: Option<u32>,
     /// Suppress routes with a prefix length >= this value (suppresses
     /// the default route when 0).
     pub suppress_prefixlen: Option<u8>,

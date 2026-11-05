@@ -234,30 +234,52 @@ impl NetlinkBackend {
             .map(|d| (d.addr(), d.prefix_len()))
             .unwrap_or((IpAddr::from([0, 0, 0, 0]), 0));
 
+        // The mark rides as an attribute rather than a builder method:
+        // only the escape rule carries one, and the attribute list is
+        // the one shape both families share.
+        let fwmark = rule.selector.fwmark.map(RuleAttribute::FwMark);
         let result = match dest {
             IpAddr::V4(d) => {
-                self.handle
-                    .rule()
-                    .add()
-                    .v4()
-                    .priority(prio)
-                    .action(action)
-                    .table_id(table)
-                    .destination_prefix(d, plen)
-                    .execute()
-                    .await
+                let mut req = self.handle.rule().add().v4();
+                req.message_mut().header.action = action;
+                req.message_mut().header.table = u8::try_from(table).unwrap_or(0);
+                req.message_mut().header.dst_len = plen;
+                req.message_mut()
+                    .attributes
+                    .push(RuleAttribute::Priority(prio));
+                req.message_mut()
+                    .attributes
+                    .push(RuleAttribute::Table(table));
+                if plen > 0 {
+                    req.message_mut()
+                        .attributes
+                        .push(RuleAttribute::Destination(IpAddr::V4(d)));
+                }
+                if let Some(mark) = fwmark {
+                    req.message_mut().attributes.push(mark);
+                }
+                req.execute().await
             }
             IpAddr::V6(d) => {
-                self.handle
-                    .rule()
-                    .add()
-                    .v6()
-                    .priority(prio)
-                    .action(action)
-                    .table_id(table)
-                    .destination_prefix(d, plen)
-                    .execute()
-                    .await
+                let mut req = self.handle.rule().add().v6();
+                req.message_mut().header.action = action;
+                req.message_mut().header.table = u8::try_from(table).unwrap_or(0);
+                req.message_mut().header.dst_len = plen;
+                req.message_mut()
+                    .attributes
+                    .push(RuleAttribute::Priority(prio));
+                req.message_mut()
+                    .attributes
+                    .push(RuleAttribute::Table(table));
+                if plen > 0 {
+                    req.message_mut()
+                        .attributes
+                        .push(RuleAttribute::Destination(IpAddr::V6(d)));
+                }
+                if let Some(mark) = fwmark {
+                    req.message_mut().attributes.push(mark);
+                }
+                req.execute().await
             }
         };
         result.map_err(nl_err)
@@ -283,6 +305,9 @@ impl NetlinkBackend {
             Some(IpAddr::V4(_)) | None => AddressFamily::Inet,
         };
         msg.attributes.push(RuleAttribute::Priority(rule.priority));
+        if let Some(mark) = rule.selector.fwmark {
+            msg.attributes.push(RuleAttribute::FwMark(mark));
+        }
         if let Some(dest) = &rule.selector.destination {
             msg.attributes.push(RuleAttribute::Destination(dest.addr()));
         }
@@ -429,11 +454,13 @@ fn parse_rule(msg: &RuleMessage) -> Option<PolicyRule> {
     let mut destination = None;
     let mut source = None;
     let mut suppress_prefixlen = None;
+    let mut fwmark = None;
 
     for attr in &msg.attributes {
         match attr {
             RuleAttribute::Priority(p) => priority = *p,
             RuleAttribute::Table(t) => table = *t,
+            RuleAttribute::FwMark(m) => fwmark = Some(*m),
             RuleAttribute::SuppressPrefixLen(len) => {
                 suppress_prefixlen = Some((*len).min(u8::MAX as u32) as u8)
             }
@@ -470,6 +497,7 @@ fn parse_rule(msg: &RuleMessage) -> Option<PolicyRule> {
             source,
             destination,
             incoming_interface: None,
+            fwmark,
             suppress_prefixlen,
             dport: None,
         },

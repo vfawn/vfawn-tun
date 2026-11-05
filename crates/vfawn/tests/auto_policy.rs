@@ -47,13 +47,13 @@ fn a_userspace_policy_starts_the_instance() {
     // Both constructors return boxed errors; the seam assertion is that
     // neither panics or feature-gates, and the failure text names the
     // device, not the policy.
-    if let Ok(mut instance) = Instance::new(config, handler) {
-        if let Err(error) = instance.start(Arc::new(EchoOnce)) {
-            let text = error.to_string();
-            assert!(
-                text.contains("TUN") || text.contains("tun") || text.contains("device"),
-                "the failure must be the device, not the policy seam: {text}"
-            );
-        }
+    if let Ok(mut instance) = Instance::new(config, handler)
+        && let Err(error) = instance.start(Arc::new(EchoOnce))
+    {
+        let text = error.to_string();
+        assert!(
+            text.contains("TUN") || text.contains("tun") || text.contains("device"),
+            "the failure must be the device, not the policy seam: {text}"
+        );
     }
 }

@@ -118,6 +118,11 @@ pub struct RouteConfig {
     /// Dedicated routing table and rule base index.
     pub table_index: u32,
     pub rule_index: u32,
+    /// The firewall mark on this instance's own outbound sockets. A
+    /// policy rule sends marked traffic past the capture table, so the
+    /// process's dials escape the very routes it installs. Zero
+    /// disables the marking and its rule.
+    pub mark: u32,
 }
 
 impl Default for RouteConfig {
@@ -136,6 +141,7 @@ impl Default for RouteConfig {
             exclude_package: Vec::new(),
             table_index: 2022,
             rule_index: 9000,
+            mark: 0x2022,
         }
     }
 }
@@ -210,6 +216,12 @@ pub enum OutboundFdHook {
     /// Bind sockets to the current default interface (SO_BINDTODEVICE on
     /// Linux).
     BindDefaultIface,
+    /// Stamp sockets with the routing mark (SO_MARK on Linux) whose
+    /// policy rule bypasses the capture — the escape the route
+    /// orchestration's own dials ride when its table carries a default
+    /// route. Survives default-interface changes where a binding is a
+    /// snapshot of the network as it was.
+    Mark(u32),
     /// Hand each fd to the host (Android VPN service protect, or any
     /// custom policy). The callback must be cheap and non-blocking.
     HostCallback(Arc<dyn Fn(RawFd) -> io::Result<()> + Send + Sync>),
@@ -220,6 +232,7 @@ impl std::fmt::Debug for OutboundFdHook {
         match self {
             Self::None => f.write_str("None"),
             Self::BindDefaultIface => f.write_str("BindDefaultIface"),
+            Self::Mark(mark) => write!(f, "Mark({mark:#x})"),
             Self::HostCallback(_) => f.write_str("HostCallback(..)"),
         }
     }
@@ -234,6 +247,7 @@ impl Serialize for OutboundFdHook {
         serializer.serialize_str(match self {
             Self::None => "none",
             Self::BindDefaultIface => "bind-default-iface",
+            Self::Mark(_) => "mark",
             Self::HostCallback(_) => "host-callback",
         })
     }

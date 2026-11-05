@@ -27,28 +27,39 @@ pub fn run(
     config.device.mtu = mtu;
     config.device.inet4_address = vec![prefix];
     config.route.auto_route = auto_route;
-    if bind_default_iface {
-        // Only the policy is set here; sockets the host opens while the
-        // instance runs read the flag from the config and bind to the
-        // default interface at dial time.
-        config.stack.outbound_fd_hook = vfawn_core::OutboundFdHook::BindDefaultIface;
-    }
+    // The escape comes with the capture it answers for: auto-route's
+    // table carries a default, so the process's own dials need a way
+    // past it. The mark is the standing answer — the same shape
+    // WireGuard and sing-box run, surviving default-interface changes
+    // a binding cannot. The binding stays as the explicit override:
+    // a socket bound to the physical interface answers the oif
+    // constraint directly, which is the belt to the mark's braces.
+    config.stack.outbound_fd_hook = if bind_default_iface {
+        vfawn_core::OutboundFdHook::BindDefaultIface
+    } else if auto_route {
+        vfawn_core::OutboundFdHook::Mark(config.route.mark)
+    } else {
+        vfawn_core::OutboundFdHook::None
+    };
 
     // The relay is the bench seat: sessions dial their original
     // destinations and escape the capture through the outbound hook.
     let handler: Arc<dyn vfawn_core::SessionHandler> = if relay {
-        let protect: vfawn::Protect = std::sync::Arc::new(|fd| {
+        // The hook binding only exists where the escape compiles; the
+        // other platforms refuse the dial rather than loop it back.
+        #[cfg(target_os = "linux")]
+        let hook = config.stack.outbound_fd_hook.clone();
+        let protect: vfawn::Protect = std::sync::Arc::new(move |fd| {
             #[cfg(target_os = "linux")]
             {
-                vfawn_platform::linux::protect(&vfawn_core::OutboundFdHook::BindDefaultIface, fd)
-                    .map(|_| ())
+                vfawn_platform::linux::protect(&hook, fd).map(|_| ())
             }
             #[cfg(not(target_os = "linux"))]
             {
                 let _ = fd;
                 Err(std::io::Error::new(
                     std::io::ErrorKind::Unsupported,
-                    "relay escape needs the Linux bind hook",
+                    "relay escape needs the Linux hook",
                 ))
             }
         });

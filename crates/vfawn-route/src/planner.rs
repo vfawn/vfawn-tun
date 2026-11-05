@@ -152,6 +152,9 @@ pub struct RouteParams<'a> {
     pub excluded: &'a [IpNet],
     pub table_index: u32,
     pub rule_index: u32,
+    /// The routing mark on this process's own sockets; zero disables
+    /// the escape rule.
+    pub mark: u32,
     pub strict_route: bool,
     pub dns_leak_prevention: bool,
 }
@@ -171,6 +174,7 @@ pub fn desired_from_config(params: &RouteParams<'_>) -> DesiredState {
         excluded,
         table_index,
         rule_index,
+        mark,
         strict_route,
         dns_leak_prevention,
     } = *params;
@@ -210,6 +214,29 @@ pub fn desired_from_config(params: &RouteParams<'_>) -> DesiredState {
     let mut rules = Vec::new();
     let mut priority = rule_index;
 
+    // Step 0: the process's own escape. The dedicated table carries a
+    // default route, so without this rule the very sockets that speak
+    // for the tunnel are captured by the tunnel — their dials recurse
+    // and die. Marked traffic answers to the main table before any
+    // capture rule sees it, and the mark survives default-interface
+    // changes a socket binding cannot.
+    if mark != 0 {
+        rules.push(PolicyRule {
+            priority,
+            selector: RuleSelector {
+                destination: None,
+                source: None,
+                incoming_interface: None,
+                fwmark: Some(mark),
+                suppress_prefixlen: None,
+                dport: None,
+            },
+            action: RuleAction::Lookup(254),
+            tag: tag.clone(),
+        });
+        priority += 1;
+    }
+
     // Step 1: exclusion rules (bypass the dedicated table).
     for prefix in excluded {
         rules.push(PolicyRule {
@@ -218,6 +245,7 @@ pub fn desired_from_config(params: &RouteParams<'_>) -> DesiredState {
                 destination: Some(*prefix),
                 source: None,
                 incoming_interface: None,
+                fwmark: None,
                 suppress_prefixlen: None,
                 dport: None,
             },
@@ -238,6 +266,7 @@ pub fn desired_from_config(params: &RouteParams<'_>) -> DesiredState {
                 destination: Some("::/0".parse().unwrap()),
                 source: None,
                 incoming_interface: None,
+                fwmark: None,
                 suppress_prefixlen: None,
                 dport: None,
             },
@@ -254,6 +283,7 @@ pub fn desired_from_config(params: &RouteParams<'_>) -> DesiredState {
             destination: Some("0.0.0.0/0".parse().unwrap()),
             source: None,
             incoming_interface: None,
+            fwmark: None,
             suppress_prefixlen: None,
             dport: None,
         },
@@ -269,6 +299,7 @@ pub fn desired_from_config(params: &RouteParams<'_>) -> DesiredState {
             destination: None,
             source: None,
             incoming_interface: None,
+            fwmark: None,
             suppress_prefixlen: Some(0),
             dport: None,
         },
@@ -285,6 +316,7 @@ pub fn desired_from_config(params: &RouteParams<'_>) -> DesiredState {
                 destination: None,
                 source: None,
                 incoming_interface: None,
+                fwmark: None,
                 suppress_prefixlen: None,
                 dport: Some(53),
             },

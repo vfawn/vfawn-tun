@@ -17,5 +17,8 @@ ipnet.workspace = true
 serde.workspace = true
 async-trait.workspace = true
 
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 serde_json.workspace = true

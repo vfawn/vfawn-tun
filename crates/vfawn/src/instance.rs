@@ -283,6 +283,7 @@ impl Instance {
             excluded: &config.route.route_exclude_address,
             table_index: config.route.table_index,
             rule_index: config.route.rule_index,
+            mark: config.route.mark,
             strict_route: config.route.strict_route,
             dns_leak_prevention: config.dns.mode == vfawn_core::DnsMode::Hijack,
         });

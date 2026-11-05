@@ -63,8 +63,44 @@ pub fn apply(hook: &OutboundFdHook, fd: RawFd, default_interface: Option<&str>) 
     match hook {
         OutboundFdHook::None => Ok(()),
         OutboundFdHook::BindDefaultIface => bind_to_interface(fd, default_interface),
+        OutboundFdHook::Mark(mark) => set_mark(fd, *mark),
         OutboundFdHook::HostCallback(protect) => protect(fd),
     }
+}
+
+/// Stamp the socket with the routing mark. One setsockopt before the
+/// connect: a mark applied after the first SYN has left is a mark the
+/// route lookup never saw, and the dial is captured anyway.
+#[cfg(target_os = "linux")]
+#[allow(unsafe_code)] // adopting the caller's fd for one setsockopt
+fn set_mark(fd: RawFd, mark: u32) -> io::Result<()> {
+    if fd < 0 {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid fd"));
+    }
+    // SAFETY: setsockopt(2) reads the mark by reference for the length
+    // given; the fd belongs to the caller and stays open through the
+    // call.
+    let set = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_MARK,
+            std::ptr::from_ref(&mark).cast(),
+            std::mem::size_of_val(&mark) as libc::socklen_t,
+        )
+    };
+    if set < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn set_mark(_fd: RawFd, _mark: u32) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "the routing mark is the Linux escape",
+    ))
 }
 
 #[cfg(target_os = "linux")]

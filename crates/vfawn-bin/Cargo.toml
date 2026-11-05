@@ -10,7 +10,7 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
-vfawn = { path = "../vfawn" }
+vfawn = { path = "../vfawn", features = ["backend-native"] }
 vfawn-core = { path = "../vfawn-core" }
 async-trait = "0.1"
 tokio = { workspace = true, features = ["rt", "signal", "macros"] }
