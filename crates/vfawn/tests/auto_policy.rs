@@ -52,7 +52,14 @@ fn a_userspace_policy_starts_the_instance() {
     {
         let text = error.to_string();
         assert!(
-            text.contains("TUN") || text.contains("tun") || text.contains("device"),
+            text.contains("TUN")
+                || text.contains("tun")
+                || text.contains("device")
+                // A runner without the device's permissions refuses it
+                // by errno, not by name — still the device's failure,
+                // still nothing the policy seam would explain.
+                || text.contains("Operation not permitted")
+                || text.contains("Permission denied"),
             "the failure must be the device, not the policy seam: {text}"
         );
     }
