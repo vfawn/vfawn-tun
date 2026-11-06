@@ -148,13 +148,14 @@ fn interface_input_packets(name: &str) -> Option<u64> {
     let text = String::from_utf8_lossy(&output.stdout);
     for line in text.lines().skip_while(|l| !l.contains("Name")) {
         let fields: Vec<&str> = line.split_whitespace().collect();
-        // The row runs Name Mtu Network Address Ipkts …, and the
-        // address column repeats the interface's own name — the last
-        // match is the one whose next field counts inputs.
-        if let Some(position) = fields.iter().rposition(|f| *f == name)
-            && fields.len() > position + 1
+        // The link-level row leaves the Address column empty, so the
+        // row runs name, mtu, <Link#n>, then the input counts; the
+        // named rows below it add network and address columns.
+        if fields.first().is_some_and(|f| *f == name)
+            && fields.get(2).is_some_and(|f| f.starts_with("<Link#"))
+            && fields.len() > 3
         {
-            return fields[position + 1].parse().ok();
+            return fields[3].parse().ok();
         }
     }
     None
