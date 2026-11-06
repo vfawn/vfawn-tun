@@ -1055,6 +1055,7 @@ impl NativeBackend {
 struct SpawnShared {
     handler: Arc<dyn SessionHandler>,
     sessions: mpsc::SyncSender<SessionHandoff>,
+    udp_sessions: mpsc::SyncSender<crate::udp_slot::UdpHandoff>,
     accept: Arc<std::sync::Mutex<AcceptQueue>>,
     cc_factory: Arc<dyn Fn() -> Box<dyn CongestionAlgo> + Send + Sync>,
     mss: u16,
@@ -1095,12 +1096,14 @@ impl StackBackend for NativeBackend {
         });
 
         let (sessions_tx, sessions_rx) = mpsc::sync_channel::<SessionHandoff>(1024);
+        let (udp_tx, udp_rx) = mpsc::sync_channel::<crate::udp_slot::UdpHandoff>(1024);
         let shard_wakes: Arc<std::sync::OnceLock<Vec<Arc<AtomicBool>>>> =
             Arc::new(std::sync::OnceLock::new());
 
         let shared = Arc::new(SpawnShared {
-            handler,
+            handler: Arc::clone(&handler),
             sessions: sessions_tx,
+            udp_sessions: udp_tx,
             accept: Arc::new(std::sync::Mutex::new(AcceptQueue::new(
                 self.syn_cookies,
                 self.backlog,
@@ -1127,6 +1130,15 @@ impl StackBackend for NativeBackend {
                     Arc::clone(&icmp_handler),
                     Arc::clone(&icmp_table_for_slots),
                     error_tx.clone(),
+                )) as Box<dyn SlotLogic>;
+            }
+            // Datagram flows ride their own slot: no handshake, no
+            // sequence space — the first datagram earns the session
+            // and the idle clock owns the rest.
+            if flow.protocol == IpProtocol::Udp {
+                return Box::new(crate::udp_slot::UdpSlot::new(
+                    Arc::clone(&factory_shared.handler),
+                    factory_shared.udp_sessions.clone(),
                 )) as Box<dyn SlotLogic>;
             }
             // Only v4 flows ride the native stack; anything else gets a
@@ -1243,6 +1255,39 @@ impl StackBackend for NativeBackend {
                 }
             })
             .expect("spawn session thread");
+
+        // The UDP session runtime: same shape as the TCP side — one
+        // shared runtime, one task per datagram flow.
+        let udp_handler = Arc::clone(&shared.handler);
+        std::thread::Builder::new()
+            .name("vfawn-native-udp".into())
+            .spawn(move || {
+                let runtime = tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(2)
+                    .enable_all()
+                    .build()
+                    .expect("udp session runtime");
+                runtime.block_on(async move {
+                    while let Ok(handoff) = udp_rx.recv() {
+                        let handler = Arc::clone(&udp_handler);
+                        tokio::spawn(async move {
+                            let transport = crate::udp_slot::NativeUdpIo {
+                                events: handoff.events,
+                                lane: Arc::clone(&handoff.lane),
+                                lane_bytes: Arc::clone(&handoff.lane_bytes),
+                                origin: handoff.flow.destination,
+                            };
+                            let session = vfawn_core::UdpSession::new(
+                                handoff.flow,
+                                Box::new(transport),
+                                None,
+                            );
+                            handler.on_udp(session).await;
+                        });
+                    }
+                });
+            })
+            .expect("spawn udp session thread");
 
         // The shards handle holds the threads; park this handle's stop
         // by leaking into a leak-box that stops on StackHandle drop is
