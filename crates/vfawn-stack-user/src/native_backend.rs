@@ -143,6 +143,11 @@ struct TcpSlot {
     /// The queue depth the last alarm saw: a real stall holds the
     /// same depth a second later, while a healthy trickle moves.
     diag_queued: usize,
+    /// The keepalive clock: when the next probe is due. None while
+    /// the connection is active; armed on the idle sweep.
+    keepalive_at: Option<Instant>,
+    /// Probes sent without an answer since the last activity.
+    keepalive_probes: u32,
     /// The flow's dispatch key, for the splice lane's lookup.
     flow_key: vfawn_wire::flow::FlowKey,
 }
@@ -172,6 +177,13 @@ const DATA_RETRY_MAX: u32 = 15;
 /// peer that will not read us again; the probes back off alongside
 /// the retransmission timer and the give-up resets the peer.
 const PERSIST_RETRY_MAX: u32 = 12;
+/// How long an ESTABLISHED flow may sit idle before the first
+/// keepalive probe (RFC 9293 §3.8.1). The interval and probe budget
+/// share the estimate: three probes ten seconds apart catches a
+/// vanished peer inside half a minute of the first question.
+const KEEPALIVE_IDLE: Duration = Duration::from_secs(30);
+const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
+const KEEPALIVE_PROBE_MAX: u32 = 3;
 
 impl TcpSlot {
     fn announce(&mut self) {
@@ -452,6 +464,12 @@ impl SlotLogic for TcpSlot {
         if self.refused {
             return;
         }
+        // Any inbound segment answers the keepalive question — the
+        // probe clock disarms and the budget resets (RFC 9293
+        // §3.8.1: an incoming segment restarts the keep-alive timer).
+        self.keepalive_at = None;
+        self.keepalive_probes = 0;
+
         let inbound = Inbound::parse(&header, payload);
 
         // The lane entry, when the relay registered this flow. Its
@@ -688,6 +706,17 @@ impl SlotLogic for TcpSlot {
                     (at + rto_backoff(self.data_retries)).saturating_duration_since(Instant::now())
                 })
             }
+            // The keepalive clock: when everything else is quiet and
+            // the probe is armed, it is the next thing the slot owes
+            // the wire (RFC 9293 §3.8.1). The stored deadline is the
+            // next action — first probe after the idle window, each
+            // successor after the interval.
+            TcpState::Established
+                if self.keepalive_at.is_some() && self.keepalive_probes < KEEPALIVE_PROBE_MAX =>
+            {
+                self.keepalive_at
+                    .map(|at| at.saturating_duration_since(Instant::now()))
+            }
             // The persist clock runs beside the retransmit one: a
             // closed window with output waiting owes the wire a
             // probe, whether or not anything is in flight.
@@ -730,6 +759,30 @@ impl SlotLogic for TcpSlot {
                 // so one byte of the waiting output goes out to ask
                 // (RFC 9293 §3.8.2). The answer's window field is the
                 // news; the normal drain takes it from there.
+                // The keepalive probe: a bare ACK asking the peer
+                // "are you there?" (RFC 9293 §3.8.1 — the probe
+                // carries no data, just the current cursors). Each
+                // unanswered probe arms the next; the budget
+                // exhausted pronounces the flow dead with the peer
+                // told (the shared give-up sends the reset).
+                if let Some(at) = self.keepalive_at
+                    && Instant::now() >= at
+                {
+                    if self.keepalive_probes >= KEEPALIVE_PROBE_MAX {
+                        self.give_up(out);
+                        return;
+                    }
+                    let probe = Reaction::segment(
+                        self.connection.send_nxt(),
+                        self.connection.recv_nxt(),
+                        ctl::ACK,
+                        self.connection.advertised_window(),
+                    );
+                    let frame = emit_v4(self.server, self.client, &probe, &[], &[]);
+                    out.push_back(BytesMut::from(&frame[..]));
+                    self.keepalive_probes += 1;
+                    self.keepalive_at = Some(Instant::now() + KEEPALIVE_INTERVAL);
+                }
                 if self.persist_at.is_some() {
                     if self.connection.peer_window() > 0 {
                         self.persist_at = None;
@@ -844,6 +897,22 @@ impl SlotLogic for TcpSlot {
     }
 
     fn on_idle(&mut self, out: &mut VecDeque<BytesMut>) {
+        // The keepalive question: a flow with no activity for the
+        // idle window arms its probe clock (the next timer fire
+        // sends the first probe). A flow that just had activity
+        // disarmed it in on_packet.
+        if matches!(self.connection.state(), TcpState::Established)
+            && self.keepalive_at.is_none()
+            && self.connection.send_una() == self.connection.send_nxt()
+            && self.flight.is_empty()
+            && self.write_lane.lock().expect("write lane").bytes == 0
+        {
+            // The arm happens only after the full idle window of
+            // quiet — use the last inbound activity, which on_packet
+            // tracks by disarming; here we re-arm with the delay.
+            self.keepalive_at = Some(Instant::now() + KEEPALIVE_IDLE);
+            self.keepalive_probes = 0;
+        }
         // Host writes that arrived after the last packet: their only
         // ride is this idle sweep; CLOSE-WAIT writes still leave
         // (half-close: the answer direction stays ours).
@@ -1199,6 +1268,8 @@ impl StackBackend for NativeBackend {
                 persist_retries: 0,
                 diag_at: None,
                 diag_queued: 0,
+                keepalive_at: None,
+                keepalive_probes: 0,
             })
         });
 
@@ -1401,6 +1472,8 @@ mod tests {
             persist_retries: 0,
             diag_at: None,
             diag_queued: 0,
+            keepalive_at: None,
+            keepalive_probes: 0,
         };
         // Drive the slot to ESTABLISHED with a handshake like the
         // machine's own tests use.
