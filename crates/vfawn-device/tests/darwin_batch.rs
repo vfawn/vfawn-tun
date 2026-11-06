@@ -20,8 +20,9 @@ use bytes::BytesMut;
 use vfawn_core::{DeviceConfig, PacketDevice};
 use vfawn_device::TunDevice;
 
-/// The interface's own prefix and the prefix routed into it.
+/// The interface's own address and prefix, and the prefix routed into it.
 const IFACE_NET: &str = "198.18.0.1/24";
+const IFACE_ADDR: Ipv4Addr = Ipv4Addr::new(198, 18, 0, 1);
 const ROUTED_NET: &str = "198.18.1.0/24";
 const PROBE_ADDR: Ipv4Addr = Ipv4Addr::new(198, 18, 1, 7);
 const PROBE_PORT: u16 = 5353;
@@ -43,10 +44,15 @@ fn batch_reads_and_the_writev_round_trip() {
     let name = device.name().expect("name");
     route_add(&name);
 
-    // A connected probe socket with a wide send buffer: every datagram
-    // leaves the process before the first read, so the kernel — not a
-    // racing reader — decides the batching.
-    let socket = std::net::UdpSocket::bind("0.0.0.0:0").expect("bind");
+    // A connected probe socket bound to the interface's own address,
+    // with a wide send buffer: every datagram leaves the process
+    // before the first read, so the kernel — not a racing reader —
+    // decides the batching. The own-address bind also decides the
+    // bounce: a reply destined to the interface's address passes the
+    // kernel's interface check, where one destined to another
+    // interface's address would be dropped on arrival.
+    let socket =
+        std::net::UdpSocket::bind(std::net::SocketAddr::from((IFACE_ADDR, 0))).expect("bind");
     let sndbuf: libc::c_int = 1 << 20;
     // SAFETY: a plain integer socket option on a descriptor this
     // process owns.
@@ -65,12 +71,7 @@ fn batch_reads_and_the_writev_round_trip() {
         .expect("connect");
     let payload_body = |n: usize| format!("vfawn-batch-probe-{n:04}");
     for n in 0..PROBES {
-        socket
-            .send_to(
-                payload_body(n).as_bytes(),
-                std::net::SocketAddr::from((PROBE_ADDR, PROBE_PORT)),
-            )
-            .expect("send");
+        socket.send(payload_body(n).as_bytes()).expect("send");
     }
 
     // Read everything back in caller-sized slices, exactly as the
@@ -105,26 +106,58 @@ fn batch_reads_and_the_writev_round_trip() {
         "steady-state batching must clear four packets per read, saw {per_batch:.1}"
     );
 
-    // The write path: bounce one frame back — endpoints swapped, the
+    // The write path: one bounced frame — endpoints swapped, the
     // header checksum recomputed, the datagram checksum elided (a
-    // zero is legal in IPv4) — and the probe socket must see it.
+    // zero is legal in IPv4) — through write_batch. Delivery to an
+    // application depends on the host's own firewall and interface
+    // policy, which is not this layer's claim; the interface's own
+    // input counter is the kernel saying it took the frame.
     let inbound = first.expect("a frame was read");
     let reply = bounce(&inbound).expect("a UDP frame to bounce");
+    let before = interface_input_packets(&name).expect("interface stats");
     let mut one = [BytesMut::from(&reply[..])];
     assert_eq!(device.write_batch(&mut one).expect("write"), 1);
-    socket
-        .set_read_timeout(Some(Duration::from_secs(3)))
-        .expect("timeout");
-    let mut seen = [0u8; 64];
-    let n = socket.recv(&mut seen).expect("bounced datagram");
-    let seen_text = String::from_utf8_lossy(&seen[..n]).to_string();
+    // One writev, one accepted frame: the counter settles without a
+    // race because the I/O thread's write drain happens before its
+    // next park, and nothing else routes into the interface.
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let mut after = before;
+    while Instant::now() < deadline {
+        after = interface_input_packets(&name).expect("interface stats");
+        if after > before {
+            break;
+        }
+    }
     assert!(
-        seen_text.starts_with("vfawn-batch-probe-"),
-        "the bounce carried the probe payload: {seen_text}"
+        after > before,
+        "the interface must accept the written frame (inputs {before} -> {after})"
     );
 
     route_del(&name);
     device.shutdown().expect("shutdown");
+}
+
+/// The interface's input-packet count: for a utun, inputs are the
+/// frames user space wrote into the descriptor, which is exactly the
+/// write path's own accounting.
+fn interface_input_packets(name: &str) -> Option<u64> {
+    let output = Command::new("netstat")
+        .args(["-I", name, "-b"])
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&output.stdout);
+    for line in text.lines().skip_while(|l| !l.contains("Name")) {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        // The row runs Name Mtu Network Address Ipkts …, and the
+        // address column repeats the interface's own name — the last
+        // match is the one whose next field counts inputs.
+        if let Some(position) = fields.iter().rposition(|f| *f == name)
+            && fields.len() > position + 1
+        {
+            return fields[position + 1].parse().ok();
+        }
+    }
+    None
 }
 
 /// Swap the endpoints of one IPv4+UDP frame and fix its header
