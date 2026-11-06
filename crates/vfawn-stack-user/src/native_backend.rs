@@ -1378,12 +1378,21 @@ impl StackBackend for NativeBackend {
             })
             .expect("spawn udp session thread");
 
-        // The shards handle holds the threads; park this handle's stop
-        // by leaking into a leak-box that stops on StackHandle drop is
-        // the facade's business via shutdown ordering in volume two.
-        // For now the threads live as long as the process, matching
-        // the e2e lifecycle (start once, kill to stop).
-        std::mem::forget(shards);
+        // The stop watcher owns the pipeline: when the host raises the
+        // handle's flag, the watcher drops the shards, whose leave
+        // stops and joins every thread — and the producer's exit
+        // knocks the device's I/O thread awake, so the interface
+        // leaves with the pipeline instead of outliving it.
+        let stop_flag = handle.stop_flag();
+        std::thread::Builder::new()
+            .name("vfawn-native-stop".into())
+            .spawn(move || {
+                while !stop_flag.load(std::sync::atomic::Ordering::Acquire) {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                drop(shards);
+            })
+            .expect("spawn stop watcher");
 
         Ok(handle)
     }

@@ -39,6 +39,12 @@ impl StackHandle {
     pub fn is_stopped(&self) -> bool {
         self.stop.load(Ordering::Acquire)
     }
+
+    /// The stop flag itself, for backends that park a watcher on it
+    /// instead of polling between work.
+    pub fn stop_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.stop)
+    }
 }
 
 impl Default for StackHandle {
