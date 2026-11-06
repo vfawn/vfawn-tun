@@ -26,5 +26,5 @@ pub use model::{
     Conflict, DesiredState, InterfaceAddress, ObservedState, Plan, PolicyRule, RouteEntry, RouteOp,
     RuleAction, RuleSelector,
 };
-pub use planner::{RouteParams, desired_from_config, plan, simulate_apply};
+pub use planner::{RouteParams, desired_from_config, orphan_rules, plan, simulate_apply};
 pub use reconciler::{AuditEntry, ReconcileError, Reconciler};

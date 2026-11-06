@@ -433,3 +433,83 @@ fn addresses_added_before_routes() {
         "addresses must exist before routes reference the interface"
     );
 }
+
+// --- Orphan rules: the dead instance's leftovers ---
+
+#[test]
+fn a_rule_selecting_a_live_table_is_kept() {
+    let observed = ObservedState {
+        addresses: vec![addr("tun1", "198.18.0.1/15")],
+        routes: vec![route(2022, "198.18.0.0/15", "tun1")],
+        rules: vec![rule(9001, "vfawn-tun1")],
+    };
+    assert!(orphan_rules(&observed).is_empty());
+}
+
+#[test]
+fn a_rule_selecting_a_table_of_dead_routes_is_swept() {
+    // The instance died with tun0; the kernel reaped tun0's routes,
+    // the rule selecting that now-empty table stayed.
+    let observed = ObservedState {
+        addresses: vec![],
+        routes: vec![],
+        rules: vec![rule(9001, "vfawn-tun0"), rule(9002, "anything")],
+    };
+    let orphans = orphan_rules(&observed);
+    assert_eq!(orphans.len(), 2, "both selectors of the dead table");
+}
+
+#[test]
+fn a_table_shared_with_a_live_instance_stays_alive() {
+    // Two instances shared the table index; one died. The kernel
+    // reaped the dead one's routes with its interface, and the live
+    // one's routes keep the table routing — so no rule selecting it
+    // is a black hole, not even the dead instance's leftover.
+    let observed = ObservedState {
+        addresses: vec![addr("tun1", "198.18.0.1/15")],
+        routes: vec![route(2022, "0.0.0.0/0", "tun1")],
+        rules: vec![rule(9001, "vfawn-tun0"), rule(9002, "vfawn-tun1")],
+    };
+    assert!(orphan_rules(&observed).is_empty());
+}
+
+#[test]
+fn a_gateway_route_keeps_its_table_alive() {
+    let observed = ObservedState {
+        addresses: vec![],
+        routes: vec![RouteEntry {
+            table: 2022,
+            destination: "0.0.0.0/0".parse().unwrap(),
+            gateway: Some("10.0.0.1".parse().unwrap()),
+            interface: None,
+            metric: 0,
+        }],
+        rules: vec![rule(9001, "vfawn-tun0")],
+    };
+    assert!(orphan_rules(&observed).is_empty());
+}
+
+#[test]
+fn the_kernel_own_tables_are_never_selected_into_orphans() {
+    let observed = ObservedState {
+        addresses: vec![],
+        routes: vec![],
+        rules: vec![PolicyRule {
+            priority: 9000,
+            selector: RuleSelector {
+                source: None,
+                destination: None,
+                incoming_interface: None,
+                fwmark: Some(0x2022),
+                suppress_prefixlen: None,
+                dport: None,
+            },
+            action: RuleAction::Lookup(254),
+            tag: "vfawn-tun0".to_string(),
+        }],
+    };
+    assert!(
+        orphan_rules(&observed).is_empty(),
+        "main always routes; the escape rule is harmless"
+    );
+}

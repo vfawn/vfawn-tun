@@ -118,6 +118,56 @@ fn rule_belongs_to_capture(rule: &PolicyRule, desired: &DesiredState) -> bool {
     in_window && ours_shape
 }
 
+/// The tables that always route: the kernel's own. A rule selecting
+/// one of these is never a black hole, whatever installed it.
+const ALWAYS_LIVE_TABLES: [u32; 3] = [253, 254, 255];
+
+/// Rules that select a table which no longer routes anywhere. A rule
+/// outlives its instance because it points at a table, not a link:
+/// the link's death reaps the table's routes and nothing reaps the
+/// rule, which leaves it selecting an empty table — a black hole for
+/// every packet it matches. A table is dead when no route in it rides
+/// a live interface (the kernel keeps no tags; liveness of the table
+/// is the whole signal a snapshot has).
+pub fn orphan_rules(observed: &ObservedState) -> Vec<PolicyRule> {
+    let live: std::collections::HashSet<&str> = observed
+        .addresses
+        .iter()
+        .map(|address| address.interface.as_str())
+        .chain(
+            observed
+                .routes
+                .iter()
+                .filter_map(|route| route.interface.as_deref()),
+        )
+        .collect();
+    let mut live_tables: std::collections::HashSet<u32> =
+        ALWAYS_LIVE_TABLES.iter().copied().collect();
+    for route in &observed.routes {
+        // A gateway route rides whatever the kernel resolves it to; a
+        // pinned route rides its interface. Only a live ride keeps a
+        // table alive.
+        let rides_live = route
+            .interface
+            .as_deref()
+            .is_none_or(|interface| live.contains(interface));
+        if rides_live {
+            live_tables.insert(route.table);
+        }
+    }
+    observed
+        .rules
+        .iter()
+        .filter(|rule| {
+            matches!(
+                rule.action,
+                RuleAction::Lookup(table) if !live_tables.contains(&table)
+            )
+        })
+        .cloned()
+        .collect()
+}
+
 pub fn simulate_apply(plan: &Plan, observed: &mut ObservedState) {
     for op in &plan.operations {
         match op {

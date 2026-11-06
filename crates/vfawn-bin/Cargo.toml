@@ -17,6 +17,7 @@ tokio = { workspace = true, features = ["rt", "signal", "macros"] }
 ipnet.workspace = true
 vfawn-wire = { path = "../vfawn-wire" }
 vfawn-platform = { path = "../vfawn-platform" }
+vfawn-route = { path = "../vfawn-route" }
 vfawn-device = { path = "../vfawn-device" }
 vfawn-stack-user = { path = "../vfawn-stack-user", features = ["backend-native"] }
 

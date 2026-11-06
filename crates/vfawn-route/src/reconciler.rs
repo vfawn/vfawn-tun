@@ -17,7 +17,7 @@
 //! operation lands in the audit log as one JSON line.
 
 use crate::backend::RouteBackend;
-use crate::model::{DesiredState, RouteOp};
+use crate::model::{DesiredState, ObservedState, RouteOp};
 use crate::planner;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -86,15 +86,19 @@ impl Reconciler {
     }
 
     /// Apply the desired state atomically. On failure, every operation
-    /// that already ran is undone in reverse order.
+    /// that already ran is undone in reverse order. Rules whose
+    /// instance is gone are swept first, best-effort: a dead hand's
+    /// rule must not veto the living install.
     pub fn apply(&self, desired: &DesiredState) -> Result<(), ReconcileError> {
-        let observed = self
+        let mut observed = self
             .backend
             .snapshot()
             .map_err(|e| ReconcileError::SnapshotFailed(e.to_string()))?;
 
+        let swept = self.sweep_from(&mut observed);
+
         let plan = planner::plan(desired, &observed);
-        if plan.is_empty() {
+        if plan.is_empty() && swept == 0 {
             return Ok(());
         }
 
@@ -113,6 +117,67 @@ impl Reconciler {
             }
         }
         Ok(())
+    }
+
+    /// Remove every rule whose instance is gone, against a fresh
+    /// snapshot. Returns the rules it removed, for the caller's
+    /// report.
+    pub fn sweep_orphans(&self) -> Result<Vec<String>, ReconcileError> {
+        let observed = self
+            .backend
+            .snapshot()
+            .map_err(|e| ReconcileError::SnapshotFailed(e.to_string()))?;
+        let removed = planner::orphan_rules(&observed)
+            .into_iter()
+            .map(|rule| RouteOp::RemoveRule(rule.clone()))
+            .filter_map(|op| match self.backend.apply(&op) {
+                Ok(()) => {
+                    self.log("sweep", &op, "ok");
+                    Some(op.describe())
+                }
+                Err(e) => {
+                    self.log("sweep", &op, &format!("error:{e}"));
+                    None
+                }
+            })
+            .collect();
+        Ok(removed)
+    }
+
+    /// Sweep against an already-taken snapshot, which this call also
+    /// edits: what it removed must not survive into the plan's view,
+    /// or the plan would see the rule as already in effect and skip
+    /// re-adding it — an instance that swept its predecessor and then
+    /// installed nothing. A failure to remove one orphan is logged
+    /// and lived with — the rules this call could not take will meet
+    /// this call again at the next pass, and their kernel state
+    /// still matches what the plan sees.
+    fn sweep_from(&self, observed: &mut ObservedState) -> usize {
+        planner::orphan_rules(observed)
+            .into_iter()
+            .map(RouteOp::RemoveRule)
+            .filter_map(|op| {
+                let removed = match self.backend.apply(&op) {
+                    Ok(()) => {
+                        self.log("sweep", &op, "ok");
+                        true
+                    }
+                    Err(e) => {
+                        self.log("sweep", &op, &format!("error:{e}"));
+                        false
+                    }
+                };
+                removed.then_some(op)
+            })
+            .map(|op| {
+                // Rule identity is priority, selector and action; the
+                // tag only records who. Remove exactly what the kernel
+                // just lost.
+                if let RouteOp::RemoveRule(rule) = op {
+                    observed.rules.retain(|existing| existing != &rule);
+                }
+            })
+            .count()
     }
 
     /// Undo already-applied operations in reverse order.
@@ -272,6 +337,119 @@ mod tests {
             strict_route: false,
             dns_leak_prevention: false,
         })
+    }
+
+    #[test]
+    fn apply_sweeps_a_dead_instances_rules_first() {
+        let backend: Arc<MockBackend> = Arc::new(MockBackend::new());
+        let re = Reconciler::new(backend.clone());
+        let desired = test_desired();
+
+        // A previous instance's rule still selects its table, whose
+        // routes died with the old interface; the new instance's own
+        // state matches desired so the plan alone would be empty.
+        {
+            let mut state = backend.state.lock().unwrap();
+            state.rules.push(PolicyRule {
+                priority: 9100,
+                selector: RuleSelector {
+                    source: None,
+                    destination: None,
+                    incoming_interface: None,
+                    fwmark: None,
+                    suppress_prefixlen: None,
+                    dport: None,
+                },
+                action: RuleAction::Lookup(2077),
+                tag: "vfawn-tun9".to_string(),
+            });
+            state.addresses.push(InterfaceAddress {
+                interface: "tun0".to_string(),
+                prefix: "198.18.0.1/15".parse().unwrap(),
+            });
+            state.routes.push(RouteEntry {
+                table: 2022,
+                destination: "0.0.0.0/0".parse().unwrap(),
+                gateway: None,
+                interface: Some("tun0".to_string()),
+                metric: 0,
+            });
+            for rule in &desired.rules {
+                state.rules.push(rule.clone());
+            }
+        }
+
+        re.apply(&desired).unwrap();
+        let calls = backend.calls.lock().unwrap().join(",");
+        assert!(
+            calls.contains("vfawn-tun9"),
+            "the dead instance's rule must be swept, saw: {calls}"
+        );
+        let state = backend.state.lock().unwrap();
+        assert!(
+            !state.rules.iter().any(|r| r.tag == "vfawn-tun9"),
+            "the swept rule is gone from the state"
+        );
+    }
+
+    #[test]
+    fn a_swept_predecessor_rule_is_readded_by_the_same_apply() {
+        // The predecessor's rule has the same identity as the new
+        // instance's own (same table, same shape; only the tag
+        // differs) and its table is empty — the sweep takes it, and
+        // the plan must see that and install its own copy, in the
+        // same apply.
+        let backend: Arc<MockBackend> = Arc::new(MockBackend::new());
+        let re = Reconciler::new(backend.clone());
+        let desired = test_desired();
+
+        {
+            let mut state = backend.state.lock().unwrap();
+            state.addresses.push(InterfaceAddress {
+                interface: "tun0".to_string(),
+                prefix: "198.18.0.1/15".parse().unwrap(),
+            });
+            for rule in &desired.rules {
+                let mut stale = rule.clone();
+                stale.tag = "vfawn-gone0".to_string();
+                state.rules.push(stale);
+            }
+            // No routes anywhere: every selector of the capture table
+            // is a black hole until this install fills the table.
+        }
+
+        re.apply(&desired).unwrap();
+        let state = backend.state.lock().unwrap();
+        assert!(
+            state
+                .rules
+                .iter()
+                .any(|r| r.action == RuleAction::Lookup(2022)),
+            "the capture rule exists after the apply that swept its predecessor"
+        );
+    }
+
+    #[test]
+    fn sweep_orphans_reports_what_it_took() {
+        let backend: Arc<MockBackend> = Arc::new(MockBackend::new());
+        let re = Reconciler::new(backend.clone());
+        backend.state.lock().unwrap().rules.push(PolicyRule {
+            priority: 9100,
+            selector: RuleSelector {
+                source: None,
+                destination: None,
+                incoming_interface: None,
+                fwmark: None,
+                suppress_prefixlen: None,
+                dport: None,
+            },
+            action: RuleAction::Lookup(2022),
+            tag: "vfawn-gone0".to_string(),
+        });
+
+        let swept = re.sweep_orphans().unwrap();
+        assert_eq!(swept.len(), 1, "one orphan, one report line");
+        assert!(swept[0].contains("vfawn-gone0"));
     }
 
     #[test]
