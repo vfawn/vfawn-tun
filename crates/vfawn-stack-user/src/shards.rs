@@ -15,9 +15,10 @@
 //! What is here, and what is not:
 //!
 //! * here: batch hand-off (whole device batches split per shard), a
-//!   wake flag so idle shards sleep instead of spin, a per-shard binary
-//!   timer heap, pooled packet buffers, and a per-slot bypass state as
-//!   the hook the payload fast path attaches to;
+//!   doorbell so idle shards park until work knocks instead of polling
+//!   a cadence, a per-shard binary timer heap, pooled packet buffers,
+//!   and a per-slot bypass state as the hook the payload fast path
+//!   attaches to;
 //! * not here: any TCP. The slot logic is a trait; the native backend
 //!   implements it with the state machine, and a UDP echo logic proves
 //!   the plumbing end to end.
@@ -182,6 +183,60 @@ unsafe impl Send for Ring {}
 #[expect(unsafe_code)]
 unsafe impl Sync for Ring {}
 
+/// One shard's doorbell: whoever hands a shard work — the producer
+/// after an inbox push, a session's lane after a host write, the stop
+/// path — knocks, and the shard parks on the condvar until then
+/// instead of waking on a cadence to check for nothing. The flag is
+/// the predicate and the condvar the wake; storing the flag before
+/// notifying under the lock means a parking thread either sees the
+/// flag or hears the bell, so a knock is never lost to the race
+/// between the last check and the park.
+pub struct ShardBell {
+    wake: AtomicBool,
+    door: (Mutex<()>, std::sync::Condvar),
+}
+
+impl ShardBell {
+    pub(crate) fn new() -> Self {
+        Self {
+            wake: AtomicBool::new(false),
+            door: (Mutex::new(()), std::sync::Condvar::new()),
+        }
+    }
+
+    /// Ring the bell: arm the flag first, then notify under the lock.
+    pub fn knock(&self) {
+        self.wake.store(true, Ordering::Release);
+        if let Ok(guard) = self.door.0.lock() {
+            drop(guard);
+            self.door.1.notify_all();
+        }
+    }
+
+    /// Whether a knock is still unclaimed.
+    fn armed(&self) -> bool {
+        self.wake.load(Ordering::Acquire)
+    }
+
+    /// Claim any pending knock; the loop does this at its top.
+    fn clear(&self) {
+        self.wake.store(false, Ordering::Relaxed);
+    }
+
+    /// Park until a knock or `timeout`. The flag re-check under the
+    /// lock is the whole pattern: a knock that landed after the
+    /// caller's own check is seen here instead of slept through.
+    fn park(&self, timeout: Duration) {
+        let Ok(guard) = self.door.0.lock() else {
+            return;
+        };
+        if self.wake.load(Ordering::Acquire) {
+            return;
+        }
+        let _ = self.door.1.wait_timeout(guard, timeout);
+    }
+}
+
 /// A deterministic flow-to-shard hash. Randomized hashing would spread
 /// flows differently per process run and make affinity tests flaky;
 /// FNV-1a over the five-tuple bytes is stable and cheap.
@@ -335,8 +390,11 @@ pub struct ShardConfig {
     pub mtu: usize,
     /// Inbox depth per shard, in batches.
     pub inbox_batches: usize,
-    /// Idle shards poll this long before sleeping again.
-    pub idle_poll: Duration,
+    /// How long an idle shard may park with nothing due. Work never
+    /// waits for it — knocks are event-driven — so the cap exists for
+    /// the clock-bound duties: the idle sweep's cadence and the stop
+    /// check between knocks.
+    pub park_cap: Duration,
 }
 
 impl Default for ShardConfig {
@@ -347,7 +405,7 @@ impl Default for ShardConfig {
                 .unwrap_or(4),
             mtu: 1500,
             inbox_batches: 64,
-            idle_poll: Duration::from_micros(200),
+            park_cap: Duration::from_millis(50),
         }
     }
 }
@@ -356,7 +414,7 @@ impl Default for ShardConfig {
 struct ShardShared {
     inbox: Arc<Ring>,
     outbox: Arc<Mutex<VecDeque<BytesMut>>>,
-    wake: Arc<AtomicBool>,
+    bell: Arc<ShardBell>,
     stopped: Arc<AtomicBool>,
     /// One-shot backlog warning for this lane's outbox.
     wrote_warning: Arc<AtomicBool>,
@@ -382,10 +440,10 @@ impl PipelineStop {
 /// thread; the device close is the caller's business as elsewhere.
 pub struct Shards {
     shared: Vec<ShardShared>,
-    /// Each shard's wake flag, indexed like `shared`: the host-side
-    /// write path sets its flow's flag so an interactive write drains
+    /// Each shard's doorbell, indexed like `shared`: the host-side
+    /// write path rings its flow's bell so an interactive write drains
     /// now instead of at the idle cadence.
-    wake_flags: Vec<Arc<AtomicBool>>,
+    bells: Vec<Arc<ShardBell>>,
     stop_all: PipelineStop,
     pool: Arc<BufferPool>,
     /// Count of packets each shard processed, for affinity tests.
@@ -412,12 +470,12 @@ impl Shards {
         let mut processed = Vec::with_capacity(shard_count);
         let mut threads = Vec::with_capacity(shard_count + 2);
 
-        let mut wake_flags: Vec<Arc<AtomicBool>> = Vec::with_capacity(shard_count);
+        let mut bells: Vec<Arc<ShardBell>> = Vec::with_capacity(shard_count);
         for _ in 0..shard_count {
             let inbox = Arc::new(Ring::new(config.inbox_batches));
             let outbox = Arc::new(Mutex::new(VecDeque::new()));
-            let wake = Arc::new(AtomicBool::new(false));
-            wake_flags.push(Arc::clone(&wake));
+            let bell = Arc::new(ShardBell::new());
+            bells.push(Arc::clone(&bell));
             let stopped = Arc::new(AtomicBool::new(false));
             let wrote_warning = Arc::new(AtomicBool::new(false));
             let counter = Arc::new(AtomicU64::new(0));
@@ -427,7 +485,7 @@ impl Shards {
             let inbox_for_loop = Arc::clone(&inbox);
             let outbox_for_loop = Arc::clone(&outbox);
             let writer_ping_for_loop = Arc::clone(&writer_ping);
-            let wake_for_loop = Arc::clone(&wake);
+            let bell_for_loop = Arc::clone(&bell);
             let stop_for_loop = Arc::clone(&stopped);
             let counter_for_loop = Arc::clone(&counter);
             let stop_all_for_shard = Arc::clone(&stop_all);
@@ -439,7 +497,7 @@ impl Shards {
                             stop_all_for_shard,
                             inbox_for_loop,
                             outbox_for_loop,
-                            wake_for_loop,
+                            bell_for_loop,
                             stop_for_loop,
                             writer_ping_for_loop,
                             counter_for_loop,
@@ -454,7 +512,7 @@ impl Shards {
                 inbox,
                 outbox,
                 writer_ping: Arc::clone(&writer_ping),
-                wake,
+                bell,
                 stopped,
                 wrote_warning,
             });
@@ -616,7 +674,7 @@ impl Shards {
 
         Self {
             shared,
-            wake_flags,
+            bells,
             stop_all: PipelineStop(Arc::clone(&stop_all)),
             pool,
             processed,
@@ -624,18 +682,15 @@ impl Shards {
         }
     }
 
-    /// Wake a shard that has pending timers due within `horizon`; the
-    /// shard loop itself checks the clock on every batch, so this is an
-    /// optimization hook for idle periods.
-    /// The wake flag of one shard, for host-side signalling that
+    /// The doorbell of one shard, for host-side signalling that
     /// targets a specific flow's shard.
-    pub fn wake_flag(&self, shard: usize) -> Option<Arc<AtomicBool>> {
-        self.wake_flags.get(shard).cloned()
+    pub fn doorbell(&self, shard: usize) -> Option<Arc<ShardBell>> {
+        self.bells.get(shard).cloned()
     }
 
     pub fn wake(&self, shard: usize) {
         if let Some(shared) = self.shared.get(shard) {
-            shared.wake.store(true, Ordering::Release);
+            shared.bell.knock();
         }
     }
 
@@ -657,7 +712,7 @@ impl Shards {
         }
         for lane in &self.shared {
             lane.stopped.store(true, Ordering::Release);
-            lane.wake.store(true, Ordering::Release);
+            lane.bell.knock();
         }
     }
 }
@@ -681,7 +736,7 @@ fn flush_lane(inbox: &Ring, shared: &ShardShared, lane: &mut Vec<Option<BytesMut
         // kernel socket buffer as the final shock absorber.
         std::thread::sleep(Duration::from_micros(50));
     }
-    shared.wake.store(true, Ordering::Release);
+    shared.bell.knock();
     true
 }
 
@@ -690,7 +745,7 @@ fn shard_loop(
     stop_all: Arc<AtomicBool>,
     inbox: Arc<Ring>,
     outbox: Arc<Mutex<VecDeque<BytesMut>>>,
-    wake: Arc<AtomicBool>,
+    bell: Arc<ShardBell>,
     stopped: Arc<AtomicBool>,
     writer_ping: Arc<(Mutex<()>, std::sync::Condvar)>,
     counter: Arc<AtomicU64>,
@@ -717,7 +772,7 @@ fn shard_loop(
         if stopped.load(Ordering::Acquire) || stop_all.load(Ordering::Acquire) {
             break;
         }
-        wake.store(false, Ordering::Relaxed);
+        bell.clear();
         let mut did_work = false;
 
         while let Some(batch) = inbox.pop() {
@@ -806,8 +861,21 @@ fn shard_loop(
             }
         }
 
-        if !did_work && !wake.load(Ordering::Acquire) {
-            std::thread::sleep(config.idle_poll);
+        if !did_work && !bell.armed() {
+            // Park until knocked: the earliest pending timer bounds the
+            // wait (every clock duty a slot owes the wire passes
+            // through the heap), the cap keeps the idle sweep's
+            // cadence, and a knock — inbox push, host write, stop —
+            // ends it in the microseconds the condvar costs instead of
+            // the cadence a blind poll would pay.
+            let timeout = timers
+                .peek()
+                .map(|earliest| earliest.deadline.saturating_duration_since(now))
+                .unwrap_or(config.park_cap)
+                .min(config.park_cap);
+            if !timeout.is_zero() {
+                bell.park(timeout);
+            }
         }
     }
 }

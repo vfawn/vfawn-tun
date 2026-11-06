@@ -31,7 +31,6 @@
 use std::collections::VecDeque;
 use std::io;
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -50,7 +49,7 @@ use vfawn_wire::tcp::TcpHeader;
 use crate::accept::{AcceptQueue, FixedSecret};
 use crate::congestion::{CongestionAlgo, Cubic, Reno, Signal};
 use crate::native_tcp::{Inbound, Reaction, ServerConnection, TcpState, ctl, emit_v4};
-use crate::shards::{BufferPool, LogicFactory, ShardConfig, Shards, SlotLogic};
+use crate::shards::{BufferPool, LogicFactory, ShardBell, ShardConfig, Shards, SlotLogic};
 
 /// The fallback segment size when the backend is constructed without
 /// one: RFC 9293 §3.7.1's default for a peer that sent no MSS option.
@@ -111,8 +110,8 @@ struct TcpSlot {
     flow: FlowInfo,
     /// The lane this slot's host writes arrive on.
     write_lane: Arc<std::sync::Mutex<WriteLane>>,
-    /// The shard's wake flag this slot's lane rings on host writes.
-    shard_wake: Arc<AtomicBool>,
+    /// The shard's doorbell this slot's lane rings on host writes.
+    shard_wake: Arc<ShardBell>,
     cc: Box<dyn CongestionAlgo>,
     /// The host channel, created when the handshake completes. A SYN
     /// that never completes (a spoofed flood) costs nothing here.
@@ -936,7 +935,7 @@ struct NativeTcpIo {
     /// protocol length prefix) sat in the lane for the sleep cadence —
     /// forty milliseconds of silence that the far end's protocol timer
     /// read as death.
-    shard_wake: Arc<AtomicBool>,
+    shard_wake: Arc<ShardBell>,
     pending: VecDeque<u8>,
     closed: bool,
 }
@@ -1045,8 +1044,7 @@ impl TcpTransport for NativeTcpIo {
         lane.bytes += data.len();
         lane.writes.push_back(data.to_vec());
         drop(lane);
-        self.shard_wake
-            .store(true, std::sync::atomic::Ordering::Release);
+        self.shard_wake.knock();
         Ok(data.len())
     }
 
@@ -1128,10 +1126,10 @@ struct SpawnShared {
     accept: Arc<std::sync::Mutex<AcceptQueue>>,
     cc_factory: Arc<dyn Fn() -> Box<dyn CongestionAlgo> + Send + Sync>,
     mss: u16,
-    /// Each shard's wake flag, filled once the shards exist: a slot's
-    /// lane sets its own shard's flag on host writes, so an
+    /// Each shard's doorbell, filled once the shards exist: a slot's
+    /// lane rings its own shard's bell on host writes, so an
     /// interactive write drains immediately.
-    shard_wakes: Arc<std::sync::OnceLock<Vec<Arc<AtomicBool>>>>,
+    shard_wakes: Arc<std::sync::OnceLock<Vec<Arc<ShardBell>>>>,
 }
 
 /// A ready session handed to the runtime side.
@@ -1139,7 +1137,7 @@ struct SessionHandoff {
     flow: FlowInfo,
     events: tokio::sync::mpsc::UnboundedReceiver<HostEvent>,
     write_lane: Arc<std::sync::Mutex<WriteLane>>,
-    shard_wake: Arc<AtomicBool>,
+    shard_wake: Arc<ShardBell>,
 }
 
 impl StackBackend for NativeBackend {
@@ -1166,7 +1164,7 @@ impl StackBackend for NativeBackend {
 
         let (sessions_tx, sessions_rx) = mpsc::sync_channel::<SessionHandoff>(1024);
         let (udp_tx, udp_rx) = mpsc::sync_channel::<crate::udp_slot::UdpHandoff>(1024);
-        let shard_wakes: Arc<std::sync::OnceLock<Vec<Arc<AtomicBool>>>> =
+        let shard_wakes: Arc<std::sync::OnceLock<Vec<Arc<ShardBell>>>> =
             Arc::new(std::sync::OnceLock::new());
 
         let shared = Arc::new(SpawnShared {
@@ -1192,6 +1190,20 @@ impl StackBackend for NativeBackend {
         let icmp_handler = Arc::clone(&shared.handler);
         let icmp_table_for_slots = Arc::clone(&icmp_table);
         let logic_factory: LogicFactory = Arc::new(move |flow: &FlowKey| {
+            // Every flow's slot knows its shard's doorbell — the host's
+            // writes ring it through the slot's lane — resolved here so
+            // the datagram slots and the connection slots share one
+            // lookup shape. Before the shards exist (nothing has flowed
+            // yet) a private bell stands in; it rings nothing.
+            let shard_bell = factory_shared
+                .shard_wakes
+                .get()
+                .and_then(|bells| {
+                    bells
+                        .get(crate::shards::shard_hash_of(flow, bells.len()))
+                        .cloned()
+                })
+                .unwrap_or_else(|| Arc::new(ShardBell::new()));
             // ICMP flows ride the datagram slot: echo answered in
             // place, errors correlated, no connection to hold.
             if flow.protocol == IpProtocol::Icmp {
@@ -1208,6 +1220,7 @@ impl StackBackend for NativeBackend {
                 return Box::new(crate::udp_slot::UdpSlot::new(
                     Arc::clone(&factory_shared.handler),
                     factory_shared.udp_sessions.clone(),
+                    shard_bell,
                 )) as Box<dyn SlotLogic>;
             }
             // Only v4 flows ride the native stack; anything else gets a
@@ -1228,15 +1241,6 @@ impl StackBackend for NativeBackend {
                 return Box::new(SinkSlot) as Box<dyn SlotLogic>;
             };
             let write_lane = Arc::new(std::sync::Mutex::new(WriteLane::new()));
-            let shard_wake = factory_shared
-                .shard_wakes
-                .get()
-                .and_then(|flags| {
-                    flags
-                        .get(crate::shards::shard_hash_of(flow, flags.len()))
-                        .cloned()
-                })
-                .unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
 
             Box::new(TcpSlot {
                 connection: ServerConnection::new(isn, factory_shared.mss),
@@ -1252,7 +1256,7 @@ impl StackBackend for NativeBackend {
                     destination: std::net::SocketAddr::new(flow.dst, flow.dst_port),
                 },
                 write_lane,
-                shard_wake,
+                shard_wake: shard_bell,
                 cc: (factory_shared.cc_factory)(),
                 to_host: None,
                 judged: false,
@@ -1286,7 +1290,7 @@ impl StackBackend for NativeBackend {
         );
         let _ = shard_wakes.set(
             (0..shard_count)
-                .filter_map(|i| shards.wake_flag(i))
+                .filter_map(|i| shards.doorbell(i))
                 .collect::<Vec<_>>(),
         );
 
@@ -1346,6 +1350,7 @@ impl StackBackend for NativeBackend {
                                 events: handoff.events,
                                 lane: Arc::clone(&handoff.lane),
                                 lane_bytes: Arc::clone(&handoff.lane_bytes),
+                                shard_wake: Arc::clone(&handoff.shard_wake),
                                 origin: handoff.flow.destination,
                             };
                             let session = vfawn_core::UdpSession::new(
@@ -1456,7 +1461,7 @@ mod tests {
                 destination: std::net::SocketAddr::V4(server),
             },
             write_lane,
-            shard_wake: Arc::new(AtomicBool::new(false)),
+            shard_wake: Arc::new(ShardBell::new()),
             cc: Box::new(crate::congestion::Cubic::new(1460)),
             to_host: None,
             judged: false,

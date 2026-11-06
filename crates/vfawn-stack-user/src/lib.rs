@@ -57,6 +57,6 @@ pub use native_backend::NativeBackend;
 pub use native_tcp::{Inbound, NativeTcpConnection, Reaction, ServerConnection, TcpState, emit_v4};
 #[cfg(feature = "backend-native")]
 #[cfg(feature = "backend-native")]
-pub use shards::{ShardConfig, Shards, SlotLogic, UdpEcho};
+pub use shards::{ShardBell, ShardConfig, Shards, SlotLogic, UdpEcho};
 #[cfg(all(feature = "backend-native", target_os = "linux"))]
 pub use splice_lane::SpliceLane;

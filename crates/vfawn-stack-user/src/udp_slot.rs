@@ -23,7 +23,7 @@ use vfawn_wire::ipv4::Ipv4Header;
 use vfawn_wire::protocol::IpProtocol;
 use vfawn_wire::udp::UdpHeader;
 
-use crate::shards::{BufferPool, SlotLogic};
+use crate::shards::{BufferPool, ShardBell, SlotLogic};
 
 /// How much unsent host output one datagram flow may hold before the
 /// next send waits: a burst of replies the wire cannot carry is
@@ -47,6 +47,10 @@ pub struct UdpSlot {
     to_host: Option<tokio::sync::mpsc::UnboundedSender<HostEvent>>,
     lane: Arc<std::sync::Mutex<VecDeque<PendingDatagram>>>,
     lane_bytes: Arc<AtomicUsize>,
+    /// The shard's doorbell, handed to the session with the lane: a
+    /// reply the host wrote must not sit in the lane until the idle
+    /// sweep or the next datagram notices it.
+    shard_wake: Arc<ShardBell>,
     judged: bool,
     flow: FlowInfo,
     /// The wire endpoints, as the emitter wants them (the captured
@@ -69,18 +73,24 @@ pub struct UdpHandoff {
     pub events: tokio::sync::mpsc::UnboundedReceiver<HostEvent>,
     pub lane: Arc<std::sync::Mutex<VecDeque<PendingDatagram>>>,
     pub lane_bytes: Arc<AtomicUsize>,
+    pub shard_wake: Arc<ShardBell>,
     pub client_addr: std::net::SocketAddrV4,
     pub server_addr: std::net::SocketAddrV4,
 }
 
 impl UdpSlot {
-    pub fn new(handler: Arc<dyn SessionHandler>, sessions: SyncSender<UdpHandoff>) -> Self {
+    pub fn new(
+        handler: Arc<dyn SessionHandler>,
+        sessions: SyncSender<UdpHandoff>,
+        shard_wake: Arc<ShardBell>,
+    ) -> Self {
         Self {
             handler,
             sessions,
             to_host: None,
             lane: Arc::new(std::sync::Mutex::new(VecDeque::new())),
             lane_bytes: Arc::new(AtomicUsize::new(0)),
+            shard_wake,
             judged: false,
             flow: FlowInfo {
                 network: Network::Udp,
@@ -131,6 +141,7 @@ impl UdpSlot {
             events: event_rx,
             lane: Arc::clone(&self.lane),
             lane_bytes: Arc::clone(&self.lane_bytes),
+            shard_wake: Arc::clone(&self.shard_wake),
             client_addr: self.client_addr,
             server_addr: self.server_addr,
         };
@@ -249,6 +260,9 @@ pub struct NativeUdpIo {
     pub events: tokio::sync::mpsc::UnboundedReceiver<HostEvent>,
     pub lane: Arc<std::sync::Mutex<VecDeque<PendingDatagram>>>,
     pub lane_bytes: Arc<AtomicUsize>,
+    /// The shard's doorbell: a reply pushed into the lane rings it, so
+    /// the framing leaves at the knock instead of the sweep cadence.
+    pub shard_wake: Arc<ShardBell>,
     pub origin: SocketAddr,
 }
 
@@ -282,6 +296,8 @@ impl vfawn_core::UdpTransport for NativeUdpIo {
         lane.push_back(PendingDatagram {
             data: data.to_vec(),
         });
+        drop(lane);
+        self.shard_wake.knock();
         Ok(())
     }
 }
