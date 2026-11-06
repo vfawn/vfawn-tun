@@ -6,15 +6,17 @@ license.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 
+[dependencies]
+ipnet.workspace = true
+vfawn-core = { path = "../vfawn-core" }
+vfawn-route = { path = "../vfawn-route" }
+
 [target.'cfg(target_os = "linux")'.dependencies]
 rtnetlink.workspace = true
 netlink-packet-route.workspace = true
-ipnet.workspace = true
 serde.workspace = true
 tokio.workspace = true
 futures = "0.3"
-vfawn-core = { path = "../vfawn-core" }
-vfawn-route = { path = "../vfawn-route" }
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 libc = "0.2"
