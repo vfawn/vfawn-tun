@@ -66,6 +66,14 @@ jobs:
         if: runner.os == 'macOS'
         run: sudo -E env "PATH=$PATH" cargo test -p vfawn-device --test darwin_batch -- --ignored --exact --nocapture
 
+      # The Windows acceptance: the runner is administrator, so the
+      # embedded driver loads, the adapter appears, routes move
+      # through the live tables, a session echoes, and shutdown
+      # leaves nothing behind.
+      - name: windows e2e (admin)
+        if: runner.os == 'Windows'
+        run: cargo test -p vfawn --test windows_e2e -- --ignored --exact --nocapture
+
       # Route backend contract tests need root for netlink and dummy links.
       - name: route backend tests (root)
         if: runner.os == 'Linux'
