@@ -38,6 +38,17 @@ jobs:
       - name: clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+      # The workspace build unifies features (vfawn-bin always pulls
+      # backend-native), so each engine alone is never compiled unless
+      # asked for by name. A backend module that drifts to depend on
+      # the other engine's gate breaks the solo configuration silently.
+      - name: solo feature configurations
+        if: runner.os == 'Linux'
+        run: |
+          cargo check -p vfawn-stack-user
+          cargo check -p vfawn-stack-user --features backend-ipstack
+          cargo check -p vfawn-stack-user --features backend-native
+
       - name: test
         run: cargo test --workspace
 

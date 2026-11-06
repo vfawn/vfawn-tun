@@ -29,6 +29,7 @@ pub mod native_backend;
 pub mod native_tcp;
 #[cfg(feature = "backend-native")]
 pub mod shards;
+#[cfg(feature = "backend-native")]
 pub mod udp_slot;
 
 #[cfg(feature = "backend-ipstack")]
