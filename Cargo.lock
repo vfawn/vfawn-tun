@@ -1370,6 +1370,7 @@ dependencies = [
  "vfawn-core",
  "vfawn-device",
  "vfawn-platform",
+ "vfawn-route",
  "vfawn-stack-user",
  "vfawn-testsuite",
  "vfawn-wire",
