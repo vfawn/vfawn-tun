@@ -1,0 +1,7 @@
+The wintun.dll binaries in this directory are unmodified copies of the
+WireGuard LLC Wintun driver userspace library
+(https://www.wintun.net/), distributed under the Apache License 2.0
+(see LICENSE in this directory), embedded here per architecture so the
+library needs no external file deployment. The bindings the device
+layer loads through are tun-rs's; this directory is only the driver
+library itself.

@@ -17,13 +17,46 @@
 use std::io;
 
 use bytes::BytesMut;
-use std::os::fd::{AsRawFd, RawFd};
+// The protect callback takes the platform's own socket descriptor: a
+// file descriptor on Unix, a socket handle on Windows. The hook's
+// contract is the platform's notion of "the socket", not ours.
+#[cfg(unix)]
+use std::os::fd::RawFd;
+#[cfg(windows)]
+use std::os::windows::io::RawSocket as RawFd;
 use std::sync::Arc;
 use vfawn_core::{FlowInfo, IcmpPacket, Network, SessionHandler, TcpSession, UdpSession, Verdict};
 
 /// Protects an outbound socket from being captured back into the
 /// device that spawned its session.
 pub type Protect = Arc<dyn Fn(RawFd) -> io::Result<()> + Send + Sync>;
+
+/// The dial-time socket as the protect hook sees it, by the platform's
+/// own descriptor notion.
+#[cfg(unix)]
+fn raw_descriptor_of(socket: &socket2::Socket) -> RawFd {
+    use std::os::fd::AsRawFd;
+    socket.as_raw_fd()
+}
+
+#[cfg(windows)]
+fn raw_descriptor_of(socket: &socket2::Socket) -> RawFd {
+    use std::os::windows::io::AsRawSocket;
+    socket.as_raw_socket()
+}
+
+/// The UDP session's socket under the same contract.
+#[cfg(unix)]
+fn udp_raw_descriptor(socket: &tokio::net::UdpSocket) -> RawFd {
+    use std::os::fd::AsRawFd;
+    socket.as_raw_fd()
+}
+
+#[cfg(windows)]
+fn udp_raw_descriptor(socket: &tokio::net::UdpSocket) -> RawFd {
+    use std::os::windows::io::AsRawSocket;
+    socket.as_raw_socket()
+}
 
 async fn dial_tcp(
     protect: &Option<Protect>,
@@ -36,7 +69,7 @@ async fn dial_tcp(
     };
     let socket = socket2::Socket::new(domain, socket2::Type::STREAM, Some(socket2::Protocol::TCP))?;
     if let Some(protect) = protect {
-        protect(socket.as_raw_fd())?;
+        protect(raw_descriptor_of(&socket))?;
     }
     // The blocking connect off the async workers: the socket keeps the
     // device binding across it, and the result returns to async land.
@@ -101,6 +134,7 @@ impl SessionHandler for RelayHandler {
         // connection (removed on return from this function).
         #[cfg(all(feature = "backend-native", target_os = "linux"))]
         {
+            use std::os::fd::AsRawFd;
             let flow = session.flow();
             if let Some(key) = relay_flow_key(flow) {
                 let fd = outbound.as_raw_fd();
@@ -194,7 +228,7 @@ impl SessionHandler for RelayHandler {
             return;
         };
         if let Some(protect) = &self.protect
-            && protect(socket.as_raw_fd()).is_err()
+            && protect(udp_raw_descriptor(&socket)).is_err()
         {
             return;
         }

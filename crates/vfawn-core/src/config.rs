@@ -16,7 +16,14 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::ops::RangeInclusive;
-use std::os::fd::RawFd;
+/// The host-supplied socket descriptor in the hook contracts: a file
+/// descriptor on Unix, a socket handle on Windows. The hook applies to
+/// whatever the host dials with; the type follows the platform's own
+/// notion of "the thing a socket is".
+#[cfg(unix)]
+pub type RawFd = std::os::fd::RawFd;
+#[cfg(windows)]
+pub type RawFd = std::os::windows::io::RawSocket;
 use std::sync::Arc;
 use std::time::Duration;
 

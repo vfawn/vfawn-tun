@@ -430,6 +430,7 @@ impl TcpSlot {
     /// place that can wait out the socket's pressure. Without a
     /// session (the flow folded after teardown), nobody downstream
     /// wants them and the accumulator just empties.
+    #[cfg(target_os = "linux")]
     fn fold_back_to_session(&mut self, bytes: &[u8]) {
         if bytes.is_empty() {
             return;
@@ -477,20 +478,27 @@ impl SlotLogic for TcpSlot {
         // machine up before any acceptance test reads its cursor, or
         // the first slow-path segment after a fast burst (a window
         // update, a teardown) looks out of order against stale state.
-        let lane = crate::splice_lane::SpliceLane::global();
-        let entry = lane.entry_for(&self.flow_key);
-        // The catch-up does not wait for the entry's activation: an
-        // inactive entry (deactivated under outbound pressure) with a
-        // machine behind the shared cursor is exactly the window where
-        // a retransmission of already-claimed bytes re-delivered —
-        // the dispatch had written them and acknowledged them, the
-        // machine never learned, the slot's fast path wrote them
-        // again, and the server read a duplicated stream. Adopting
-        // the wire's position whenever the flow rides the lane closes
-        // the hole for every entry state.
-        if let Some(entry) = &entry {
-            self.connection.catchup_recv(entry.recv_nxt_value());
-        }
+        // The lane is the Linux fast path's registry; where it does
+        // not exist, the slow path below is the whole story.
+        #[cfg(target_os = "linux")]
+        let entry = {
+            let lane = crate::splice_lane::SpliceLane::global();
+            let entry = lane.entry_for(&self.flow_key);
+            // The catch-up does not wait for the entry's activation:
+            // an inactive entry (deactivated under outbound pressure)
+            // with a machine behind the shared cursor is exactly the
+            // window where a retransmission of already-claimed bytes
+            // re-delivered — the dispatch had written them and
+            // acknowledged them, the machine never learned, the slot's
+            // fast path wrote them again, and the server read a
+            // duplicated stream. Adopting the wire's position whenever
+            // the flow rides the lane closes the hole for every entry
+            // state.
+            if let Some(entry) = &entry {
+                self.connection.catchup_recv(entry.recv_nxt_value());
+            }
+            entry
+        };
 
         // The payload fast path: a registered relay flow's steady data
         // segment skips the session channel and the relay task
@@ -500,6 +508,7 @@ impl SlotLogic for TcpSlot {
         // is the bootstrap segment (before the entry activates for
         // the read dispatch) or a dispatch fallback — outbound
         // backpressure or a contested TUN channel.
+        #[cfg(target_os = "linux")]
         if let Some(entry) = &entry
             && self.connection.fast_acceptable(&inbound)
         {
@@ -670,6 +679,7 @@ impl SlotLogic for TcpSlot {
         // FIN, window arithmetic), so the view re-syncs here. A stale
         // view costs only hit rate — the dispatch declines, the next
         // segment rides this same path — never correctness.
+        #[cfg(target_os = "linux")]
         if let Some(entry) = &entry
             && entry.is_active()
         {
@@ -1154,13 +1164,16 @@ impl StackBackend for NativeBackend {
         // producer, ring, and shard crossings the slow path pays per
         // segment become none, and the answers leave through the
         // device's own write path at the end of the read batch.
-        let lane = crate::splice_lane::SpliceLane::global();
-        device.set_read_dispatch(vfawn_core::device::ReadDispatch {
-            claim: Arc::new(|packet: &[u8], produced: &mut Vec<BytesMut>| {
-                lane.try_dispatch(packet, produced)
-            }),
-            finish: Arc::new(|| lane.flush_staged()),
-        });
+        #[cfg(target_os = "linux")]
+        {
+            let lane = crate::splice_lane::SpliceLane::global();
+            device.set_read_dispatch(vfawn_core::device::ReadDispatch {
+                claim: Arc::new(|packet: &[u8], produced: &mut Vec<BytesMut>| {
+                    lane.try_dispatch(packet, produced)
+                }),
+                finish: Arc::new(|| lane.flush_staged()),
+            });
+        }
 
         let (sessions_tx, sessions_rx) = mpsc::sync_channel::<SessionHandoff>(1024);
         let (udp_tx, udp_rx) = mpsc::sync_channel::<crate::udp_slot::UdpHandoff>(1024);

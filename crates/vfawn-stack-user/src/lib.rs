@@ -47,7 +47,7 @@ pub use icmp::{ECHO_REPLY, ECHO_REQUEST, IcmpTable, IcmpVerdict, TIME_EXCEEDED, 
 #[cfg(feature = "backend-native")]
 pub use icmp_slot::IcmpSlot;
 #[cfg(feature = "backend-native")]
-#[cfg(feature = "backend-native")]
+#[cfg(all(feature = "backend-native", target_os = "linux"))]
 pub mod splice_lane;
 #[cfg(feature = "backend-ipstack")]
 pub use ipstack_backend::IpstackBackend;

@@ -28,9 +28,8 @@
 //! moment of the dial; this module takes it as a parameter and stays
 //! free of platform code.
 
-use crate::config::OutboundFdHook;
+use crate::config::{OutboundFdHook, RawFd};
 use std::io;
-use std::os::fd::RawFd;
 
 /// Apply the outbound policy to one socket.
 ///
@@ -49,7 +48,7 @@ use std::os::fd::RawFd;
 /// use vfawn_core::{OutboundFdHook, outbound};
 /// use std::io;
 ///
-/// # fn jni_protect(_fd: std::os::fd::RawFd) -> io::Result<()> { Ok(()) }
+/// # fn jni_protect(_fd: vfawn_core::config::RawFd) -> io::Result<()> { Ok(()) }
 /// // Android shape: the callback crosses into the JVM and calls
 /// // VpnService.protect(fd) on a thread attached to it. The JNI call
 /// // itself is host territory; this closure is the whole contract.
@@ -57,7 +56,7 @@ use std::os::fd::RawFd;
 ///     move |fd| jni_protect(fd),
 /// ));
 /// // The no-op variant always succeeds and touches nothing.
-/// assert!(outbound::apply(&OutboundFdHook::None, -1, None).is_ok());
+/// assert!(outbound::apply(&OutboundFdHook::None, 0, None).is_ok());
 /// ```
 pub fn apply(hook: &OutboundFdHook, fd: RawFd, default_interface: Option<&str>) -> io::Result<()> {
     match hook {
@@ -140,35 +139,60 @@ fn bind_to_interface(_fd: RawFd, _interface: Option<&str>) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::fd::RawFd;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicI32, Ordering};
+    use std::sync::atomic::{AtomicIsize, Ordering};
+
+    /// A descriptor no syscall would accept, by the platform's own
+    /// notion of one: a negative file descriptor on Unix, an odd
+    /// handle on Windows (real handles are even and nonzero).
+    fn unusable_descriptor() -> RawFd {
+        #[cfg(unix)]
+        {
+            -1
+        }
+        #[cfg(windows)]
+        {
+            3
+        }
+    }
 
     #[test]
     fn none_touches_nothing() {
-        // A negative fd would fail any real syscall; success here
-        // proves the variant never reaches one.
-        assert!(apply(&OutboundFdHook::None, -1, None).is_ok());
+        // An unusable descriptor would fail any real syscall; success
+        // here proves the variant never reaches one.
+        assert!(apply(&OutboundFdHook::None, unusable_descriptor(), None).is_ok());
     }
 
     #[test]
     fn host_callback_sees_the_fd_and_its_errors() {
-        let seen = Arc::new(AtomicI32::new(-1));
+        let seen = Arc::new(AtomicIsize::new(-1));
         let recorder = {
             let seen = Arc::clone(&seen);
             move |fd: RawFd| -> io::Result<()> {
-                seen.store(fd, Ordering::SeqCst);
+                seen.store(fd as isize, Ordering::SeqCst);
                 Ok(())
             }
         };
-        assert!(apply(&OutboundFdHook::HostCallback(Arc::new(recorder)), 7, None).is_ok());
-        assert_eq!(seen.load(Ordering::SeqCst), 7);
+        let probe = unusable_descriptor();
+        assert!(
+            apply(
+                &OutboundFdHook::HostCallback(Arc::new(recorder)),
+                probe,
+                None
+            )
+            .is_ok()
+        );
+        assert_eq!(seen.load(Ordering::SeqCst), probe as isize);
 
         let failing = |_: RawFd| -> io::Result<()> {
             Err(io::Error::new(io::ErrorKind::PermissionDenied, "denied"))
         };
-        let err = apply(&OutboundFdHook::HostCallback(Arc::new(failing)), 7, None)
-            .expect_err("callback error must propagate");
+        let err = apply(
+            &OutboundFdHook::HostCallback(Arc::new(failing)),
+            probe,
+            None,
+        )
+        .expect_err("callback error must propagate");
         assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
     }
 
@@ -177,7 +201,12 @@ mod tests {
         // Not a silent skip: the caller must learn the escape did not
         // happen. On non-Linux the same call reports Unsupported, which
         // this test also pins.
-        let err = apply(&OutboundFdHook::BindDefaultIface, -1, None).expect_err("must fail");
+        let err = apply(
+            &OutboundFdHook::BindDefaultIface,
+            unusable_descriptor(),
+            None,
+        )
+        .expect_err("must fail");
         assert!(
             err.kind() == io::ErrorKind::InvalidInput || err.kind() == io::ErrorKind::Unsupported
         );
