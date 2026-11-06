@@ -72,7 +72,7 @@ jobs:
       # leaves nothing behind.
       - name: windows e2e (admin)
         if: runner.os == 'Windows'
-        run: cargo test -p vfawn --test windows_e2e -- --ignored --exact --nocapture
+        run: cargo test -p vfawn --features backend-native --test windows_e2e -- --ignored --exact --nocapture
 
       # Route backend contract tests need root for netlink and dummy links.
       - name: route backend tests (root)

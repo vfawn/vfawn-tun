@@ -249,11 +249,15 @@ pub fn desired_from_config(params: &RouteParams<'_>) -> DesiredState {
         interface: Some(interface.to_string()),
         metric: 0,
     });
-    // One route per captured prefix.
+    // One route per captured prefix, with the host bits masked away:
+    // the model's IpNet tolerates them, kernels do not, and a
+    // configuration that names the tunnel by its own address
+    // ("198.18.0.1/15") is too natural to refuse at the door.
     for prefix in captured {
         routes.push(RouteEntry {
             table: table_index,
-            destination: *prefix,
+            destination: ipnet::IpNet::new(prefix.network(), prefix.prefix_len())
+                .unwrap_or(*prefix),
             gateway: None,
             interface: Some(interface.to_string()),
             metric: 0,

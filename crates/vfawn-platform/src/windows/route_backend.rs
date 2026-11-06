@@ -122,7 +122,7 @@ impl WindowsRouteBackend {
             let mut row: MIB_IPFORWARD_ROW2 = std::mem::zeroed();
             InitializeIpForwardEntry(&mut row);
             row.InterfaceIndex = index;
-            row.DestinationPrefix.Prefix = sockaddr_of(&entry.destination.addr());
+            row.DestinationPrefix.Prefix = sockaddr_of(&network_of(entry));
             row.DestinationPrefix.PrefixLength = entry.destination.prefix_len();
             row.NextHop = match entry.gateway {
                 Some(gateway) => sockaddr_of(&gateway),
@@ -157,7 +157,7 @@ impl WindowsRouteBackend {
             let mut row: MIB_IPFORWARD_ROW2 = std::mem::zeroed();
             InitializeIpForwardEntry(&mut row);
             row.InterfaceIndex = index;
-            row.DestinationPrefix.Prefix = sockaddr_of(&entry.destination.addr());
+            row.DestinationPrefix.Prefix = sockaddr_of(&network_of(entry));
             row.DestinationPrefix.PrefixLength = entry.destination.prefix_len();
             row.NextHop = match entry.gateway {
                 Some(gateway) => sockaddr_of(&gateway),
@@ -304,6 +304,13 @@ unsafe fn friendly_name(pointer: windows_sys::core::PWSTR) -> String {
         }
         String::from_utf16_lossy(std::slice::from_raw_parts(pointer, length))
     }
+}
+
+/// The entry's destination as the kernel wants it: a prefix carries
+/// no host bits, and the model's IpNet tolerates them, so the
+/// platform boundary masks on the way in.
+fn network_of(entry: &RouteEntry) -> IpAddr {
+    entry.destination.network()
 }
 
 /// A prefix length as an address mask.

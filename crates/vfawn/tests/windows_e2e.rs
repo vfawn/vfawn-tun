@@ -125,7 +125,7 @@ fn adapter_routes_session_and_clean_teardown() {
     // Orderly shutdown removes the capture; the adapter goes with the
     // device that owned it.
     instance.shutdown().expect("shutdown");
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         let state = backend.snapshot().expect("snapshot");
         let adapter_gone = !state

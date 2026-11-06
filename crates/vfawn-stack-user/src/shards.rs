@@ -579,6 +579,15 @@ impl Shards {
                             Err(_) => break,
                         }
                     }
+                    // The loop is over, by stop or by device error, and
+                    // the I/O thread may be parked on the device's
+                    // read with no packet coming to wake it. The
+                    // shutdown call is that knock: the parked read
+                    // returns, the I/O thread drops the device it
+                    // owns, and the interface leaves with it — an
+                    // adapter that outlives its pipeline is residue a
+                    // later create would only have to recover from.
+                    let _ = device.shutdown();
                 })
                 .expect("spawn producer"),
         );
