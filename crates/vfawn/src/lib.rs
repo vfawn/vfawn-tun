@@ -31,7 +31,6 @@ pub mod echo;
 pub mod instance;
 pub mod relay;
 
-#[cfg(target_os = "linux")]
 pub mod route_orchestration;
 
 pub use instance::{Instance, RestartReason, StatsSnapshot};

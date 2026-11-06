@@ -3,3 +3,9 @@
 
 //! Windows backend: wintun device access, iphlpapi for interfaces and routes,
 //! and firewall rules through the INetFwPolicy2 COM interface.
+
+pub mod monitor;
+pub mod route_backend;
+
+pub use monitor::NetworkMonitor;
+pub use route_backend::WindowsRouteBackend;

@@ -58,7 +58,6 @@ pub struct Instance {
     handle: Option<StackHandle>,
     panics: Arc<AtomicU64>,
     reconciler: Option<Reconciler>,
-    #[cfg(target_os = "linux")]
     orchestration: Option<crate::route_orchestration::RouteOrchestration>,
 }
 
@@ -79,7 +78,6 @@ impl Instance {
             handle: None,
             panics: Arc::new(AtomicU64::new(0)),
             reconciler: None,
-            #[cfg(target_os = "linux")]
             orchestration: None,
         })
     }
@@ -207,7 +205,6 @@ impl Instance {
         // Route orchestration installs after the device exists (rules
         // and addresses reference its real name) and before traffic
         // flows (the capture must already own the routing table).
-        #[cfg(target_os = "linux")]
         if self.config.route.auto_route {
             let interface = device.name()?;
             let addresses: Vec<ipnet::IpNet> = self

@@ -24,6 +24,10 @@ use std::sync::RwLock;
 use vfawn_core::VfawnConfig;
 #[cfg(target_os = "linux")]
 use vfawn_platform::linux::{NetlinkBackend, NetworkMonitor};
+#[cfg(target_os = "macos")]
+use vfawn_platform::macos::{DarwinRouteBackend, NetworkMonitor};
+#[cfg(target_os = "windows")]
+use vfawn_platform::windows::{NetworkMonitor, WindowsRouteBackend};
 use vfawn_route::{AutoReconciler, DesiredState, Reconciler, RouteParams, desired_from_config};
 
 /// The installed capture: desired state, reconciler, and the self-heal
@@ -47,17 +51,16 @@ impl RouteOrchestration {
         #[cfg(target_os = "linux")]
         let backend = Arc::new(NetlinkBackend::new()?);
         #[cfg(target_os = "macos")]
-        let backend = Arc::new(vfawn_platform::macos::DarwinRouteBackend::new());
+        let backend = Arc::new(DarwinRouteBackend::new());
+        #[cfg(target_os = "windows")]
+        let backend = Arc::new(WindowsRouteBackend::new());
         let reconciler = Arc::new(Reconciler::new(backend));
         reconciler
             .apply(&desired)
             .map_err(|e| std::io::Error::other(e.to_string()))?;
 
         let shared = Arc::new(RwLock::new(desired));
-        #[cfg(target_os = "linux")]
         let mut monitor = NetworkMonitor::start()?;
-        #[cfg(target_os = "macos")]
-        let mut monitor = NetworkMonitor::start()?; // darwin reuses the poll shape
         // Taking the receiver starts nothing on its own; the loop below
         // is what drains it, and a monitor without a reader would drop
         // events on a full channel.

@@ -20,8 +20,6 @@ bytes.workspace = true
 vfawn-stack-user = { path = "../vfawn-stack-user", optional = true }
 vfawn-route = { path = "../vfawn-route" }
 vfawn-wire = { path = "../vfawn-wire", optional = true }
-
-[target.'cfg(target_os = "linux")'.dependencies]
 vfawn-platform = { path = "../vfawn-platform" }
 
 [features]
