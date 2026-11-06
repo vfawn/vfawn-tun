@@ -18,7 +18,12 @@ mod linux;
 #[cfg(target_os = "linux")]
 pub use linux::TunDevice;
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "macos")]
+mod darwin;
+#[cfg(target_os = "macos")]
+pub use darwin::TunDevice;
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 mod pending;
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub use pending::TunDevice;
