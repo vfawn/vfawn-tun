@@ -772,7 +772,7 @@ mod tests {
         assert!(!lane.try_dispatch(&packet, &mut staged));
 
         let entry = lane.entry_for(&key).expect("registered");
-        entry.activate(500, 900, 65535);
+        entry.activate(500, 900, 65535, None);
 
         // In-order current segment: claimed, cursor advanced, the
         // payload staged (nothing on the socket yet — the batch has
@@ -843,6 +843,64 @@ mod tests {
         lane.unregister(&key);
         assert!(lane.entry_for(&key).is_none());
         assert!(!lane.try_dispatch(&packet, &mut staged));
+        // SAFETY: both test sockets are ours to close.
+        #[expect(unsafe_code)]
+        unsafe {
+            libc::close(fds[0]);
+            libc::close(fds[1]);
+        }
+    }
+
+    #[test]
+    fn arming_marks_when_the_cursors_become_the_wires_word() {
+        // A fresh registration knows only the fd: its cursor is the
+        // constructor's zero, and the catch-up must not treat that as
+        // the wire's position — adopting it once wiped a machine's
+        // true receive cursor whenever the client's ISN lived in the
+        // upper half of sequence space (the zero looks forward from
+        // there by less than half the space). Activation is what
+        // makes the cursor speak, and a later deactivation (an
+        // outbound write refused under pressure) does not unsay it:
+        // the bytes the dispatch claimed and acknowledged before the
+        // pressure are still the wire's truth.
+        let lane = SpliceLane::new();
+        let key = FlowKey {
+            src: IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 2)),
+            src_port: 44444,
+            dst: IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 1)),
+            dst_port: 443,
+            protocol: IpProtocol::Tcp,
+        };
+        let mut fds = [0i32; 2];
+        // SAFETY: socketpair(2) fills the array with two live fds this
+        // test owns.
+        #[expect(unsafe_code)]
+        unsafe {
+            assert_eq!(
+                libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()),
+                0
+            );
+        }
+        lane.register(key, fds[0]);
+        let entry = lane.entry_for(&key).expect("registered");
+        assert!(
+            !entry.cursor_armed(),
+            "a registration alone arms nothing"
+        );
+        assert_eq!(entry.recv_nxt_value(), 0);
+
+        entry.activate(500, 900, 65535, None);
+        assert!(entry.cursor_armed());
+        assert_eq!(entry.recv_nxt_value(), 500);
+
+        entry.deactivate();
+        assert!(
+            entry.cursor_armed(),
+            "deactivation keeps the cursor's word"
+        );
+        assert_eq!(entry.recv_nxt_value(), 500);
+
+        lane.unregister(&key);
         // SAFETY: both test sockets are ours to close.
         #[expect(unsafe_code)]
         unsafe {
