@@ -25,6 +25,11 @@ use vfawn_wire::protocol::IpProtocol;
 
 /// Echo request (RFC 792).
 pub const ECHO_REQUEST: u8 = 8;
+
+/// ICMPv6's echo pair (RFC 4443 §2): the numbers moved when ICMP
+/// grew an address family.
+pub const ECHO6_REQUEST: u8 = 128;
+pub const ECHO6_REPLY: u8 = 129;
 /// Echo reply (RFC 792).
 pub const ECHO_REPLY: u8 = 0;
 /// Destination unreachable (RFC 792).
@@ -119,6 +124,15 @@ pub fn classify(packet: &IcmpPacket) -> IcmpVerdict {
                 None => IcmpVerdict::Ignore,
             }
         }
+        ECHO6_REQUEST => {
+            let Some((identifier, _seq)) = echo_identity(packet.payload()) else {
+                return IcmpVerdict::Ignore;
+            };
+            match build_echo_reply_v6(packet, identifier) {
+                Some(frame) => IcmpVerdict::EchoReply(frame),
+                None => IcmpVerdict::Ignore,
+            }
+        }
         UNREACHABLE => {
             let (victim, code) = quoted_flow(packet.payload());
             (victim, code).into()
@@ -185,6 +199,38 @@ fn build_echo_reply(packet: &IcmpPacket, _identifier: u16) -> Option<Vec<u8>> {
         src,
         IpProtocol::Icmp,
         ttl - 1,
+        &replied,
+    ))
+}
+
+/// Build the ICMPv6 echo reply (RFC 4443 §2): the type flips to 129
+/// and the checksum is recomputed over the pseudo-header — mandatory
+/// in v6, unlike the v4 message-only sum. The answer is a whole v6
+/// frame toward the requester, one hop of budget spent.
+fn build_echo_reply_v6(packet: &IcmpPacket, _identifier: u16) -> Option<Vec<u8>> {
+    let flow = packet.flow();
+    let (src, dst) = match (flow.source.ip(), flow.destination.ip()) {
+        (std::net::IpAddr::V6(src), std::net::IpAddr::V6(dst)) => (src, dst),
+        _ => return None, // v6 replies are for v6 askers
+    };
+    let hop = packet.ttl();
+    if hop == 0 {
+        return None; // spent on arrival; silence, as the v4 path
+    }
+    let message = packet.payload();
+    let mut replied = Vec::with_capacity(message.len());
+    replied.extend_from_slice(message);
+    replied[0] = ECHO6_REPLY;
+    replied[2..4].copy_from_slice(&[0, 0]);
+    let sum =
+        vfawn_wire::checksum::pseudo_header_v6(src, dst, IpProtocol::Icmpv6, replied.len() as u32)
+            + vfawn_wire::checksum::sum_words(&replied);
+    replied[2..4].copy_from_slice(&(!vfawn_wire::checksum::fold(sum)).to_be_bytes());
+    Some(vfawn_wire::emit::ipv6_frame_v6(
+        dst,
+        src,
+        IpProtocol::Icmpv6,
+        hop - 1,
         &replied,
     ))
 }

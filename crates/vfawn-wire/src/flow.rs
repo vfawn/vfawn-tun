@@ -125,7 +125,7 @@ fn transport_key(src: IpAddr, dst: IpAddr, protocol: IpProtocol, bytes: &[u8]) -
         // identifier) hash to one slot. Other ICMP messages share the
         // zero identifier, which is exactly the "one datagram flow per
         // address pair" the datagram slot wants.
-        IpProtocol::Icmp => {
+        IpProtocol::Icmp | IpProtocol::Icmpv6 => {
             let identifier =
                 u16::from_be_bytes([*bytes.get(4).unwrap_or(&0), *bytes.get(5).unwrap_or(&0)]);
             (identifier, 0)

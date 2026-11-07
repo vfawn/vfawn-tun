@@ -19,6 +19,15 @@ use vfawn_wire::protocol::IpProtocol;
 use crate::icmp::{ECHO_REQUEST, IcmpTable, IcmpVerdict};
 use crate::shards::{BufferPool, SlotLogic};
 
+/// The asking packet's hop budget, by family: one field, two homes.
+fn hop_budget(packet: &[u8]) -> u8 {
+    match packet.first().map(|byte| byte >> 4) {
+        Some(4) => packet.get(8).copied().unwrap_or(0),
+        Some(6) => packet.get(7).copied().unwrap_or(0),
+        _ => 0,
+    }
+}
+
 /// Everything an ICMP slot needs: the host's judgment, the echo
 /// ledger, and the lane error reports ride to reach it (a session
 /// thread per datagram would be absurd; the correlation lands on the
@@ -54,16 +63,45 @@ impl SlotLogic for IcmpSlot {
         _pool: &BufferPool,
         _mtu: usize,
     ) {
-        let Ok((ip, payload)) = Ipv4Header::parse(packet) else {
-            return;
-        };
-        if ip.protocol != IpProtocol::Icmp || payload.len() < 8 {
-            return;
-        }
-        let flow = FlowInfo {
-            network: Network::Icmp,
-            source: std::net::SocketAddr::new(std::net::IpAddr::V4(ip.src), 0),
-            destination: std::net::SocketAddr::new(std::net::IpAddr::V4(ip.dst), 0),
+        // Both families' ICMP reaches here; the branch decides the
+        // addresses and the rest is family-blind.
+        let (flow, payload) = match packet.first().map(|byte| byte >> 4) {
+            Some(4) => {
+                let Ok((ip, payload)) = Ipv4Header::parse(packet) else {
+                    return;
+                };
+                if ip.protocol != IpProtocol::Icmp || payload.len() < 8 {
+                    return;
+                }
+                (
+                    FlowInfo {
+                        network: Network::Icmp,
+                        source: std::net::SocketAddr::new(std::net::IpAddr::V4(ip.src), 0),
+                        destination: std::net::SocketAddr::new(std::net::IpAddr::V4(ip.dst), 0),
+                    },
+                    payload,
+                )
+            }
+            Some(6) => {
+                let Ok((ip, rest)) = vfawn_wire::ipv6::Ipv6Header::parse(packet) else {
+                    return;
+                };
+                let Ok(payload) = vfawn_wire::ipv6::V6Payload::walk(ip.next_header, rest) else {
+                    return;
+                };
+                if payload.protocol != IpProtocol::Icmpv6 || payload.bytes.len() < 8 {
+                    return;
+                }
+                (
+                    FlowInfo {
+                        network: Network::Icmp,
+                        source: std::net::SocketAddr::new(std::net::IpAddr::V6(ip.src), 0),
+                        destination: std::net::SocketAddr::new(std::net::IpAddr::V6(ip.dst), 0),
+                    },
+                    payload.bytes,
+                )
+            }
+            _ => return,
         };
         // The host judges datagram flows once each; a datagram has no
         // handshake to defer to.
@@ -83,13 +121,13 @@ impl SlotLogic for IcmpSlot {
             payload[1],
             bytes::Bytes::copy_from_slice(payload),
         )
-        .with_ttl(ip.ttl);
+        .with_ttl(hop_budget(packet));
         match crate::icmp::classify(&icmp) {
             IcmpVerdict::EchoReply(frame) => {
-                if icmp.kind() == ECHO_REQUEST {
+                if icmp.kind() == ECHO_REQUEST || icmp.kind() == crate::icmp::ECHO6_REQUEST {
                     self.table.on_echo_request(
                         icmp.flow().source,
-                        std::net::IpAddr::V4(ip.dst),
+                        icmp.flow().destination.ip(),
                         u16::from_be_bytes([payload[4], payload[5]]),
                     );
                 }

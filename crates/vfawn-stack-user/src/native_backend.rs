@@ -1225,8 +1225,9 @@ impl StackBackend for NativeBackend {
                 })
                 .unwrap_or_else(|| Arc::new(ShardBell::new()));
             // ICMP flows ride the datagram slot: echo answered in
-            // place, errors correlated, no connection to hold.
-            if flow.protocol == IpProtocol::Icmp {
+            // place, errors correlated, no connection to hold — both
+            // families, the kinds tell them apart.
+            if flow.protocol == IpProtocol::Icmp || flow.protocol == IpProtocol::Icmpv6 {
                 return Box::new(crate::icmp_slot::IcmpSlot::new(
                     Arc::clone(&icmp_handler),
                     Arc::clone(&icmp_table_for_slots),
