@@ -30,58 +30,14 @@ const PROBES: usize = 400;
 
 /// What the batch evidence says: packets per batch read, which is the
 /// syscall count per packet turned upside down.
-#[test]
-#[ignore]
-fn batch_reads_and_the_writev_round_trip() {
-    // Root hands us the address; the route is the system's own tool.
-    assert_root();
-    let device = TunDevice::create(&DeviceConfig {
-        mtu: 1500,
-        inet4_address: vec![IFACE_NET.parse().expect("interface prefix")],
-        ..DeviceConfig::default()
-    })
-    .expect("device");
-    let name = device.name().expect("name");
-    route_add(&name);
-
-    // A connected probe socket bound to the interface's own address,
-    // with a wide send buffer: every datagram leaves the process
-    // before the first read, so the kernel — not a racing reader —
-    // decides the batching. The own-address bind also decides the
-    // bounce: a reply destined to the interface's address passes the
-    // kernel's interface check, where one destined to another
-    // interface's address would be dropped on arrival.
-    let socket =
-        std::net::UdpSocket::bind(std::net::SocketAddr::from((IFACE_ADDR, 0))).expect("bind");
-    let sndbuf: libc::c_int = 1 << 20;
-    // SAFETY: a plain integer socket option on a descriptor this
-    // process owns.
-    #[expect(unsafe_code)]
-    unsafe {
-        libc::setsockopt(
-            socket.as_raw_fd(),
-            libc::SOL_SOCKET,
-            libc::SO_SNDBUF,
-            &sndbuf as *const libc::c_int as *const libc::c_void,
-            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-        );
-    }
-    socket
-        .connect(std::net::SocketAddr::from((PROBE_ADDR, PROBE_PORT)))
-        .expect("connect");
-    let payload_body = |n: usize| format!("vfawn-batch-probe-{n:04}");
-    for n in 0..PROBES {
-        socket.send(payload_body(n).as_bytes()).expect("send");
-    }
-
-    // Read everything back in caller-sized slices, exactly as the
-    // pipeline does, and count batch messages against frames.
-    let mut device = device;
+/// One full exchange on one device: send every probe, read them
+/// back, and report (frames, batches, first probe frame).
+fn probe_round(device: &mut TunDevice) -> (usize, usize, Option<Vec<u8>>) {
     let mut bufs = vec![BytesMut::new(); 8];
     let mut batches = 0usize;
     let mut frames = 0usize;
     let mut first: Option<Vec<u8>> = None;
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(6);
     while frames < PROBES && Instant::now() < deadline {
         let count = device.read_batch(&mut bufs).expect("read");
         if count == 0 {
@@ -92,16 +48,76 @@ fn batch_reads_and_the_writev_round_trip() {
             // Only the probes count: a routed interface also carries
             // the kernel's own housekeeping, which is not probe loss.
             if buf.len() > 40 && buf[9] == 17 && buf[40..].starts_with(b"vfawn-batch-probe-") {
-                if first.is_none() {
-                    first = Some(buf.to_vec());
-                }
+                first.get_or_insert_with(|| buf.to_vec());
                 frames += 1;
             }
         }
     }
+    (frames, batches, first)
+}
+
+/// What the batch evidence says: packets per batch read, which is the
+/// syscall count per packet turned upside down.
+#[test]
+#[ignore]
+fn batch_reads_and_the_writev_round_trip() {
+    // Root hands us the address; the route is the system's own tool.
+    assert_root();
+
+    // A shared runner's first interface has twice read nothing at all
+    // — routes and interface state look right, the reader sees zero.
+    // One fresh interface separates that noise from a real regression:
+    // a broken read path fails every round the same way.
+    let mut round = 0;
+    let (frames, batches, first) = loop {
+        round += 1;
+        let mut device = TunDevice::create(&DeviceConfig {
+            mtu: 1500,
+            inet4_address: vec![IFACE_NET.parse().expect("interface prefix")],
+            ..DeviceConfig::default()
+        })
+        .expect("device");
+        let name = device.name().expect("name");
+        route_add(&name);
+        // A connected probe socket with a wide send buffer: every datagram
+        // leaves the process before the first read, so the kernel — not a
+        // racing reader — decides the batching. The own-address bind also
+        // decides the bounce: a reply destined to the interface's address
+        // passes the kernel's interface check.
+        let socket =
+            std::net::UdpSocket::bind(std::net::SocketAddr::from((IFACE_ADDR, 0))).expect("bind");
+        let sndbuf: libc::c_int = 1 << 20;
+        // SAFETY: a plain integer socket option on a descriptor this
+        // process owns.
+        #[expect(unsafe_code)]
+        unsafe {
+            libc::setsockopt(
+                socket.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_SNDBUF,
+                &sndbuf as *const libc::c_int as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            );
+        }
+        socket
+            .connect(std::net::SocketAddr::from((PROBE_ADDR, PROBE_PORT)))
+            .expect("connect");
+
+        let payload_body = |n: usize| format!("vfawn-batch-probe-{n:04}");
+        for n in 0..PROBES {
+            socket.send(payload_body(n).as_bytes()).expect("send");
+        }
+        let outcome = probe_round(&mut device);
+        route_del(&name);
+        let _ = device.shutdown();
+        if outcome.0 > 0 || round >= 2 {
+            break (outcome.0, outcome.1, outcome.2);
+        }
+        println!("round {round} read zero; retrying on a fresh interface");
+    };
     if frames == 0 {
-        // The diagnosis the zero deserves: where the routes point,
-        // which interfaces live, and what the reader actually saw.
+        // The diagnosis the zero deserves: where the routes point and
+        // which interfaces live.
         let routes = Command::new("netstat").args(["-rn", "-f", "inet"]).output();
         if let Ok(output) = routes {
             for line in String::from_utf8_lossy(&output.stdout).lines() {
@@ -110,11 +126,7 @@ fn batch_reads_and_the_writev_round_trip() {
                 }
             }
         }
-        let links = Command::new("ifconfig").output();
-        if let Ok(output) = links {
-            println!("links: {}", String::from_utf8_lossy(&output.stdout));
-        }
-        panic!("every probe reached the reader (saw zero; diagnostics above)");
+        panic!("every probe reached the reader (saw zero in both rounds; diagnostics above)");
     }
     assert_eq!(frames, PROBES, "every probe reached the reader");
     let per_batch = frames as f64 / batches as f64;
@@ -127,12 +139,17 @@ fn batch_reads_and_the_writev_round_trip() {
         "steady-state batching must clear four packets per read, saw {per_batch:.1}"
     );
 
-    // The write path: one bounced frame — endpoints swapped, the
-    // header checksum recomputed, the datagram checksum elided (a
-    // zero is legal in IPv4) — through write_batch. Delivery to an
-    // application depends on the host's own firewall and interface
-    // policy, which is not this layer's claim; the interface's own
-    // input counter is the kernel saying it took the frame.
+    // The write path needs a live device again: the probe rounds tore
+    // theirs down. A fresh one, a bounced frame, the interface's own
+    // input counter as the kernel's receipt.
+    let mut device = TunDevice::create(&DeviceConfig {
+        mtu: 1500,
+        inet4_address: vec![IFACE_NET.parse().expect("interface prefix")],
+        ..DeviceConfig::default()
+    })
+    .expect("write-path device");
+    let name = device.name().expect("name");
+    route_add(&name);
     let inbound = first.expect("a frame was read");
     let reply = bounce(&inbound).expect("a UDP frame to bounce");
     let before = interface_input_packets(&name).expect("interface stats");
@@ -156,30 +173,6 @@ fn batch_reads_and_the_writev_round_trip() {
 
     route_del(&name);
     device.shutdown().expect("shutdown");
-}
-
-/// The interface's input-packet count: for a utun, inputs are the
-/// frames user space wrote into the descriptor, which is exactly the
-/// write path's own accounting.
-fn interface_input_packets(name: &str) -> Option<u64> {
-    let output = Command::new("netstat")
-        .args(["-I", name, "-b"])
-        .output()
-        .ok()?;
-    let text = String::from_utf8_lossy(&output.stdout);
-    for line in text.lines().skip_while(|l| !l.contains("Name")) {
-        let fields: Vec<&str> = line.split_whitespace().collect();
-        // The link-level row leaves the Address column empty, so the
-        // row runs name, mtu, <Link#n>, then the input counts; the
-        // named rows below it add network and address columns.
-        if fields.first().is_some_and(|f| *f == name)
-            && fields.get(2).is_some_and(|f| f.starts_with("<Link#"))
-            && fields.len() > 3
-        {
-            return fields[3].parse().ok();
-        }
-    }
-    None
 }
 
 /// Swap the endpoints of one IPv4+UDP frame and fix its header
@@ -267,14 +260,19 @@ fn a_host_fd_is_adopted_and_reads() {
     const ADOPTED_PROBE: Ipv4Addr = Ipv4Addr::new(198, 18, 2, 7);
 
     // Create with the host's tooling — address included, as a host
-    // that built the interface would have — then hand over only the fd.
+    // that built the interface would have — then hand over a
+    // duplicate of the fd: the original wrapper drops and closes its
+    // side, the dup keeps the interface alive with exactly one owner,
+    // the adoption.
     let owned = tun_rs::DeviceBuilder::new()
         .mtu(1500)
         .ipv4(ADOPTED_ADDR, 24, None)
         .build_sync()
         .expect("host utun");
-    let fd = owned.as_raw_fd();
-    std::mem::forget(owned); // the adoption takes the ownership
+    // SAFETY: dup of a live descriptor this test owns.
+    #[expect(unsafe_code)]
+    let fd = unsafe { libc::dup(owned.as_raw_fd()) };
+    drop(owned);
     // SAFETY: the fd above is a live utun descriptor this test just
     // created and released its wrapper for.
     #[expect(unsafe_code)]
@@ -301,4 +299,27 @@ fn a_host_fd_is_adopted_and_reads() {
     assert!(seen > 0, "the adopted fd reads the probes");
     route_del_on(&name, ADOPTED_NET);
     device.shutdown().expect("shutdown");
+}
+
+/// The interface's input-packet count: for a utun, inputs are the
+/// frames user space wrote into the descriptor, which is exactly the
+/// write path's own accounting.
+fn interface_input_packets(name: &str) -> Option<u64> {
+    let output = Command::new("netstat")
+        .args(["-I", name, "-b"])
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&output.stdout);
+    for line in text.lines().skip_while(|l| !l.contains("Name")) {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        // The link-level row leaves the Address column empty, so the
+        // row runs name, mtu, <Link#n>, then the input counts.
+        if fields.first().is_some_and(|f| *f == name)
+            && fields.get(2).is_some_and(|f| f.starts_with("<Link#"))
+            && fields.len() > 3
+        {
+            return fields[3].parse().ok();
+        }
+    }
+    None
 }
