@@ -95,37 +95,49 @@ impl TunDevice {
     /// concern, not a framing one, and land with the route engine.
     pub fn create(config: &DeviceConfig) -> io::Result<Self> {
         let mtu = effective_mtu(config.mtu);
-        // Vnet stays off: with it the kernel coalesces the peer's
-        // inbound TCP and both stacks above collapse (measured 4.5
-        // Mbit/s on an eight-stream upload against 200 without it,
-        // buffer sizing already corrected ,  the merged-burst semantics
-        // need dedicated integration work in the stacks, tracked as
-        // its own item). The plain-frame path is the stable truth.
-        // The transmit queue is the burst shock absorber: the peer's
-        // kernel pumps eight streams at line rate and the reader
-        // drains in batches — a shallow queue (the library's 1000
-        // default) overflowed at every burst seam, and the kernel
-        // dropped whole segments before the process ever saw them
-        // (nine thousand drops and a hundred sixty thousand
-        // retransmissions inside ten seconds, measured). The deep
-        // queue needs the lane catch-up fix beside it — with it, the
-        // uplink sustains two and a half gigabits where the shallow
-        // queue held six hundred megabits.
+        // Vnet is the Linux acceleration: the kernel merges the
+        // peer's inbound segments on the read side (the reader's
+        // per-packet cost collapses) and the write side's merged
+        // frames ride the TSO fast path (measured together: the
+        // upload holds seven and a half gigabits across eight flows
+        // against two without, the download keeps its two and a
+        // quarter, the kernel's transmit queue stops dropping, and
+        // the per-frame header staging is the price the writer
+        // thread — five percent of a core at saturation — pays).
+        // The plain-frame path stays one environment switch away: it
+        // is the floor every platform without virtio headers runs
+        // on, and the escape hatch when a kernel's offload misbe-
+        // haves. The transmit queue is the burst shock absorber: the
+        // peer's kernel pumps eight streams at line rate and the
+        // reader drains in batches — a shallow queue (the library's
+        // 1000 default) overflowed at every burst seam, and the
+        // kernel dropped whole segments before the process ever saw
+        // them (nine thousand drops and a hundred sixty thousand
+        // retransmissions inside ten seconds, measured).
+        let offload = std::env::var_os("VFAWN_NO_OFFLOAD").is_none();
         let mut builder = DeviceBuilder::new()
             .mtu(mtu as u16)
             .tx_queue_len(10_000)
-            .offload(false);
+            .offload(offload);
         if let Some(name) = &config.name {
             builder = builder.name(name.clone());
         }
-        if let Some(net) = config.inet4_address.first() {
+        if let Some(net) = &config.inet4_address.first() {
             builder = builder.ipv4(net.addr(), net.prefix_len(), None);
         }
         for net in &config.inet6_address {
             builder = builder.ipv6(net.addr(), net.prefix_len());
         }
         let device = builder.build_sync()?;
-        let caps = DeviceCaps::MINIMAL;
+        let caps = if offload {
+            DeviceCaps {
+                gso: true,
+                gro: true,
+                queues: 1,
+            }
+        } else {
+            DeviceCaps::MINIMAL
+        };
         Self::spawn_io(device, caps)
     }
 
@@ -167,16 +179,16 @@ impl TunDevice {
 
     fn spawn_io(device: SyncDevice, caps: DeviceCaps) -> io::Result<Self> {
         let name = device.name()?;
-        // TSO off, GRO stays: the kernel's TCP segmentation offload
-        // buffers our MSS-sized frames for a merge that never comes
-        // (the vnet header says no-GSO), holding each write until
-        // its timer expires — a thousand-fold downlink regression,
-        // measured. GRO on the read side is the whole point of
-        // vnet: the kernel merges the peer's inbound segments into
-        // large blobs and the read syscall count collapses.
-        let _ = std::process::Command::new("ethtool")
-            .args(["-K", &name, "tso", "off"])
-            .output();
+        if !caps.gro {
+            // TSO off when vnet is off: the kernel's TCP
+            // segmentation offload buffers MSS-sized frames for a
+            // merge the vnet-less writes can never describe, holding
+            // each until its timer expires. With vnet on, the merged
+            // write frames are exactly what TSO exists to segment.
+            let _ = std::process::Command::new("ethtool")
+                .args(["-K", &name, "tso", "off"])
+                .output();
+        }
         let (read_tx, read_rx) = mpsc::sync_channel(READ_DEPTH);
         let (write_tx, write_rx) = mpsc::sync_channel(WRITE_DEPTH);
         let event = InterruptEvent::new()?;
