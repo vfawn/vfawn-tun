@@ -56,6 +56,20 @@ pub struct SpliceEntry {
     /// The 16-bit window field the dispatch stamps, matching what the
     /// machine's own reactions carry.
     window: AtomicU16,
+    /// The peer's latest acknowledgment number, as the dispatch heard
+    /// it (the ACK fast lane). The slot adopts this before any send
+    /// decision: a pure ACK arriving here saves the channel, shard
+    /// inbox, and state-machine crossing the slow path would charge,
+    /// and in the downlink those crossings per acknowledgment were
+    /// the retransmission cascade's trigger.
+    peer_ack: AtomicU32,
+    /// The peer's latest advertised window, as the dispatch heard it.
+    peer_window: AtomicU16,
+    /// The shard's doorbell: the ACK fast lane records the cursor
+    /// AND rings it, so the owner wakes to adopt the acknowledgment
+    /// on its next pass — a parked shard that never hears the knock
+    /// would sit on a stale window until the timer sweep.
+    shard_bell: std::sync::Mutex<Option<std::sync::Arc<crate::shards::ShardBell>>>,
     /// Whether the shared cursors hold the connection's truth. The
     /// relay's register knows only the fd; the slot, which owns the
     /// connection, activates the entry when it first sees the flow.
@@ -69,6 +83,9 @@ impl SpliceEntry {
             recv_nxt: AtomicU32::new(0),
             send_nxt: AtomicU32::new(0),
             window: AtomicU16::new(0),
+            peer_ack: AtomicU32::new(0),
+            peer_window: AtomicU16::new(0),
+            shard_bell: std::sync::Mutex::new(None),
             active: AtomicBool::new(false),
         }
     }
@@ -77,10 +94,21 @@ impl SpliceEntry {
     /// by the slot, on the first segment it sees for a registered
     /// flow; after this the io thread's dispatch claims the flow's
     /// steady segments before they enter the read channel.
-    pub fn activate(&self, recv_nxt: u32, send_nxt: u32, window: u16) {
+    pub fn activate(
+        &self,
+        recv_nxt: u32,
+        send_nxt: u32,
+        window: u16,
+        bell: Option<std::sync::Arc<crate::shards::ShardBell>>,
+    ) {
         self.recv_nxt.store(recv_nxt, Ordering::Release);
         self.send_nxt.store(send_nxt, Ordering::Release);
         self.window.store(window, Ordering::Release);
+        if let Some(bell) = bell
+            && let Ok(mut slot) = self.shard_bell.lock()
+        {
+            *slot = Some(bell);
+        }
         self.active.store(true, Ordering::Release);
     }
 
@@ -108,6 +136,54 @@ impl SpliceEntry {
     /// The outbound descriptor the payload writes to.
     pub fn outbound_fd(&self) -> RawFd {
         self.outbound_fd
+    }
+
+    /// Record the peer's acknowledgment, forward only (a stale or
+    /// duplicate ACK loses the race and changes nothing). The window
+    /// rides along because the same segment carried it.
+    pub fn note_ack(&self, ack: u32, window: u16) {
+        let mut current = self.peer_ack.load(Ordering::Relaxed);
+        loop {
+            let delta = ack.wrapping_sub(current);
+            if delta == 0 || delta > u32::MAX / 2 {
+                // Stale or duplicate: the cursor already knows.
+                if window > self.peer_window.load(Ordering::Relaxed) {
+                    self.peer_window.store(window, Ordering::Release);
+                }
+                return;
+            }
+            match self.peer_ack.compare_exchange_weak(
+                current,
+                ack,
+                Ordering::Release,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => {
+                    self.peer_window.store(window, Ordering::Release);
+                    // The owner must hear about this: a parked shard
+                    // that never wakes would sit on a closed window
+                    // until the timer sweep, and the sender above
+                    // would retransmit into the silence.
+                    if let Ok(slot) = self.shard_bell.lock()
+                        && let Some(bell) = slot.as_ref()
+                    {
+                        bell.knock();
+                    }
+                    return;
+                }
+                Err(actual) => current = actual,
+            }
+        }
+    }
+
+    /// The latest acknowledgment the dispatch heard, and the window
+    /// that segment carried. The slot adopts this before any send
+    /// decision.
+    pub fn latest_ack(&self) -> (u32, u16) {
+        (
+            self.peer_ack.load(Ordering::Acquire),
+            self.peer_window.load(Ordering::Acquire),
+        )
     }
 
     /// Advance the shared receive cursor from the machine's known
@@ -151,6 +227,8 @@ pub struct SpliceLane {
     /// write. The reader lock keeps those lookups off each other's
     /// way; the writer lock is the rare relay spawn/exit.
     targets: RwLock<HashMap<FlowKey, Arc<SpliceEntry>>>,
+    /// Pure ACKs the fast lane claimed (the downlink's reply stream).
+    acked: AtomicU64,
     /// The read loop's outbound staging: claimed payloads accumulate
     /// per socket through a read batch and leave as one write each at
     /// its end. Only the I/O thread touches this — the claim and its
@@ -239,16 +317,43 @@ impl SpliceLane {
             return false;
         };
         // The steady shape only: pure data (an ACK carrying payload,
-        // no control flags). Everything else belongs to the machine.
-        // The empty-payload test comes first and costs nothing beyond
-        // the parses: the downlink's whole acknowledgment stream takes
-        // this exit, and it must not pay for a key it will never use.
+        // no control flags). Everything else belongs to the machine —
+        // except the pure ACK: a bare acknowledgment for a registered
+        // flow is the downlink's whole reply stream, and the slow
+        // path's per-ACK cost (channel, shard inbox, state machine)
+        // was the retransmission cascade's trigger. The fast lane
+        // records the cursor and moves on.
         let control = TcpFlags::SYN.union(TcpFlags::RST).union(TcpFlags::FIN);
-        if payload.is_empty()
-            || !tcp.flags.contains(TcpFlags::ACK)
-            || (tcp.flags.bits() & control.bits()) != 0
-        {
+        if (tcp.flags.bits() & control.bits()) != 0 {
             return false; // the machine's traffic: not a decline
+        }
+        if !tcp.flags.contains(TcpFlags::ACK) {
+            return false; // not an ACK at all
+        }
+        if payload.is_empty() {
+            // The ACK fast lane: find the flow, record the cursor,
+            // claim the packet. No key lookup for unregistered flows
+            // (the decline counter would lie).
+            let key = FlowKey {
+                src: IpAddr::V4(ip.src),
+                src_port: tcp.src_port,
+                dst: IpAddr::V4(ip.dst),
+                dst_port: tcp.dst_port,
+                protocol: IpProtocol::Tcp,
+            };
+            if let Some(entry) = self.entry_for(&key)
+                && entry.is_active()
+            {
+                // Record the cursor (the fast preview the slot's
+                // on_idle adopts), but DO NOT claim: the state
+                // machine still needs the acknowledgment for fast
+                // retransmit detection, zero-window probing, and FIN
+                // handling. The fast lane saves nothing if it starves
+                // the machine of its own inputs.
+                entry.note_ack(tcp.ack, tcp.window);
+                self.acked.fetch_add(1, Ordering::Relaxed);
+            }
+            return false;
         }
         let key = FlowKey {
             src: IpAddr::V4(ip.src),

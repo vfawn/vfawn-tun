@@ -804,6 +804,18 @@ impl ServerConnection {
         }
     }
 
+    /// Adopt the peer's latest acknowledgment from the shared cursor
+    /// (the ACK fast lane's other half): forward-only, within half
+    /// the sequence space, and only when the machine is behind. The
+    /// congestion and retransmission accounting stays the machine's —
+    /// this moves the floor, the next reaction builds on it.
+    pub fn adopt_ack(&mut self, ack: u32) {
+        let delta = ack.wrapping_sub(self.send.una);
+        if delta > 0 && delta < u32::MAX / 2 {
+            self.send.una = ack;
+        }
+    }
+
     /// The raw 16-bit window field the fast paths stamp on their ACKs —
     /// the same value the machine's own established-state reactions
     /// carry, so both paths advertise one window.

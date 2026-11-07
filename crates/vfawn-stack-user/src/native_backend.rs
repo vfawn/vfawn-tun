@@ -566,6 +566,7 @@ impl SlotLogic for TcpSlot {
                         self.connection.recv_nxt(),
                         self.connection.send_nxt(),
                         self.connection.fast_window(),
+                        Some(Arc::clone(&self.shard_wake)),
                     );
                 }
                 // Write through, never accumulate: this branch sees the
@@ -944,6 +945,35 @@ impl SlotLogic for TcpSlot {
     }
 
     fn on_idle(&mut self, out: &mut VecDeque<BytesMut>) {
+        // The ACK fast lane's other half: the dispatch recorded the
+        // peer's acknowledgments atomically (saving each one the
+        // channel, shard inbox, and state-machine crossing); the slot
+        // adopts the latest before any send decision, the same
+        // catch-up the receive cursor gets. A behind value (the
+        // machine already knows more) is a no-op.
+        #[cfg(target_os = "linux")]
+        if let Some(entry) = crate::splice_lane::SpliceLane::global().entry_for(&self.flow_key)
+            && entry.is_active()
+        {
+            let (ack, _window) = entry.latest_ack();
+            let una_before = self.connection.send_una();
+            self.connection.adopt_ack(ack);
+            let advanced = ack.wrapping_sub(una_before);
+            if advanced > 0 && advanced < u32::MAX / 2 {
+                // The window grows on acknowledgments (RFC 5681 §3.1)
+                // — the slow path's per-ACK reaction, amortized here
+                // to one call per adopted batch. Without it, the fast
+                // lane advances the floor while the pipe stays at
+                // the initial ten segments forever.
+                self.cc.on_signal(
+                    self.connection.mss(),
+                    Signal::Acked {
+                        newly: advanced.min(u32::from(u16::MAX)),
+                        rtt: None,
+                    },
+                );
+            }
+        }
         // The keepalive question: a flow with no activity for the
         // idle window arms its probe clock (the next timer fire
         // sends the first probe). A flow that just had activity

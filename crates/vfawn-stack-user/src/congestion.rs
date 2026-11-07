@@ -78,7 +78,11 @@ impl CongestionAlgo for Reno {
                 } else {
                     // Congestion avoidance: one MSS per RTT, spread
                     // over the window's acknowledgments.
-                    self.cwnd += mss.saturating_mul(mss) / self.cwnd.max(1);
+                    // The additive-increase approximation (one MSS per RTT spread over
+                    // the window) rounds to zero once the window passes mss²; the
+                    // floor keeps the climb alive at the large windows the
+                    // local-pipe start reaches immediately.
+                    self.cwnd += (mss.saturating_mul(mss) / self.cwnd.max(1)).max(1);
                 }
             }
             Signal::Timeout => {
