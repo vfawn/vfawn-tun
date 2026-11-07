@@ -20,6 +20,7 @@ use bytes::BytesMut;
 use vfawn_core::{FlowInfo, Network, SessionHandler, Verdict};
 use vfawn_wire::checksum;
 use vfawn_wire::ipv4::Ipv4Header;
+use vfawn_wire::ipv6::{Ipv6Header, V6Payload};
 use vfawn_wire::protocol::IpProtocol;
 use vfawn_wire::udp::UdpHeader;
 
@@ -57,10 +58,11 @@ pub struct UdpSlot {
     judged: bool,
     flow: FlowInfo,
     /// The wire endpoints, as the emitter wants them (the captured
-    /// flow's v4 addresses and ports — the reply leaves from the
-    /// destination the datagram aimed at).
-    client_addr: std::net::SocketAddrV4,
-    server_addr: std::net::SocketAddrV4,
+    /// flow's addresses and ports — the reply leaves from the
+    /// destination the datagram aimed at, in the family it arrived
+    /// in).
+    client_addr: SocketAddr,
+    server_addr: SocketAddr,
     last_active: Instant,
 }
 
@@ -78,8 +80,8 @@ pub struct UdpHandoff {
     pub lane_bytes: Arc<AtomicUsize>,
     pub shard_wake: Arc<ShardBell>,
     pub tracker: Option<Arc<dyn vfawn_core::FlowTrackerHook>>,
-    pub client_addr: std::net::SocketAddrV4,
-    pub server_addr: std::net::SocketAddrV4,
+    pub client_addr: SocketAddr,
+    pub server_addr: SocketAddr,
 }
 
 impl UdpSlot {
@@ -105,25 +107,23 @@ impl UdpSlot {
                     0,
                 ),
             },
-            client_addr: std::net::SocketAddrV4::new(std::net::Ipv4Addr::UNSPECIFIED, 0),
-            server_addr: std::net::SocketAddrV4::new(std::net::Ipv4Addr::UNSPECIFIED, 0),
+            client_addr: SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0),
+            server_addr: SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0),
             last_active: Instant::now(),
         }
     }
 
     /// The host's say on the first datagram: the same verdict
     /// vocabulary TCP uses, with the same panic containment.
-    fn judge(&mut self, ip: &Ipv4Header, udp: &UdpHeader) -> bool {
+    fn judge(&mut self, client: SocketAddr, server: SocketAddr) -> bool {
         self.judged = true;
-        let source = SocketAddr::new(std::net::IpAddr::V4(ip.src), udp.src_port);
-        let destination = SocketAddr::new(std::net::IpAddr::V4(ip.dst), udp.dst_port);
         self.flow = FlowInfo {
             network: Network::Udp,
-            source,
-            destination,
+            source: client,
+            destination: server,
         };
-        self.client_addr = std::net::SocketAddrV4::new(ip.src, udp.src_port);
-        self.server_addr = std::net::SocketAddrV4::new(ip.dst, udp.dst_port);
+        self.client_addr = client;
+        self.server_addr = server;
         let verdict = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             self.handler.judge_flow(&self.flow, &[])
         }))
@@ -166,13 +166,28 @@ impl UdpSlot {
         while let Some(pending) = lane.pop_front() {
             self.lane_bytes
                 .fetch_sub(pending.data.len(), AtomicOrdering::Relaxed);
-            let Some(frame) = emit_udp_frame(
-                *self.server_addr.ip(),
-                *self.client_addr.ip(),
-                self.server_addr.port(),
-                self.client_addr.port(),
-                &pending.data,
-            ) else {
+            let frame = match (self.server_addr.ip(), self.client_addr.ip()) {
+                (std::net::IpAddr::V4(server), std::net::IpAddr::V4(client)) => emit_udp_frame(
+                    server,
+                    client,
+                    self.server_addr.port(),
+                    self.client_addr.port(),
+                    &pending.data,
+                ),
+                (std::net::IpAddr::V6(server), std::net::IpAddr::V6(client)) => {
+                    vfawn_wire::emit::emit_udp_frame_v6(
+                        server,
+                        client,
+                        self.server_addr.port(),
+                        self.client_addr.port(),
+                        &pending.data,
+                    )
+                }
+                // A family cannot change mid-flow: the endpoints were
+                // named together by the first datagram.
+                _ => None,
+            };
+            let Some(frame) = frame else {
                 continue;
             };
             out.push_back(BytesMut::from(&frame[..]));
@@ -189,16 +204,50 @@ impl SlotLogic for UdpSlot {
         _mtu: usize,
     ) {
         self.last_active = Instant::now();
-        let Ok((ip, rest)) = Ipv4Header::parse(packet) else {
-            return;
+        // The family decides the parse: both carry a UDP header
+        // directly after their own headers (v6 after any extension
+        // chain), and both deliver the same session shape.
+        let (client, server, datagram) = match packet.first().map(|byte| byte >> 4) {
+            Some(4) => {
+                let Ok((ip, rest)) = Ipv4Header::parse(packet) else {
+                    return;
+                };
+                if ip.protocol != IpProtocol::Udp {
+                    return;
+                }
+                let Ok((udp, datagram)) = UdpHeader::parse(rest) else {
+                    return;
+                };
+                (
+                    SocketAddr::new(std::net::IpAddr::V4(ip.src), udp.src_port),
+                    SocketAddr::new(std::net::IpAddr::V4(ip.dst), udp.dst_port),
+                    datagram,
+                )
+            }
+            Some(6) => {
+                let Ok((ip, rest)) = Ipv6Header::parse(packet) else {
+                    return;
+                };
+                // Walk the extension chain to the transport header; a
+                // non-first fragment has no ports to name a flow.
+                let Ok(payload) = V6Payload::walk(ip.next_header, rest) else {
+                    return;
+                };
+                if payload.protocol != IpProtocol::Udp {
+                    return;
+                }
+                let Ok((udp, datagram)) = UdpHeader::parse(payload.bytes) else {
+                    return;
+                };
+                (
+                    SocketAddr::new(std::net::IpAddr::V6(ip.src), udp.src_port),
+                    SocketAddr::new(std::net::IpAddr::V6(ip.dst), udp.dst_port),
+                    datagram,
+                )
+            }
+            _ => return,
         };
-        if ip.protocol != IpProtocol::Udp {
-            return;
-        }
-        let Ok((udp, datagram)) = UdpHeader::parse(rest) else {
-            return;
-        };
-        if !self.judged && !self.judge(&ip, &udp) {
+        if !self.judged && !self.judge(client, server) {
             return;
         }
         // The first accepted datagram earns the session before it
