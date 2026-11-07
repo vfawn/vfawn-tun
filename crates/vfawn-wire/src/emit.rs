@@ -18,7 +18,7 @@ use crate::checksum;
 use crate::ipv4::Ipv4Header;
 use crate::protocol::IpProtocol;
 use crate::tcp::{TcpFlags, TcpHeader};
-use std::net::{Ipv4Addr, SocketAddrV4};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4};
 
 /// The TTL stamped on generated packets; a host default, since these
 /// packets never travel far.
@@ -161,6 +161,61 @@ pub fn icmpv4_frag_needed_v4(from: Ipv4Addr, offending: &[u8], next_mtu: u16) ->
     let sum = checksum::sum_words(&msg);
     msg[4..6].copy_from_slice(&(!checksum::fold(sum)).to_be_bytes());
     Some(ipv4_envelope(from, ip.src, IpProtocol::Icmp, &msg))
+}
+
+/// A whole IPv6 frame around a transport payload: no options, no
+/// fragment header, a caller-chosen hop budget. IPv6 carries no header
+/// checksum — integrity rides the transport checksum, which the
+/// payload builders below compute.
+pub fn ipv6_frame_v6(
+    src: Ipv6Addr,
+    dst: Ipv6Addr,
+    next_header: IpProtocol,
+    hop_limit: u8,
+    payload: &[u8],
+) -> Vec<u8> {
+    let total = 40 + payload.len();
+    let mut packet = Vec::with_capacity(total);
+    // Version 6, traffic class zero, flow label zero: the first four
+    // bytes are the version nibble and 24 bits of zero.
+    packet.extend_from_slice(&[0x60, 0, 0, 0]);
+    packet.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+    packet.push(next_header.number());
+    packet.push(hop_limit);
+    packet.extend_from_slice(&src.octets());
+    packet.extend_from_slice(&dst.octets());
+    packet.extend_from_slice(payload);
+    packet
+}
+
+/// Build a whole IPv6+UDP frame. The checksum is mandatory in IPv6
+/// (a zero is illegal, unlike IPv4), and it covers the pseudo-header:
+/// both addresses, the protocol, and the UDP length.
+pub fn emit_udp_frame_v6(
+    src: Ipv6Addr,
+    dst: Ipv6Addr,
+    src_port: u16,
+    dst_port: u16,
+    data: &[u8],
+) -> Option<Vec<u8>> {
+    if data.len() > (u16::MAX - 8) as usize {
+        return None;
+    }
+    let length = 8u16.checked_add(data.len() as u16)?;
+    let mut udp = Vec::with_capacity(8 + data.len());
+    udp.extend_from_slice(&src_port.to_be_bytes());
+    udp.extend_from_slice(&dst_port.to_be_bytes());
+    udp.extend_from_slice(&length.to_be_bytes());
+    udp.extend_from_slice(&[0, 0]);
+    udp.extend_from_slice(data);
+    let sum = crate::checksum::pseudo_header_v6(src, dst, IpProtocol::Udp, udp.len() as u32)
+        + crate::checksum::sum_words(&udp);
+    let folded = !crate::checksum::fold(sum);
+    // The all-ones checksum is transmitted as zero is the TCP rule;
+    // UDP keeps the value as computed (zero is illegal in v6 anyway,
+    // and fold's complement of a zero sum is 0xffff).
+    udp[6..8].copy_from_slice(&folded.to_be_bytes());
+    Some(ipv6_frame_v6(src, dst, IpProtocol::Udp, 64, &udp))
 }
 
 /// Serialize a TCP header over `payload`. The checksum covers the pseudo
@@ -393,5 +448,47 @@ mod frag_needed_tests {
         assert_eq!(u16::from_be_bytes([error[26], error[27]]), 1400);
         assert_eq!(&error[28..48], &offending[..20]);
         assert_eq!(&error[48..56], &offending[20..28]);
+    }
+}
+
+#[cfg(test)]
+mod v6_emit_tests {
+    use super::*;
+    use crate::checksum;
+    use crate::ipv6::Ipv6Header;
+    use crate::protocol::IpProtocol;
+    use crate::udp::UdpHeader;
+
+    #[test]
+    fn a_v6_udp_frame_parses_back_with_a_valid_checksum() {
+        let src = Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 1);
+        let dst = Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 2);
+        let frame = emit_udp_frame_v6(src, dst, 5353, 45000, b"v6 rides").expect("frame");
+        let (header, rest) = Ipv6Header::parse(&frame).expect("v6 header");
+        assert_eq!(header.src, src);
+        assert_eq!(header.dst, dst);
+        assert_eq!(header.next_header, IpProtocol::Udp);
+        assert_eq!(header.payload_len as usize, 8 + b"v6 rides".len());
+        let (udp, data) = UdpHeader::parse(rest).expect("udp header");
+        assert_eq!(udp.src_port, 5353);
+        assert_eq!(udp.dst_port, 45000);
+        assert_eq!(data, b"v6 rides");
+        // The checksum verifies: pseudo-header plus the whole UDP
+        // datagram folds to all ones.
+        let datagram = rest;
+        let sum = checksum::pseudo_header_v6(src, dst, IpProtocol::Udp, datagram.len() as u32)
+            + checksum::sum_words(datagram);
+        assert_eq!(checksum::fold(sum), 0xffff);
+    }
+
+    #[test]
+    fn the_checksum_is_never_zero() {
+        // A payload crafted to make the naive sum land on a zero
+        // checksum must still emit a legal (non-zero) value.
+        let src = Ipv6Addr::LOCALHOST;
+        let dst = Ipv6Addr::LOCALHOST;
+        let frame = emit_udp_frame_v6(src, dst, 1, 2, &[0u8; 4]).expect("frame");
+        let checksum = u16::from_be_bytes([frame[46], frame[47]]);
+        assert_ne!(checksum, 0, "zero is illegal in v6 UDP");
     }
 }
