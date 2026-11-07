@@ -512,17 +512,22 @@ impl SlotLogic for TcpSlot {
         let entry = {
             let lane = crate::splice_lane::SpliceLane::global();
             let entry = lane.entry_for(&self.flow_key);
-            // The catch-up does not wait for the entry's activation:
-            // an inactive entry (deactivated under outbound pressure)
-            // with a machine behind the shared cursor is exactly the
-            // window where a retransmission of already-claimed bytes
-            // re-delivered — the dispatch had written them and
-            // acknowledged them, the machine never learned, the slot's
-            // fast path wrote them again, and the server read a
-            // duplicated stream. Adopting the wire's position whenever
-            // the flow rides the lane closes the hole for every entry
-            // state.
-            if let Some(entry) = &entry {
+            // The catch-up does not wait for the entry's activation,
+            // only for its arming: an entry deactivated under outbound
+            // pressure with a machine behind the shared cursor is
+            // exactly the window where a retransmission of
+            // already-claimed bytes re-delivered — the dispatch had
+            // written them and acknowledged them, the machine never
+            // learned, the slot's fast path wrote them again, and the
+            // server read a duplicated stream. A never-armed entry is
+            // the other story: its cursor is the constructor's zero,
+            // and adopting that zero (which the half-space test calls
+            // forward whenever the client's ISN lives in the upper
+            // half of sequence space) wiped the machine's true cursor
+            // and froze the flow behind a wall of challenge ACKs.
+            if let Some(entry) = &entry
+                && entry.cursor_armed()
+            {
                 self.connection.catchup_recv(entry.recv_nxt_value());
             }
             entry
@@ -550,7 +555,7 @@ impl SlotLogic for TcpSlot {
             // actually deliverable.
             {
                 if !entry.is_active() {
-                    // Adoption before activation: a deactivation (an
+                    // Adoption before re-arming: a deactivation (an
                     // outbound write refused under pressure) left the
                     // shared cursor ahead of the machine — the bytes
                     // the dispatch claimed, staged, and acknowledged.
@@ -560,8 +565,12 @@ impl SlotLogic for TcpSlot {
                     // the slow path: a quarter of all segments, and
                     // the throughput's sawtooth. The machine takes the
                     // wire's position first; the entry arms at the
-                    // truth.
-                    self.connection.catchup_recv(entry.recv_nxt_value());
+                    // truth. A never-armed entry skips the adoption —
+                    // its cursor is the constructor's zero, not the
+                    // wire's word — and arms straight from the machine.
+                    if entry.cursor_armed() {
+                        self.connection.catchup_recv(entry.recv_nxt_value());
+                    }
                     entry.activate(
                         self.connection.recv_nxt(),
                         self.connection.send_nxt(),

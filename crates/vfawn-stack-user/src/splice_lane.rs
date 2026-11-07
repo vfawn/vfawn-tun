@@ -74,6 +74,16 @@ pub struct SpliceEntry {
     /// relay's register knows only the fd; the slot, which owns the
     /// connection, activates the entry when it first sees the flow.
     active: AtomicBool,
+    /// Whether the cursors have EVER held the wire's truth. The
+    /// distinction matters after activation ends: an entry deactivated
+    /// under outbound pressure still carries a cursor worth adopting
+    /// (bytes the dispatch claimed and acknowledged), while an entry
+    /// that never activated carries the constructor's zero — a value
+    /// the catch-up once trusted, wiping the machine's true receive
+    /// cursor to zero whenever the client's ISN sat in the upper half
+    /// of sequence space (there the zero looks forward by less than
+    /// half the space) and freezing the flow in challenge-ACK silence.
+    armed: AtomicBool,
 }
 
 impl SpliceEntry {
@@ -87,6 +97,7 @@ impl SpliceEntry {
             peer_window: AtomicU16::new(0),
             shard_bell: std::sync::Mutex::new(None),
             active: AtomicBool::new(false),
+            armed: AtomicBool::new(false),
         }
     }
 
@@ -104,6 +115,7 @@ impl SpliceEntry {
         self.recv_nxt.store(recv_nxt, Ordering::Release);
         self.send_nxt.store(send_nxt, Ordering::Release);
         self.window.store(window, Ordering::Release);
+        self.armed.store(true, Ordering::Release);
         if let Some(bell) = bell
             && let Ok(mut slot) = self.shard_bell.lock()
         {
@@ -115,6 +127,14 @@ impl SpliceEntry {
     /// Whether the shared cursors are live.
     pub fn is_active(&self) -> bool {
         self.active.load(Ordering::Acquire)
+    }
+
+    /// Whether the cursors have ever been seeded from the machine —
+    /// the catch-up's admission test. A zero from a never-armed entry
+    /// is not the wire's position; a cursor from an armed one (live or
+    /// deactivated) is.
+    pub fn cursor_armed(&self) -> bool {
+        self.armed.load(Ordering::Acquire)
     }
 
     /// Take the flow off the fast path. The slot does this when the

@@ -183,7 +183,13 @@ impl SessionHandler for RelayHandler {
                         // channel made the channel multi-producer, which
                         // collapsed both directions. The drain owns
                         // downlink; this side only moves bytes.
-                        let mut down = BytesMut::with_capacity(2048);
+                        // One readiness, one large read: the socket
+                        // usually holds far more than a segment's worth
+                        // (the sender's bursts land whole), and every
+                        // extra byte here is a hop through the write
+                        // lane, the shard, and the writer that the
+                        // next read would otherwise pay again.
+                        let mut down = BytesMut::with_capacity(65536);
                         match outbound.try_read_buf(&mut down) {
                             // A readiness race, not an error: the socket
                             // said readable, the read found nothing, and
