@@ -47,10 +47,19 @@ pub fn run_cleanup(all: bool) -> io::Result<()> {
         }
         Ok(())
     }
-    #[cfg(not(target_os = "linux"))]
+    // Windows residue is the firewall rule: a kill -9 leaves it, and
+    // the next run of this same binary maps to the same rule name.
+    #[cfg(target_os = "windows")]
     {
         let _ = all;
-        println!("cleanup requires Linux (nftables/netlink)");
+        vfawn_platform::firewall_gate_remove()?;
+        println!("firewall rule removed (if it stood)");
+        Ok(())
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+    {
+        let _ = all;
+        println!("cleanup requires Linux or Windows");
         Ok(())
     }
 }

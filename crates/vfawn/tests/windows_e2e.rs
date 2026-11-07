@@ -21,8 +21,10 @@ use std::time::{Duration, Instant};
 use ipnet::IpNet;
 use vfawn::echo::EchoHandler;
 use vfawn::instance::Instance;
+use vfawn_core::WindowsFirewallMode;
 use vfawn_core::config::VfawnConfig;
 use vfawn_platform::windows::WindowsRouteBackend;
+use vfawn_platform::windows::{firewall_apply, firewall_remove};
 use vfawn_route::backend::RouteBackend;
 use vfawn_route::model::{RouteEntry, RouteOp};
 
@@ -138,4 +140,72 @@ fn adapter_routes_session_and_clean_teardown() {
         }
         std::thread::sleep(Duration::from_millis(200));
     }
+}
+
+/// The firewall rule's round trip, cross-checked against the system's
+/// own reporter: add by COM, see it through netsh, remove by COM, see
+/// the absence. The documented mode must print a command netsh itself
+/// accepts.
+#[test]
+#[ignore]
+fn firewall_rule_round_trip_and_documented_mode() {
+    use std::process::Command;
+
+    let name = vfawn_platform::windows::firewall_rule_name();
+
+    // Add (idempotent), verify through netsh, remove, verify gone.
+    let added = firewall_apply(WindowsFirewallMode::Auto).expect("apply");
+    assert_eq!(added.as_deref(), Some(name.as_str()), "the rule's name");
+    // A second apply is a no-op, not an error.
+    firewall_apply(WindowsFirewallMode::Auto).expect("idempotent apply");
+
+    let shown = Command::new("netsh")
+        .args([
+            "advfirewall",
+            "firewall",
+            "show",
+            "rule",
+            &format!("name={name}"),
+        ])
+        .output()
+        .expect("netsh");
+    let text = String::from_utf8_lossy(&shown.stdout);
+    assert!(text.contains(&name), "netsh sees the rule: {text}");
+
+    firewall_remove().expect("remove");
+    let shown = Command::new("netsh")
+        .args([
+            "advfirewall",
+            "firewall",
+            "show",
+            "rule",
+            &format!("name={name}"),
+        ])
+        .output()
+        .expect("netsh");
+    let text = String::from_utf8_lossy(&shown.stdout);
+    assert!(
+        !text.contains("Enabled:") && !text.contains("Direction:"),
+        "netsh sees no rule under the name: {text}"
+    );
+
+    // The documented mode prints a command netsh accepts; run it, then
+    // remove — the printed text is the whole contract.
+    let documented = firewall_apply(WindowsFirewallMode::Documented).expect("documented apply");
+    assert_eq!(
+        documented.as_deref(),
+        Some(name.as_str()),
+        "same rule, printed"
+    );
+    let command = vfawn_platform::windows::firewall_documented_add(&name);
+    let status = Command::new("cmd")
+        .args(["/C", &command])
+        .output()
+        .expect("run the printed command");
+    assert!(
+        status.status.success(),
+        "the printed command runs: {}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+    firewall_remove().expect("remove the printed rule");
 }

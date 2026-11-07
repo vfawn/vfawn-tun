@@ -130,6 +130,28 @@ pub struct RouteConfig {
     /// process's dials escape the very routes it installs. Zero
     /// disables the marking and its rule.
     pub mark: u32,
+    /// How the Windows firewall treats this process while a capture is
+    /// up. Auto adds (and later removes) an inbound-allow rule for the
+    /// running executable through the system's own firewall COM API —
+    /// without it a default-deny firewall swallows the very packets
+    /// the TUN hands the process. Documented prints the equivalent
+    /// netsh commands instead of touching the system, for hosts whose
+    /// policy forbids programmatic rule edits. Disabled touches
+    /// nothing. Inert on the other platforms.
+    pub windows_firewall: WindowsFirewallMode,
+}
+
+/// The Windows firewall posture for the process's own executable.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WindowsFirewallMode {
+    /// Add and remove the rule programmatically.
+    #[default]
+    Auto,
+    /// Print the commands a host administrator would run, touch
+    /// nothing.
+    Documented,
+    /// Neither: the host owns its firewall entirely.
+    Disabled,
 }
 
 impl Default for RouteConfig {
@@ -149,6 +171,7 @@ impl Default for RouteConfig {
             table_index: 2022,
             rule_index: 9000,
             mark: 0x2022,
+            windows_firewall: WindowsFirewallMode::Auto,
         }
     }
 }

@@ -28,7 +28,7 @@ pub mod verdict;
 pub use config::{
     ConfigError, CongestionAlgo, DeviceConfig, DnsConfig, DnsMode, OffloadPolicy, OutboundFdHook,
     QueuePolicy, RouteConfig, RouteRule, StackConfig, StackPolicy, UdpNatConfig, UdpSessionMode,
-    VfawnConfig,
+    VfawnConfig, WindowsFirewallMode,
 };
 pub use device::{DeviceCaps, PacketDevice};
 pub use dns_hijack::{DnsHijack, HijackOutcome, derive_virtual_v4};

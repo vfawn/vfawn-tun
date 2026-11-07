@@ -59,6 +59,9 @@ pub struct Instance {
     panics: Arc<AtomicU64>,
     reconciler: Option<Reconciler>,
     orchestration: Option<crate::route_orchestration::RouteOrchestration>,
+    /// The firewall posture taken at start, for the symmetric removal
+    /// at shutdown. None when nothing was taken.
+    firewall_rule: Option<String>,
 }
 
 impl Instance {
@@ -79,6 +82,7 @@ impl Instance {
             panics: Arc::new(AtomicU64::new(0)),
             reconciler: None,
             orchestration: None,
+            firewall_rule: None,
         })
     }
 
@@ -220,6 +224,11 @@ impl Instance {
                 &interface,
                 &addresses,
             )?);
+            // The Windows firewall posture rides the same gate: a
+            // capture that swallows the host's network is also the
+            // moment a default-deny firewall starts swallowing this
+            // process's own packets. Other platforms no-op.
+            self.firewall_rule = vfawn_platform::firewall_gate(self.config.route.windows_firewall)?;
         }
 
         vfawn_core::StackBackend::spawn(backend, Box::new(device), handler).map(|handle| {
@@ -251,6 +260,11 @@ impl Instance {
         // pragmatic answer until the in-house stack lands with one.
         std::thread::sleep(DRAIN_TIMEOUT);
         self.handle = None;
+        // The firewall rule follows the same doctrine as the routes
+        // below: it must not outlive an orderly shutdown.
+        if self.firewall_rule.take().is_some() {
+            vfawn_platform::firewall_gate_remove()?;
+        }
         // Routing rules outlive a process crash by design; they
         // must not outlive an orderly shutdown.
         #[cfg(target_os = "linux")]
