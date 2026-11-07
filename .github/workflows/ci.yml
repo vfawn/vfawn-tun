@@ -83,6 +83,13 @@ jobs:
             sudo env LD_LIBRARY_PATH="$PWD/target/debug" /tmp/vfawn-lifecycle
           fi
 
+      # The darwin acceptance: takeover through the system's own route
+      # command, stats while it stands, and a teardown that returns
+      # the table.
+      - name: macos e2e (root)
+        if: runner.os == 'macOS'
+        run: sudo -E env "PATH=$PATH" cargo test -p vfawn --features backend-native --test macos_e2e -- --ignored --exact --nocapture
+
       # The Windows acceptance: the runner is administrator, so the
       # embedded driver loads, the adapter appears, routes move
       # through the live tables, a session echoes, and shutdown

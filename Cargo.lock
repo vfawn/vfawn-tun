@@ -1549,6 +1549,7 @@ dependencies = [
  "async-trait",
  "bytes",
  "ipnet",
+ "libc",
  "socket2 0.5.10",
  "tokio",
  "vfawn-core",
