@@ -64,7 +64,7 @@ jobs:
       # criterion wants on record.
       - name: darwin batch e2e (root)
         if: runner.os == 'macOS'
-        run: sudo -E env "PATH=$PATH" cargo test -p vfawn-device --test darwin_batch -- --ignored --nocapture
+        run: sudo -E env "PATH=$PATH" cargo test -p vfawn-device --test darwin_batch -- --ignored --test-threads=1 --nocapture
 
       # The C host's whole lifecycle against the cdylib, with the
       # privileges interface creation needs on each platform. The

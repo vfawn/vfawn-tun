@@ -89,10 +89,14 @@ fn batch_reads_and_the_writev_round_trip() {
         }
         batches += 1;
         for buf in bufs.iter_mut().take(count) {
-            if first.is_none() {
-                first = Some(buf.to_vec());
+            // Only the probes count: a routed interface also carries
+            // the kernel's own housekeeping, which is not probe loss.
+            if buf.len() > 40 && buf[9] == 17 && buf[40..].starts_with(b"vfawn-batch-probe-") {
+                if first.is_none() {
+                    first = Some(buf.to_vec());
+                }
+                frames += 1;
             }
-            frames += 1;
         }
     }
     assert_eq!(frames, PROBES, "every probe reached the reader");
