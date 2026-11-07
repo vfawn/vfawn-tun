@@ -800,6 +800,71 @@ pub fn emit_v4(
     packet
 }
 
+/// The family-general emit: one shape, two envelopes. The TCP
+/// segment itself is family-blind; the envelope and the checksum's
+/// pseudo-header are not.
+pub fn emit_tcp(
+    src: std::net::SocketAddr,
+    dst: std::net::SocketAddr,
+    reaction: &Reaction,
+    options: &[u8],
+    payload: &[u8],
+) -> Vec<u8> {
+    match (src, dst) {
+        (std::net::SocketAddr::V4(src), std::net::SocketAddr::V4(dst)) => {
+            emit_v4(src, dst, reaction, options, payload)
+        }
+        (std::net::SocketAddr::V6(src), std::net::SocketAddr::V6(dst)) => {
+            emit_v6(src, dst, reaction, options, payload)
+        }
+        // Endpoints were named together by the flow's first packet;
+        // a mismatch has no honest envelope.
+        _ => Vec::new(),
+    }
+}
+
+/// The v6 twin of [`emit_v4`]: a 40-byte envelope, no header checksum
+/// (v6 carries none), and the TCP checksum over the v6 pseudo-header.
+pub fn emit_v6(
+    src: std::net::SocketAddrV6,
+    dst: std::net::SocketAddrV6,
+    reaction: &Reaction,
+    options: &[u8],
+    payload: &[u8],
+) -> Vec<u8> {
+    let options_len = options.len().div_ceil(4) * 4;
+    let mut packet = Vec::with_capacity(40 + 20 + options_len + payload.len());
+    packet.extend_from_slice(&[0x60, 0, 0, 0]); // version, class, label
+    let tcp_len = 20 + options_len + payload.len();
+    packet.extend_from_slice(&(tcp_len as u16).to_be_bytes());
+    packet.push(IpProtocol::Tcp.number());
+    packet.push(64); // hop budget, one hop from this endpoint
+    packet.extend_from_slice(&src.ip().octets());
+    packet.extend_from_slice(&dst.ip().octets());
+    packet.extend_from_slice(&src.port().to_be_bytes());
+    packet.extend_from_slice(&dst.port().to_be_bytes());
+    packet.extend_from_slice(&reaction.seq.to_be_bytes());
+    packet.extend_from_slice(&reaction.ack.to_be_bytes());
+    packet.push((((20 + options_len) / 4) as u8) << 4);
+    packet.push(reaction.flags);
+    packet.extend_from_slice(&reaction.window.to_be_bytes());
+    packet.extend_from_slice(&[0, 0]); // checksum, fixed below
+    packet.extend_from_slice(&[0, 0]); // urgent pointer
+    packet.extend_from_slice(options);
+    packet.extend(std::iter::repeat_n(1, options_len - options.len()));
+    packet.extend_from_slice(payload);
+
+    let sum = vfawn_wire::checksum::pseudo_header_v6(
+        *src.ip(),
+        *dst.ip(),
+        IpProtocol::Tcp,
+        tcp_len as u32,
+    ) + vfawn_wire::checksum::sum_words(&packet[40..]);
+    let fixed = !vfawn_wire::checksum::fold(sum);
+    packet[56..58].copy_from_slice(&fixed.to_be_bytes());
+    packet
+}
+
 /// The differential driver's native side: the same scenario, the same
 /// wire bytes out as the smoltcp oracle produces, from this stack.
 pub struct NativeTcpConnection {

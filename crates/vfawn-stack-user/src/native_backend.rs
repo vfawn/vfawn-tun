@@ -48,7 +48,7 @@ use vfawn_wire::tcp::TcpHeader;
 
 use crate::accept::{AcceptQueue, FixedSecret};
 use crate::congestion::{CongestionAlgo, Cubic, Reno, Signal};
-use crate::native_tcp::{Inbound, Reaction, ServerConnection, TcpState, ctl, emit_v4};
+use crate::native_tcp::{Inbound, Reaction, ServerConnection, TcpState, ctl, emit_tcp};
 use crate::shards::{BufferPool, LogicFactory, ShardBell, ShardConfig, Shards, SlotLogic};
 
 /// The fallback segment size when the backend is constructed without
@@ -64,13 +64,10 @@ enum HostEvent {
 }
 
 /// The v4 endpoints of a flow, as the emitter wants them.
-fn v4_ends(flow: &FlowKey) -> Option<(std::net::SocketAddrV4, std::net::SocketAddrV4)> {
-    let (std::net::IpAddr::V4(src), std::net::IpAddr::V4(dst)) = (flow.src, flow.dst) else {
-        return None;
-    };
+fn v4_ends(flow: &FlowKey) -> Option<(std::net::SocketAddr, std::net::SocketAddr)> {
     Some((
-        std::net::SocketAddrV4::new(src, flow.src_port),
-        std::net::SocketAddrV4::new(dst, flow.dst_port),
+        std::net::SocketAddr::new(flow.src, flow.src_port),
+        std::net::SocketAddr::new(flow.dst, flow.dst_port),
     ))
 }
 
@@ -102,8 +99,8 @@ impl WriteLane {
 /// only when the handshake completes.
 struct TcpSlot {
     connection: ServerConnection,
-    client: std::net::SocketAddrV4,
-    server: std::net::SocketAddrV4,
+    client: std::net::SocketAddr,
+    server: std::net::SocketAddr,
     handler: Arc<dyn SessionHandler>,
     accept: Arc<std::sync::Mutex<AcceptQueue>>,
     sessions: mpsc::SyncSender<SessionHandoff>,
@@ -233,7 +230,11 @@ impl TcpSlot {
                 // The debt the transitional backend could not pay: the
                 // raw SYN is right here, so the RST is real (RFC 9293
                 // §3.4, constructed from the offending segment).
-                if let Some(frame) = tcp_rst_v4(packet, *self.server.ip()) {
+                let reset = match self.server.ip() {
+                    std::net::IpAddr::V4(server) => tcp_rst_v4(packet, server),
+                    std::net::IpAddr::V6(_) => None, // the v6 RST twin lands with v6 TCP
+                };
+                if let Some(frame) = reset {
                     out.push_back(BytesMut::from(&frame[..]));
                 }
                 self.refused = true;
@@ -288,7 +289,7 @@ impl TcpSlot {
                 drop(lane);
                 let reaction = self.connection.fin_reaction();
                 if reaction.flags != 0 {
-                    let frame = emit_v4(self.server, self.client, &reaction, &[], &[]);
+                    let frame = emit_tcp(self.server, self.client, &reaction, &[], &[]);
                     out.push_back(BytesMut::from(&frame[..]));
                     self.fin_at = Some(reaction.seq);
                     self.data_sent_at = Some(Instant::now());
@@ -313,7 +314,7 @@ impl TcpSlot {
                 held: false,
                 gap_filled: false,
             };
-            let frame = emit_v4(self.server, self.client, &reaction, &[], &write[..take]);
+            let frame = emit_tcp(self.server, self.client, &reaction, &[], &write[..take]);
             out.push_back(BytesMut::from(&frame[..]));
             if self.flight.is_empty() {
                 self.flight_base = self.connection.send_nxt();
@@ -396,7 +397,7 @@ impl TcpSlot {
         } else {
             Vec::new()
         };
-        let frame = emit_v4(self.server, self.client, reaction, &options, &[]);
+        let frame = emit_tcp(self.server, self.client, reaction, &options, &[]);
         out.push_back(BytesMut::from(&frame[..]));
         self.connection
             .send_advance(u32::from(reaction.flags & 0x03 != 0));
@@ -417,7 +418,7 @@ impl TcpSlot {
             ctl::RST | ctl::ACK,
             0,
         );
-        let frame = emit_v4(self.server, self.client, &reset, &[], &[]);
+        let frame = emit_tcp(self.server, self.client, &reset, &[], &[]);
         out.push_back(BytesMut::from(&frame[..]));
         self.connection.abandon();
         self.flight.clear();
@@ -455,12 +456,32 @@ impl SlotLogic for TcpSlot {
         _pool: &BufferPool,
         _mtu: usize,
     ) {
-        let Ok((ip, payload)) = Ipv4Header::parse(packet) else {
-            return;
+        // The family decides where the segment starts; the machine
+        // downstream is family-blind (sequence space and flags).
+        let payload = match packet.first().map(|byte| byte >> 4) {
+            Some(4) => {
+                let Ok((ip, payload)) = Ipv4Header::parse(packet) else {
+                    return;
+                };
+                if ip.protocol != IpProtocol::Tcp {
+                    return;
+                }
+                payload
+            }
+            Some(6) => {
+                let Ok((ip, rest)) = vfawn_wire::ipv6::Ipv6Header::parse(packet) else {
+                    return;
+                };
+                let Ok(transport) = vfawn_wire::ipv6::V6Payload::walk(ip.next_header, rest) else {
+                    return;
+                };
+                if transport.protocol != IpProtocol::Tcp {
+                    return;
+                }
+                transport.bytes
+            }
+            _ => return,
         };
-        if ip.protocol != IpProtocol::Tcp {
-            return;
-        }
         let Ok((header, _segment_payload)) = TcpHeader::parse(payload) else {
             return;
         };
@@ -754,7 +775,7 @@ impl SlotLogic for TcpSlot {
                 // same sequence, a longer wait if it fires again.
                 if let Some(reaction) = self.connection.synack_retransmit() {
                     let options = self.connection.handshake_options();
-                    let frame = emit_v4(self.server, self.client, &reaction, &options, &[]);
+                    let frame = emit_tcp(self.server, self.client, &reaction, &options, &[]);
                     out.push_back(BytesMut::from(&frame[..]));
                     self.synack_retries = self.synack_retries.saturating_add(1);
                     self.synack_at = Some(Instant::now());
@@ -793,7 +814,7 @@ impl SlotLogic for TcpSlot {
                         ctl::ACK,
                         self.connection.advertised_window(),
                     );
-                    let frame = emit_v4(self.server, self.client, &probe, &[], &[]);
+                    let frame = emit_tcp(self.server, self.client, &probe, &[], &[]);
                     out.push_back(BytesMut::from(&frame[..]));
                     self.keepalive_probes += 1;
                     self.keepalive_at = Some(Instant::now() + KEEPALIVE_INTERVAL);
@@ -835,7 +856,8 @@ impl SlotLogic for TcpSlot {
                                 held: false,
                                 gap_filled: false,
                             };
-                            let frame = emit_v4(self.server, self.client, &reaction, &[], &[probe]);
+                            let frame =
+                                emit_tcp(self.server, self.client, &reaction, &[], &[probe]);
                             out.push_back(BytesMut::from(&frame[..]));
                             if self.flight.is_empty() {
                                 self.flight_base = self.connection.send_nxt();
@@ -864,7 +886,7 @@ impl SlotLogic for TcpSlot {
                             held: false,
                             gap_filled: false,
                         };
-                        let frame = emit_v4(self.server, self.client, &reaction, &[], &[]);
+                        let frame = emit_tcp(self.server, self.client, &reaction, &[], &[]);
                         out.push_back(BytesMut::from(&frame[..]));
                         self.data_retries = self.data_retries.saturating_add(1);
                         self.data_sent_at = Some(Instant::now());
@@ -894,7 +916,7 @@ impl SlotLogic for TcpSlot {
                         held: false,
                         gap_filled: false,
                     };
-                    let frame = emit_v4(
+                    let frame = emit_tcp(
                         self.server,
                         self.client,
                         &reaction,
@@ -1460,8 +1482,14 @@ mod tests {
     }
 
     fn slot_with_waiting_output(bytes: &[u8]) -> TcpSlot {
-        let client = std::net::SocketAddrV4::new(std::net::Ipv4Addr::new(10, 0, 0, 2), 44444);
-        let server = std::net::SocketAddrV4::new(std::net::Ipv4Addr::new(10, 0, 0, 1), 443);
+        let client = std::net::SocketAddr::V4(std::net::SocketAddrV4::new(
+            std::net::Ipv4Addr::new(10, 0, 0, 2),
+            44444,
+        ));
+        let server = std::net::SocketAddr::V4(std::net::SocketAddrV4::new(
+            std::net::Ipv4Addr::new(10, 0, 0, 1),
+            443,
+        ));
         let write_lane = Arc::new(std::sync::Mutex::new(WriteLane::new()));
         {
             let mut lane = write_lane.lock().expect("write lane");
@@ -1472,9 +1500,9 @@ mod tests {
         let mut slot = TcpSlot {
             connection: ServerConnection::new(1000, 1460),
             flow_key: vfawn_wire::flow::FlowKey {
-                src: std::net::IpAddr::V4(*client.ip()),
+                src: client.ip(),
                 src_port: client.port(),
-                dst: std::net::IpAddr::V4(*server.ip()),
+                dst: server.ip(),
                 dst_port: server.port(),
                 protocol: IpProtocol::Tcp,
             },
@@ -1489,8 +1517,8 @@ mod tests {
             sessions: sessions_tx,
             flow: FlowInfo {
                 network: Network::Tcp,
-                source: std::net::SocketAddr::V4(client),
-                destination: std::net::SocketAddr::V4(server),
+                source: client,
+                destination: server,
             },
             write_lane,
             shard_wake: Arc::new(ShardBell::new()),
