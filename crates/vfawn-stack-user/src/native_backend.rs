@@ -50,6 +50,7 @@ use crate::accept::{AcceptQueue, FixedSecret};
 use crate::congestion::{CongestionAlgo, Cubic, Reno, Signal};
 use crate::native_tcp::{Inbound, Reaction, ServerConnection, TcpState, ctl, emit_tcp};
 use crate::shards::{BufferPool, LogicFactory, ShardBell, ShardConfig, Shards, SlotLogic};
+use vfawn_wire::emit::tcp_rst_v6;
 
 /// The fallback segment size when the backend is constructed without
 /// one: RFC 9293 §3.7.1's default for a peer that sent no MSS option.
@@ -232,7 +233,7 @@ impl TcpSlot {
                 // §3.4, constructed from the offending segment).
                 let reset = match self.server.ip() {
                     std::net::IpAddr::V4(server) => tcp_rst_v4(packet, server),
-                    std::net::IpAddr::V6(_) => None, // the v6 RST twin lands with v6 TCP
+                    std::net::IpAddr::V6(server) => tcp_rst_v6(packet, server),
                 };
                 if let Some(frame) = reset {
                     out.push_back(BytesMut::from(&frame[..]));

@@ -71,6 +71,50 @@ pub fn tcp_rst_v4(offending: &[u8], from: Ipv4Addr) -> Option<Vec<u8>> {
     Some(ipv4_envelope(from, ip.src, IpProtocol::Tcp, &segment))
 }
 
+/// Build the IPv6 twin of [`tcp_rst_v4`]: same RFC 9293 §3.4
+/// sequence arithmetic, a v6 envelope, and the TCP checksum over the
+/// v6 pseudo-header.
+pub fn tcp_rst_v6(offending: &[u8], from: Ipv6Addr) -> Option<Vec<u8>> {
+    let (ip, payload) = crate::ipv6::Ipv6Header::parse(offending).ok()?;
+    let transport = crate::ipv6::V6Payload::walk(ip.next_header, payload).ok()?;
+    if transport.protocol != IpProtocol::Tcp {
+        return None;
+    }
+    let (tcp, seg_payload) = TcpHeader::parse(transport.bytes).ok()?;
+    let seg_len = seg_payload.len() as u32
+        + u32::from(tcp.flags.contains(TcpFlags::SYN))
+        + u32::from(tcp.flags.contains(TcpFlags::FIN));
+
+    let (seq, ack, flags) = if tcp.flags.contains(TcpFlags::ACK) {
+        (tcp.ack, 0, TcpFlags::RST)
+    } else {
+        (
+            0,
+            tcp.seq.wrapping_add(seg_len),
+            TcpFlags::RST.union(TcpFlags::ACK),
+        )
+    };
+
+    // The bare TCP segment: header only, no payload, no options.
+    let mut segment = Vec::with_capacity(20);
+    segment.extend_from_slice(&tcp.dst_port.to_be_bytes());
+    segment.extend_from_slice(&tcp.src_port.to_be_bytes());
+    segment.extend_from_slice(&seq.to_be_bytes());
+    segment.extend_from_slice(&ack.to_be_bytes());
+    segment.push(5 << 4); // data offset: no options
+    segment.push(flags.bits());
+    segment.extend_from_slice(&0u16.to_be_bytes()); // window
+    segment.extend_from_slice(&[0, 0]); // checksum, fixed below
+    segment.extend_from_slice(&[0, 0]); // urgent
+    let sum =
+        crate::checksum::pseudo_header_v6(from, ip.src, IpProtocol::Tcp, segment.len() as u32)
+            + crate::checksum::sum_words(&segment);
+    let fixed = !crate::checksum::fold(sum);
+    segment[16..18].copy_from_slice(&fixed.to_be_bytes());
+
+    Some(ipv6_frame_v6(from, ip.src, IpProtocol::Tcp, 64, &segment))
+}
+
 /// Build the RST that tears down an established flow we own, with the
 /// sequence state of both directions at abort time.
 ///
@@ -490,5 +534,82 @@ mod v6_emit_tests {
         let frame = emit_udp_frame_v6(src, dst, 1, 2, &[0u8; 4]).expect("frame");
         let checksum = u16::from_be_bytes([frame[46], frame[47]]);
         assert_ne!(checksum, 0, "zero is illegal in v6 UDP");
+    }
+}
+
+#[cfg(test)]
+mod v6_rst_tests {
+    use super::*;
+    use crate::ipv6::Ipv6Header;
+    use crate::tcp::TcpHeader;
+
+    /// One v6 TCP SYN to quote in the RST.
+    fn v6_syn() -> Vec<u8> {
+        let src = Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 2);
+        let dst = Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 1);
+        let mut tcp = Vec::new();
+        tcp.extend_from_slice(&45000u16.to_be_bytes());
+        tcp.extend_from_slice(&443u16.to_be_bytes());
+        tcp.extend_from_slice(&5000u32.to_be_bytes());
+        tcp.extend_from_slice(&0u32.to_be_bytes());
+        tcp.push(5 << 4);
+        tcp.push(0x02); // SYN
+        tcp.extend_from_slice(&64256u16.to_be_bytes());
+        tcp.extend_from_slice(&[0, 0, 0, 0]);
+        let sum = crate::checksum::pseudo_header_v6(src, dst, IpProtocol::Tcp, tcp.len() as u32)
+            + crate::checksum::sum_words(&tcp);
+        tcp[16..18].copy_from_slice(&(!crate::checksum::fold(sum)).to_be_bytes());
+        ipv6_frame_v6(src, dst, IpProtocol::Tcp, 64, &tcp)
+    }
+
+    #[test]
+    fn a_v6_syn_without_ack_answers_rst_ack() {
+        let offending = v6_syn();
+        let from = Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 1);
+        let rst = tcp_rst_v6(&offending, from).expect("RST built");
+
+        let (header, message) = Ipv6Header::parse(&rst).expect("v6 header");
+        assert_eq!(header.src, from, "answered from the server");
+        assert_eq!(header.dst, Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 2));
+        assert_eq!(header.next_header, IpProtocol::Tcp);
+
+        let (tcp, _) = TcpHeader::parse(message).expect("TCP header");
+        assert_eq!(tcp.flags, TcpFlags::RST.union(TcpFlags::ACK));
+        assert_eq!(tcp.ack, 5001, "SYN consumes one sequence");
+        assert_eq!(tcp.seq, 0, "no data to acknowledge");
+
+        // The checksum verifies over the v6 pseudo-header.
+        let sum = crate::checksum::pseudo_header_v6(
+            header.src,
+            header.dst,
+            IpProtocol::Tcp,
+            message.len() as u32,
+        ) + crate::checksum::sum_words(message);
+        assert_eq!(crate::checksum::fold(sum), 0xffff);
+    }
+
+    #[test]
+    fn a_v6_ack_answers_a_bare_rst() {
+        let src = Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 2);
+        let dst = Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 1);
+        let mut tcp = Vec::new();
+        tcp.extend_from_slice(&45000u16.to_be_bytes());
+        tcp.extend_from_slice(&443u16.to_be_bytes());
+        tcp.extend_from_slice(&6000u32.to_be_bytes());
+        tcp.extend_from_slice(&7001u32.to_be_bytes()); // ACK
+        tcp.push(5 << 4);
+        tcp.push(0x10); // ACK
+        tcp.extend_from_slice(&64256u16.to_be_bytes());
+        tcp.extend_from_slice(&[0, 0, 0, 0]);
+        let sum = crate::checksum::pseudo_header_v6(src, dst, IpProtocol::Tcp, tcp.len() as u32)
+            + crate::checksum::sum_words(&tcp);
+        tcp[16..18].copy_from_slice(&(!crate::checksum::fold(sum)).to_be_bytes());
+        let frame = ipv6_frame_v6(src, dst, IpProtocol::Tcp, 64, &tcp);
+
+        let rst = tcp_rst_v6(&frame, dst).expect("RST");
+        let (_, message) = Ipv6Header::parse(&rst).expect("header");
+        let (tcp, _) = TcpHeader::parse(message).expect("TCP");
+        assert_eq!(tcp.flags, TcpFlags::RST, "bare RST, no ACK");
+        assert_eq!(tcp.seq, 7001, "carries the peer's ACK number");
     }
 }
