@@ -99,6 +99,23 @@ fn batch_reads_and_the_writev_round_trip() {
             }
         }
     }
+    if frames == 0 {
+        // The diagnosis the zero deserves: where the routes point,
+        // which interfaces live, and what the reader actually saw.
+        let routes = Command::new("netstat").args(["-rn", "-f", "inet"]).output();
+        if let Ok(output) = routes {
+            for line in String::from_utf8_lossy(&output.stdout).lines() {
+                if line.contains("198.18") || line.contains("utun") {
+                    println!("route: {line}");
+                }
+            }
+        }
+        let links = Command::new("ifconfig").output();
+        if let Ok(output) = links {
+            println!("links: {}", String::from_utf8_lossy(&output.stdout));
+        }
+        panic!("every probe reached the reader (saw zero; diagnostics above)");
+    }
     assert_eq!(frames, PROBES, "every probe reached the reader");
     let per_batch = frames as f64 / batches as f64;
     println!(
