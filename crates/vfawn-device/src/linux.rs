@@ -113,7 +113,8 @@ impl TunDevice {
         // queue held six hundred megabits.
         let mut builder = DeviceBuilder::new()
             .mtu(mtu as u16)
-            .tx_queue_len(10_000);
+            .tx_queue_len(10_000)
+            .offload(true);
         if let Some(name) = &config.name {
             builder = builder.name(name.clone());
         }
