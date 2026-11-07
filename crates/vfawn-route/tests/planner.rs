@@ -553,7 +553,9 @@ fn uid_desired(
 
 #[test]
 fn uid_ranges_segment_the_capture() {
-    let state = uid_desired(&[1000..=1999, 10000..=10042], &[]);
+    #[allow(clippy::single_range_in_vec_init)]
+    let include: &[std::ops::RangeInclusive<u32>] = &[1000..=1999, 10000..=10042];
+    let state = uid_desired(include, &[]);
     let captures: Vec<&PolicyRule> = state
         .rules
         .iter()
@@ -596,7 +598,9 @@ fn an_empty_filter_keeps_the_catch_all() {
 
 #[test]
 fn excluded_uids_escape_to_main_ahead_of_the_capture() {
-    let state = uid_desired(&[], &[5000..=5099]);
+    #[allow(clippy::single_range_in_vec_init)]
+    let exclude: &[std::ops::RangeInclusive<u32>] = &[5000..=5099];
+    let state = uid_desired(&[], exclude);
     let escape = state
         .rules
         .iter()
@@ -621,7 +625,11 @@ fn excluded_uids_escape_to_main_ahead_of_the_capture() {
 fn uid_rules_round_trip_through_the_plan() {
     // Apply, snapshot, and re-plan against the uid-carrying state: the
     // second plan must be empty (identity includes the range).
-    let desired = uid_desired(&[1000..=1999], &[5000..=5099]);
+    #[allow(clippy::single_range_in_vec_init)]
+    let include: &[std::ops::RangeInclusive<u32>] = &[1000..=1999];
+    #[allow(clippy::single_range_in_vec_init)]
+    let exclude: &[std::ops::RangeInclusive<u32>] = &[5000..=5099];
+    let desired = uid_desired(include, exclude);
     let mut observed = ObservedState::default();
     simulate_apply(&plan(&desired, &observed), &mut observed);
     let second = plan(&desired, &observed);
