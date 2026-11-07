@@ -22,6 +22,7 @@ pub mod checksum;
 pub mod emit;
 pub mod error;
 pub mod flow;
+pub mod fragment_out;
 pub mod icmpv4;
 pub mod ipv4;
 pub mod ipv6;

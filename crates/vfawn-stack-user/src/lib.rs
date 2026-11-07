@@ -19,6 +19,7 @@
 pub mod accept;
 #[cfg(feature = "backend-native")]
 pub mod congestion;
+#[cfg(feature = "backend-native")]
 pub mod fragment;
 #[cfg(feature = "backend-native")]
 mod icmp;

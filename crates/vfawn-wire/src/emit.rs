@@ -144,6 +144,25 @@ pub fn icmpv4_unreachable_v4(from: Ipv4Addr, offending: &[u8], code: u8) -> Opti
     Some(ipv4_envelope(from, ip.src, IpProtocol::Icmp, &msg))
 }
 
+/// Build an ICMPv4 fragmentation-needed error quoting `offending`,
+/// with the next-hop MTU the sender should fall back to (RFC 1191:
+/// type 3, code 4, the MTU in the high half of the unused word). The
+/// quote is the offending header plus eight octets, the same shape
+/// `icmpv4_unreachable_v4` carries — the sender finds the socket, and
+/// the MTU tells it what to do next.
+pub fn icmpv4_frag_needed_v4(from: Ipv4Addr, offending: &[u8], next_mtu: u16) -> Option<Vec<u8>> {
+    let (ip, _) = Ipv4Header::parse(offending).ok()?;
+    let quote_end = offending.len().min(ip.header_len + 8);
+    let mut msg = Vec::with_capacity(8 + quote_end);
+    // Type 3, code 4, checksum; the unused half-word, then the MTU.
+    msg.extend_from_slice(&[3, 4, 0, 0, 0, 0]);
+    msg.extend_from_slice(&next_mtu.to_be_bytes());
+    msg.extend_from_slice(&offending[..quote_end]);
+    let sum = checksum::sum_words(&msg);
+    msg[4..6].copy_from_slice(&(!checksum::fold(sum)).to_be_bytes());
+    Some(ipv4_envelope(from, ip.src, IpProtocol::Icmp, &msg))
+}
+
 /// Serialize a TCP header over `payload`. The checksum covers the pseudo
 /// header and the segment, so the addresses are needed here too.
 #[allow(clippy::too_many_arguments)]
@@ -347,5 +366,32 @@ mod tests {
     fn garbage_offender_yields_no_reset() {
         assert!(tcp_rst_v4(&[0u8; 4], Ipv4Addr::LOCALHOST).is_none());
         assert!(icmpv4_unreachable_v4(Ipv4Addr::LOCALHOST, &[0u8; 4], 3).is_none());
+    }
+}
+
+#[cfg(test)]
+mod frag_needed_tests {
+    use super::*;
+
+    #[test]
+    fn the_error_carries_the_mtu_and_the_quote() {
+        // One UDP packet to quote.
+        let offending = ipv4_frame_v4(
+            Ipv4Addr::new(198, 18, 0, 2),
+            Ipv4Addr::new(203, 0, 113, 1),
+            IpProtocol::Udp,
+            64,
+            &[0u8; 16],
+        );
+        let error =
+            icmpv4_frag_needed_v4(Ipv4Addr::new(203, 0, 113, 1), &offending, 1400).expect("built");
+        // The envelope is ICMP; the message: type 3, code 4, the MTU
+        // in bytes 6-7, then the quote (header + 8).
+        assert_eq!(error[9], 1);
+        assert_eq!(error[20], 3);
+        assert_eq!(error[21], 4);
+        assert_eq!(u16::from_be_bytes([error[26], error[27]]), 1400);
+        assert_eq!(&error[28..48], &offending[..20]);
+        assert_eq!(&error[48..56], &offending[20..28]);
     }
 }

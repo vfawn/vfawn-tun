@@ -611,6 +611,7 @@ impl Shards {
         let writer_ping_for_writer = Arc::clone(&writer_ping);
         let writer_pool = Arc::clone(&pool);
         let stop_all_for_writer = Arc::clone(&stop_all);
+        let writer_mtu = config.mtu;
         threads.push(
             std::thread::Builder::new()
                 .name("vfawn-shard-writer".into())
@@ -634,6 +635,27 @@ impl Shards {
                                 );
                             }
                             while let Some(packet) = outbox.pop_front() {
+                                // The device's MTU is a promise about
+                                // what it will carry: a datagram the
+                                // stack produced whole leaves as IP
+                                // fragments when it exceeds that (DF
+                                // set keeps the sender's refusal —
+                                // the frame drops as the sender asked).
+                                if packet.len() > writer_mtu {
+                                    match vfawn_wire::fragment_out::split(&packet, writer_mtu) {
+                                        Some(pieces) => {
+                                            writer_pool.release_packet(packet);
+                                            for piece in pieces {
+                                                batch.push(BytesMut::from(&piece[..]));
+                                            }
+                                            continue;
+                                        }
+                                        None => {
+                                            writer_pool.release_packet(packet);
+                                            continue;
+                                        }
+                                    }
+                                }
                                 batch.push(packet);
                             }
                         }
