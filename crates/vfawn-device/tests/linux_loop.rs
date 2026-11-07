@@ -42,7 +42,12 @@ fn reads_kernel_traffic_writes_back_and_stops_cleanly() {
     let mut device = TunDevice::create(&subnet_config(0)).expect("create device");
     let caps = device.capabilities();
     assert_eq!(caps.queues, 1);
-    assert!(!caps.gro && !caps.gso);
+    // The Linux default carries the virtio header in both directions;
+    // the capability bits report exactly that, and the plain-frame
+    // floor remains reachable through the escape hatch.
+    let offload_disabled = std::env::var_os("VFAWN_NO_OFFLOAD").is_some();
+    assert_eq!(caps.gro, !offload_disabled);
+    assert_eq!(caps.gso, !offload_disabled);
 
     let pinger = thread::spawn(|| {
         Command::new("ping")
