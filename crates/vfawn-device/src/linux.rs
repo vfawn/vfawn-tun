@@ -114,7 +114,7 @@ impl TunDevice {
         let mut builder = DeviceBuilder::new()
             .mtu(mtu as u16)
             .tx_queue_len(10_000)
-            .offload(true);
+            .offload(false);
         if let Some(name) = &config.name {
             builder = builder.name(name.clone());
         }
@@ -167,6 +167,16 @@ impl TunDevice {
 
     fn spawn_io(device: SyncDevice, caps: DeviceCaps) -> io::Result<Self> {
         let name = device.name()?;
+        // TSO off, GRO stays: the kernel's TCP segmentation offload
+        // buffers our MSS-sized frames for a merge that never comes
+        // (the vnet header says no-GSO), holding each write until
+        // its timer expires — a thousand-fold downlink regression,
+        // measured. GRO on the read side is the whole point of
+        // vnet: the kernel merges the peer's inbound segments into
+        // large blobs and the read syscall count collapses.
+        let _ = std::process::Command::new("ethtool")
+            .args(["-K", &name, "tso", "off"])
+            .output();
         let (read_tx, read_rx) = mpsc::sync_channel(READ_DEPTH);
         let (write_tx, write_rx) = mpsc::sync_channel(WRITE_DEPTH);
         let event = InterruptEvent::new()?;
@@ -352,17 +362,24 @@ fn io_loop(shared: Arc<Shared>, mut device: SyncDevice, writes: Receiver<Vec<Byt
 /// per frame otherwise.
 fn send_batch(
     device: &mut SyncDevice,
-    gro_table: &mut tun_rs::GROTable,
+    _gro_table: &mut tun_rs::GROTable,
     staging: &mut Vec<BytesMut>,
     batch: &[BytesMut],
 ) -> io::Result<()> {
+    // One write per frame, bypassing the send_multiple GRO pass:
+    // that pass merges our outgoing TCP segments (contiguous sequence
+    // numbers look mergeable to it), and the merged frame carries a
+    // GSO vnet header the kernel then tries to segment — a path our
+    // plain zero-header frames never asked for, and one that corrupts
+    // the byte stream (measured: downlink from gigabits to zero the
+    // moment sustained data flows). Reading keeps the kernel's GRO;
+    // writing keeps one plain frame per syscall.
     for frame in batch {
         let mut padded = BytesMut::with_capacity(VIRTIO_NET_HDR_LEN + frame.len());
         padded.resize(VIRTIO_NET_HDR_LEN, 0);
         padded.extend_from_slice(frame);
-        staging.push(padded);
+        device.send(&padded)?;
     }
-    device.send_multiple(gro_table, staging, VIRTIO_NET_HDR_LEN)?;
     staging.clear();
     Ok(())
 }
