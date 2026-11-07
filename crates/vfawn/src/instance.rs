@@ -325,6 +325,8 @@ impl Instance {
             mark: config.route.mark,
             strict_route: config.route.strict_route,
             dns_leak_prevention: config.dns.mode == vfawn_core::DnsMode::Hijack,
+            include_uid: &config.route.include_uid,
+            exclude_uid: &config.route.exclude_uid,
         });
         if let Some(reason) = needs_restart_desired(&self.config, config) {
             return Err(ApplyError::NeedsRestart(reason));

@@ -63,6 +63,13 @@ pub struct RuleSelector {
     /// capture table's own process: its sockets carry the mark and the
     /// rule above the capture sends them elsewhere.
     pub fwmark: Option<u32>,
+    /// The socket-owner range (Linux FRA_UID_RANGE): the per-app
+    /// filter's kernel face. A rule carrying it answers only traffic
+    /// from UIDs inside the range — the host translates its app
+    /// identities to UID ranges (the platform's own mapping, as the
+    /// reference stack's host does for it) and this field carries the
+    /// answer into the kernel.
+    pub uid_range: Option<std::ops::RangeInclusive<u32>>,
     /// Suppress routes with a prefix length >= this value (suppresses
     /// the default route when 0).
     pub suppress_prefixlen: Option<u8>,

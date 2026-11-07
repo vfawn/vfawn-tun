@@ -207,6 +207,12 @@ pub struct RouteParams<'a> {
     pub mark: u32,
     pub strict_route: bool,
     pub dns_leak_prevention: bool,
+    /// UID ranges to capture (Linux FRA_UID_RANGE): the per-app
+    /// filter. Empty captures every UID, as before.
+    pub include_uid: &'a [std::ops::RangeInclusive<u32>],
+    /// UID ranges to spare even inside the capture. Applied ahead of
+    /// the capture rules, toward the main table.
+    pub exclude_uid: &'a [std::ops::RangeInclusive<u32>],
 }
 
 /// Build a desired state from the host configuration; this is the
@@ -222,11 +228,14 @@ pub fn desired_from_config(params: &RouteParams<'_>) -> DesiredState {
         addresses,
         captured,
         excluded,
+        include_uid,
+        exclude_uid,
         table_index,
         rule_index,
         mark,
         strict_route,
         dns_leak_prevention,
+        ..
     } = *params;
     let interface: &str = interface;
     let addresses: &[IpNet] = addresses;
@@ -284,6 +293,7 @@ pub fn desired_from_config(params: &RouteParams<'_>) -> DesiredState {
                 fwmark: Some(mark),
                 suppress_prefixlen: None,
                 dport: None,
+                uid_range: None,
             },
             action: RuleAction::Lookup(254),
             tag: tag.clone(),
@@ -302,6 +312,7 @@ pub fn desired_from_config(params: &RouteParams<'_>) -> DesiredState {
                 fwmark: None,
                 suppress_prefixlen: None,
                 dport: None,
+                uid_range: None,
             },
             // The main table, not "continue": a nop rule falls through
             // to the capture rule right below it, and the exclusion
@@ -323,6 +334,7 @@ pub fn desired_from_config(params: &RouteParams<'_>) -> DesiredState {
                 fwmark: None,
                 suppress_prefixlen: None,
                 dport: None,
+                uid_range: None,
             },
             action: RuleAction::Unreachable,
             tag: tag.clone(),
@@ -330,21 +342,66 @@ pub fn desired_from_config(params: &RouteParams<'_>) -> DesiredState {
         priority += 1;
     }
 
-    // Step 3: captured prefixes go to the dedicated table.
-    rules.push(PolicyRule {
-        priority,
-        selector: RuleSelector {
-            destination: Some("0.0.0.0/0".parse().unwrap()),
-            source: None,
-            incoming_interface: None,
-            fwmark: None,
-            suppress_prefixlen: None,
-            dport: None,
-        },
-        action: RuleAction::Lookup(table_index),
-        tag: tag.clone(),
-    });
-    priority += 1;
+    // Step 2.5: UID escapes ahead of the capture — a spared range
+    // answers the main table no matter what the capture below would
+    // do with its packets.
+    for range in exclude_uid {
+        rules.push(PolicyRule {
+            priority,
+            selector: RuleSelector {
+                destination: None,
+                source: None,
+                incoming_interface: None,
+                fwmark: None,
+                suppress_prefixlen: None,
+                dport: None,
+                uid_range: Some(range.clone()),
+            },
+            action: RuleAction::Lookup(254),
+            tag: tag.clone(),
+        });
+        priority += 1;
+    }
+
+    // Step 3: captured prefixes go to the dedicated table — every UID
+    // when the filter is off, one rule per UID range when it is on
+    // (the kernel matches one range per rule; segments are the honest
+    // shape, the same one the reference stack installs).
+    if include_uid.is_empty() {
+        rules.push(PolicyRule {
+            priority,
+            selector: RuleSelector {
+                destination: Some("0.0.0.0/0".parse().unwrap()),
+                source: None,
+                incoming_interface: None,
+                fwmark: None,
+                suppress_prefixlen: None,
+                dport: None,
+                uid_range: None,
+            },
+            action: RuleAction::Lookup(table_index),
+            tag: tag.clone(),
+        });
+        priority += 1;
+    } else {
+        for range in include_uid {
+            rules.push(PolicyRule {
+                priority,
+                selector: RuleSelector {
+                    destination: Some("0.0.0.0/0".parse().unwrap()),
+                    source: None,
+                    incoming_interface: None,
+                    fwmark: None,
+                    suppress_prefixlen: None,
+                    dport: None,
+                    uid_range: Some(range.clone()),
+                },
+                action: RuleAction::Lookup(table_index),
+                tag: tag.clone(),
+            });
+            priority += 1;
+        }
+    }
 
     // Step 4: suppress the default-route fallback in the main table.
     rules.push(PolicyRule {
@@ -356,6 +413,7 @@ pub fn desired_from_config(params: &RouteParams<'_>) -> DesiredState {
             fwmark: None,
             suppress_prefixlen: Some(0),
             dport: None,
+            uid_range: None,
         },
         action: RuleAction::Lookup(table_index),
         tag: tag.clone(),
@@ -373,6 +431,7 @@ pub fn desired_from_config(params: &RouteParams<'_>) -> DesiredState {
                 fwmark: None,
                 suppress_prefixlen: None,
                 dport: Some(53),
+                uid_range: None,
             },
             action: RuleAction::Lookup(254), // main table
             tag: tag.clone(),

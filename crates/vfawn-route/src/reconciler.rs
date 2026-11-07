@@ -336,6 +336,8 @@ mod tests {
             mark: 0,
             strict_route: false,
             dns_leak_prevention: false,
+            include_uid: &[],
+            exclude_uid: &[],
         })
     }
 
@@ -359,6 +361,7 @@ mod tests {
                     fwmark: None,
                     suppress_prefixlen: None,
                     dport: None,
+                    uid_range: None,
                 },
                 action: RuleAction::Lookup(2077),
                 tag: "vfawn-tun9".to_string(),
@@ -442,6 +445,7 @@ mod tests {
                 fwmark: None,
                 suppress_prefixlen: None,
                 dport: None,
+                uid_range: None,
             },
             action: RuleAction::Lookup(2022),
             tag: "vfawn-gone0".to_string(),

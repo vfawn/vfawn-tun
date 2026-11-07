@@ -17,6 +17,8 @@ fn test_desired() -> DesiredState {
         mark: 0,
         strict_route: true,
         dns_leak_prevention: true,
+        include_uid: &[],
+        exclude_uid: &[],
     })
 }
 
@@ -47,6 +49,7 @@ fn rule(prio: u32, tag: &str) -> PolicyRule {
             fwmark: None,
             suppress_prefixlen: None,
             dport: None,
+            uid_range: None,
         },
         action: RuleAction::Lookup(2022),
         tag: tag.to_string(),
@@ -279,6 +282,8 @@ fn the_escape_rule_precedes_every_capture_rule() {
         mark: 0x2022,
         strict_route: false,
         dns_leak_prevention: false,
+        include_uid: &[],
+        exclude_uid: &[],
     });
     let first = d.rules.first().expect("the escape rule exists");
     assert_eq!(first.selector.fwmark, Some(0x2022));
@@ -298,6 +303,8 @@ fn the_escape_rule_precedes_every_capture_rule() {
         mark: 0,
         strict_route: false,
         dns_leak_prevention: false,
+        include_uid: &[],
+        exclude_uid: &[],
     });
     assert!(unmarked.rules.iter().all(|r| r.selector.fwmark.is_none()));
 }
@@ -314,6 +321,8 @@ fn strict_route_adds_unreachable_rule() {
         mark: 0,
         strict_route: true,
         dns_leak_prevention: false,
+        include_uid: &[],
+        exclude_uid: &[],
     });
     assert!(
         strict
@@ -332,6 +341,8 @@ fn strict_route_adds_unreachable_rule() {
         mark: 0,
         strict_route: false,
         dns_leak_prevention: false,
+        include_uid: &[],
+        exclude_uid: &[],
     });
     assert!(
         !lax.rules
@@ -353,6 +364,8 @@ fn dns_leak_prevention_adds_rule() {
         mark: 0,
         strict_route: false,
         dns_leak_prevention: true,
+        include_uid: &[],
+        exclude_uid: &[],
     });
     let without = desired_from_config(&RouteParams {
         interface: "t",
@@ -364,6 +377,8 @@ fn dns_leak_prevention_adds_rule() {
         mark: 0,
         strict_route: false,
         dns_leak_prevention: false,
+        include_uid: &[],
+        exclude_uid: &[],
     });
     assert!(with.rules.len() > without.rules.len());
 }
@@ -503,6 +518,7 @@ fn the_kernel_own_tables_are_never_selected_into_orphans() {
                 fwmark: Some(0x2022),
                 suppress_prefixlen: None,
                 dport: None,
+                uid_range: None,
             },
             action: RuleAction::Lookup(254),
             tag: "vfawn-tun0".to_string(),
@@ -512,4 +528,102 @@ fn the_kernel_own_tables_are_never_selected_into_orphans() {
         orphan_rules(&observed).is_empty(),
         "main always routes; the escape rule is harmless"
     );
+}
+
+// --- Per-app UID filtering ------------------------------------------
+
+fn uid_desired(
+    inc: &[std::ops::RangeInclusive<u32>],
+    exc: &[std::ops::RangeInclusive<u32>],
+) -> DesiredState {
+    desired_from_config(&RouteParams {
+        interface: "tun0",
+        addresses: &["198.18.0.1/15".parse().unwrap()],
+        captured: &["0.0.0.0/0".parse().unwrap()],
+        excluded: &[],
+        table_index: 2022,
+        rule_index: 9000,
+        mark: 0,
+        strict_route: false,
+        dns_leak_prevention: false,
+        include_uid: inc,
+        exclude_uid: exc,
+    })
+}
+
+#[test]
+fn uid_ranges_segment_the_capture() {
+    let state = uid_desired(&[1000..=1999, 10000..=10042], &[]);
+    let captures: Vec<&PolicyRule> = state
+        .rules
+        .iter()
+        .filter(|r| {
+            matches!(r.action, RuleAction::Lookup(2022))
+                && r.selector.destination.is_some_and(|d| d.prefix_len() == 0)
+        })
+        .collect();
+    assert_eq!(captures.len(), 2, "one rule per segment");
+    assert!(
+        captures.iter().all(|r| r.selector.uid_range.is_some()),
+        "each carries its range"
+    );
+    assert!(
+        captures
+            .iter()
+            .any(|r| r.selector.uid_range == Some(1000..=1999))
+    );
+    assert!(
+        captures
+            .iter()
+            .any(|r| r.selector.uid_range == Some(10000..=10042))
+    );
+}
+
+#[test]
+fn an_empty_filter_keeps_the_catch_all() {
+    let state = uid_desired(&[], &[]);
+    let captures: Vec<&PolicyRule> = state
+        .rules
+        .iter()
+        .filter(|r| {
+            matches!(r.action, RuleAction::Lookup(2022))
+                && r.selector.destination.is_some_and(|d| d.prefix_len() == 0)
+        })
+        .collect();
+    assert_eq!(captures.len(), 1);
+    assert!(captures[0].selector.uid_range.is_none());
+}
+
+#[test]
+fn excluded_uids_escape_to_main_ahead_of_the_capture() {
+    let state = uid_desired(&[], &[5000..=5099]);
+    let escape = state
+        .rules
+        .iter()
+        .find(|r| r.selector.uid_range == Some(5000..=5099))
+        .expect("the escape rule exists");
+    assert!(
+        matches!(escape.action, RuleAction::Lookup(254)),
+        "the spared range answers the main table"
+    );
+    // And it sits above the capture rules.
+    let capture_top = state
+        .rules
+        .iter()
+        .filter(|r| matches!(r.action, RuleAction::Lookup(2022)))
+        .map(|r| r.priority)
+        .min()
+        .expect("a capture");
+    assert!(escape.priority < capture_top, "escape precedes capture");
+}
+
+#[test]
+fn uid_rules_round_trip_through_the_plan() {
+    // Apply, snapshot, and re-plan against the uid-carrying state: the
+    // second plan must be empty (identity includes the range).
+    let desired = uid_desired(&[1000..=1999], &[5000..=5099]);
+    let mut observed = ObservedState::default();
+    simulate_apply(&plan(&desired, &observed), &mut observed);
+    let second = plan(&desired, &observed);
+    assert!(second.is_empty(), "uid rules are idempotent");
 }

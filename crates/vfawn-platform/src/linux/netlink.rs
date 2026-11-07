@@ -21,7 +21,7 @@ use netlink_packet_route::{
     AddressFamily,
     address::{AddressAttribute, AddressMessage},
     route::{RouteAttribute, RouteMessage},
-    rule::{RuleAction as WireAction, RuleAttribute, RuleMessage},
+    rule::{RuleAction as WireAction, RuleAttribute, RuleMessage, RuleUidRange},
 };
 use rtnetlink::{Handle, IpVersion, new_connection};
 
@@ -238,6 +238,14 @@ impl NetlinkBackend {
         // only the escape rule carries one, and the attribute list is
         // the one shape both families share.
         let fwmark = rule.selector.fwmark.map(RuleAttribute::FwMark);
+        // The per-app filter's kernel face (FRA_UID_RANGE): one range
+        // per rule, exactly the shape the planner segments into.
+        let uid_range = rule.selector.uid_range.clone().map(|range| {
+            RuleAttribute::UidRange(RuleUidRange {
+                start: *range.start(),
+                end: *range.end(),
+            })
+        });
         let result = match dest {
             IpAddr::V4(d) => {
                 let mut req = self.handle.rule().add().v4();
@@ -257,6 +265,9 @@ impl NetlinkBackend {
                 }
                 if let Some(mark) = fwmark {
                     req.message_mut().attributes.push(mark);
+                }
+                if let Some(range) = uid_range {
+                    req.message_mut().attributes.push(range);
                 }
                 req.execute().await
             }
@@ -278,6 +289,9 @@ impl NetlinkBackend {
                 }
                 if let Some(mark) = fwmark {
                     req.message_mut().attributes.push(mark);
+                }
+                if let Some(range) = uid_range {
+                    req.message_mut().attributes.push(range);
                 }
                 req.execute().await
             }
@@ -310,6 +324,14 @@ impl NetlinkBackend {
         }
         if let Some(dest) = &rule.selector.destination {
             msg.attributes.push(RuleAttribute::Destination(dest.addr()));
+        }
+        // The uid range takes part in rule identity the same way: a
+        // per-app rule and the catch-all differ by exactly this.
+        if let Some(range) = &rule.selector.uid_range {
+            msg.attributes.push(RuleAttribute::UidRange(RuleUidRange {
+                start: *range.start(),
+                end: *range.end(),
+            }));
         }
         self.handle.rule().del(msg).execute().await.map_err(nl_err)
     }
@@ -455,12 +477,14 @@ fn parse_rule(msg: &RuleMessage) -> Option<PolicyRule> {
     let mut source = None;
     let mut suppress_prefixlen = None;
     let mut fwmark = None;
+    let mut uid_range = None;
 
     for attr in &msg.attributes {
         match attr {
             RuleAttribute::Priority(p) => priority = *p,
             RuleAttribute::Table(t) => table = *t,
             RuleAttribute::FwMark(m) => fwmark = Some(*m),
+            RuleAttribute::UidRange(range) => uid_range = Some(range.start..=range.end),
             RuleAttribute::SuppressPrefixLen(len) => {
                 suppress_prefixlen = Some((*len).min(u8::MAX as u32) as u8)
             }
@@ -500,6 +524,7 @@ fn parse_rule(msg: &RuleMessage) -> Option<PolicyRule> {
             fwmark,
             suppress_prefixlen,
             dport: None,
+            uid_range,
         },
         action,
         tag: String::new(),

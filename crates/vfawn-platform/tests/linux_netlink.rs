@@ -137,6 +137,7 @@ fn rule_add_remove_by_priority() {
             fwmark: None,
             suppress_prefixlen: None,
             dport: None,
+            uid_range: None,
         },
         action: RuleAction::Lookup(254),
         tag: "vfawn-test".to_string(),
