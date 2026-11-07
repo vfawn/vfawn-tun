@@ -891,10 +891,7 @@ mod tests {
         }
         lane.register(key, fds[0]);
         let entry = lane.entry_for(&key).expect("registered");
-        assert!(
-            !entry.cursor_armed(),
-            "a registration alone arms nothing"
-        );
+        assert!(!entry.cursor_armed(), "a registration alone arms nothing");
         assert_eq!(entry.recv_nxt_value(), 0);
 
         entry.activate(500, 900, 480, 65535, None);
@@ -908,10 +905,7 @@ mod tests {
         assert_eq!(entry.latest_ack().0, 480);
 
         entry.deactivate();
-        assert!(
-            entry.cursor_armed(),
-            "deactivation keeps the cursor's word"
-        );
+        assert!(entry.cursor_armed(), "deactivation keeps the cursor's word");
         assert_eq!(entry.recv_nxt_value(), 500);
 
         lane.unregister(&key);
