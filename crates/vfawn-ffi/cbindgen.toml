@@ -1,0 +1,45 @@
+# The header generator's contract: the C names are the API (snake
+# case, the vfawn_ prefix), the documentation travels, and only the
+# listed surface crosses.
+language = "C"
+include_guard = "VFAWN_H"
+autogen_warning = "/* Regenerate with VFAWN_REGEN_HEADER=1 cargo test -p vfawn-ffi; do not edit by hand. */"
+documentation = true
+documentation_style = "doxy"
+
+[parse]
+parse_deps = false
+
+[export]
+include = [
+    "vfawn_instance_t",
+    "vfawn_handler_vtable_t",
+    "vfawn_stats_t",
+    "vfawn_judge_fn",
+    "VFAWN_ABI_VERSION",
+    "VFAWN_NULL_HANDLE",
+    "VFAWN_OK",
+    "VFAWN_ERR_INVALID_CONFIG",
+    "VFAWN_ERR_ALREADY_RUNNING",
+    "VFAWN_ERR_NOT_RUNNING",
+    "VFAWN_ERR_UNSUPPORTED",
+    "VFAWN_ERR_BAD_HANDLE",
+    "VFAWN_ERR_BUFFER_TOO_SMALL",
+    "VFAWN_ERR_NEEDS_RESTART",
+    "VFAWN_ERR_PANIC",
+    "VFAWN_ERR_REENTRANT",
+    "VFAWN_VERDICT_ACCEPT",
+    "VFAWN_VERDICT_BYPASS",
+    "VFAWN_VERDICT_DROP",
+    "VFAWN_VERDICT_REJECT",
+    "vfawn_version",
+    "vfawn_config_validate",
+    "vfawn_instance_create",
+    "vfawn_set_handler",
+    "vfawn_instance_start",
+    "vfawn_instance_stats",
+    "vfawn_instance_apply_config",
+    "vfawn_instance_shutdown",
+    "vfawn_instance_destroy",
+    "vfawn_last_error_message",
+]

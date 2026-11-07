@@ -9,4 +9,15 @@ publish.workspace = true
 [lints]
 workspace = true
 
+[lib]
+crate-type = ["rlib", "cdylib"]
+
 [dependencies]
+vfawn = { path = "../vfawn" }
+vfawn-core = { path = "../vfawn-core" }
+serde.workspace = true
+serde_json.workspace = true
+async-trait = "0.1"
+
+[dev-dependencies]
+cbindgen = "0.29"

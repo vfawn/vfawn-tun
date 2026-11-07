@@ -66,6 +66,23 @@ jobs:
         if: runner.os == 'macOS'
         run: sudo -E env "PATH=$PATH" cargo test -p vfawn-device --test darwin_batch -- --ignored --nocapture
 
+      # The C host's whole lifecycle against the cdylib, with the
+      # privileges interface creation needs on each platform. The
+      # Windows C compile is a manual-verification item; its ABI is
+      # covered by the crate tests (header diff, hostile inputs).
+      - name: C ABI example (privileged)
+        if: runner.os != 'Windows'
+        run: |
+          cargo build -p vfawn-ffi
+          cc crates/vfawn-ffi/examples/c/lifecycle.c \
+            -I crates/vfawn-ffi/include -L target/debug -lvfawn_ffi \
+            -o /tmp/vfawn-lifecycle
+          if [ "$(uname)" = "Darwin" ]; then
+            sudo env DYLD_LIBRARY_PATH="$PWD/target/debug" /tmp/vfawn-lifecycle
+          else
+            sudo env LD_LIBRARY_PATH="$PWD/target/debug" /tmp/vfawn-lifecycle
+          fi
+
       # The Windows acceptance: the runner is administrator, so the
       # embedded driver loads, the adapter appears, routes move
       # through the live tables, a session echoes, and shutdown
