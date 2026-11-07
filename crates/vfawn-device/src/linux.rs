@@ -19,7 +19,7 @@ use std::os::fd::RawFd;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError};
+use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::thread;
 
 use bytes::BytesMut;
@@ -187,10 +187,26 @@ impl TunDevice {
             stopped: AtomicBool::new(false),
             dispatch: Mutex::new(None),
         });
+        // The descriptor is full duplex: reads and writes are
+        // independent halves of the tun socket, so the write side
+        // earns its own thread on its own handle. One thread doing
+        // both saturated at the downlink's two gigabits (the peer's
+        // acknowledgments then queued behind the unread side until
+        // the kernel's tun queue overflowed — tun0 tx_dropped — and
+        // every dropped acknowledgment became a retransmission
+        // cascade), and no amount of interleaving fairness fixes a
+        // core that is simply full.
+        let device = Arc::new(SharedTun(device));
+        let writer_shared = Arc::clone(&shared);
+        let writer_device = Arc::clone(&device);
+        thread::Builder::new()
+            .name("vfawn-tun-writer".into())
+            .spawn(move || write_loop(writer_shared, writer_device, write_rx, caps.gso))?;
         let io_shared = Arc::clone(&shared);
+        let reader_device = Arc::clone(&device);
         thread::Builder::new()
             .name("vfawn-tun-io".into())
-            .spawn(move || io_loop(io_shared, device, write_rx))?;
+            .spawn(move || io_loop(io_shared, reader_device, caps.gso))?;
         Ok(TunDevice {
             shared,
             reads: Some(read_rx),
@@ -200,14 +216,26 @@ impl TunDevice {
     }
 }
 
-/// The I/O thread: one descriptor, two directions, one loop.
-///
-/// Writes drain first (a batch already waiting is worth more than one
-/// more poll), then the kernel read blocks until a frame, the poll
-/// budget, or a wake arrives; a wake is either a write enqueue or the
-/// stop flag, which the loop head sorts.
-fn io_loop(shared: Arc<Shared>, mut device: SyncDevice, writes: Receiver<Vec<BytesMut>>) {
-    let mut drop_counter = 0u64;
+/// The device shared by the reader and writer threads. The tun file
+/// is full duplex and its read and write syscalls are independent;
+/// every method used here takes the device by shared reference and is
+/// a stateless call on the descriptor.
+struct SharedTun(SyncDevice);
+// SAFETY: the kernel serializes file operations on the same
+// descriptor; the two threads issue disjoint halves (read vs write)
+// of a stateless full-dupplex socket, and none of the methods called
+// through this wrapper mutate shared Rust-side state.
+#[expect(unsafe_code)]
+unsafe impl Sync for SharedTun {}
+
+/// The reader half of the device: the kernel read blocks until a
+/// frame, the poll budget, or a wake arrives (a wake is the stop
+/// flag's), the fast dispatch claims what it can, and the answers it
+/// produced leave inline on this thread's own write — the turnaround
+/// a claimed payload's acknowledgment owes the peer is one syscall,
+/// not a channel crossing. Everything else a caller wrote travels the
+/// write channel to the writer thread.
+fn io_loop(shared: Arc<Shared>, device: Arc<SharedTun>, vnet: bool) {
     let mut sizes = vec![0usize; BATCH];
     // The buffers the kernel read fills hold one split segment each
     // (the merged burst lands whole in the scratch above and the
@@ -229,43 +257,13 @@ fn io_loop(shared: Arc<Shared>, mut device: SyncDevice, writes: Receiver<Vec<Byt
                 buf.resize(seg, 0);
             }
         }
-        loop {
-            match writes.try_recv() {
-                Ok(batch) => {
-                    if let Err(error) =
-                        send_batch(&mut device, &mut gro_table, &mut staging, &batch)
-                    {
-                        // A queue that cannot take the batch right now
-                        // is backpressure, not death: the drop behaves
-                        // like a qdisc drop (TCP above retransmits,
-                        // UDP loses one datagram), which beats taking
-                        // the whole interface down mid-transfer ,  the
-                        // kernel removes the device with the last fd,
-                        // and every route falls through to a bypass.
-                        if error.kind() == ErrorKind::NotConnected {
-                            eprintln!("vfawn: tun I/O stopped: device down");
-                            shared.stopped.store(true, Ordering::Release);
-                            return;
-                        }
-                        drop_counter = drop_counter.wrapping_add(1);
-                        if drop_counter == 1 || drop_counter.is_multiple_of(10_000) {
-                            eprintln!(
-                                "vfawn: tun write refused ({error}); dropped {drop_counter} batches"
-                            );
-                        }
-                    }
-                }
-                Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => {
-                    eprintln!("vfawn: tun I/O stopped: writers gone");
-                    return;
-                }
-            }
-        }
         if shared.stopped.load(Ordering::Acquire) {
             return;
         }
-        match device.recv_multiple_intr(&mut original, &mut bufs, &mut sizes, 0, &shared.event) {
+        match device
+            .0
+            .recv_multiple_intr(&mut original, &mut bufs, &mut sizes, 0, &shared.event)
+        {
             Ok(count) if count > 0 => {
                 // The fast dispatch first: a claimed packet is answered
                 // here — payload out through the claim, answer frames
@@ -303,7 +301,7 @@ fn io_loop(shared: Arc<Shared>, mut device: SyncDevice, writes: Receiver<Vec<Byt
                 // death stops the loop.
                 if !answers.is_empty()
                     && let Err(error) =
-                        send_batch(&mut device, &mut gro_table, &mut staging, &answers)
+                        send_batch(&device.0, vnet, &mut gro_table, &mut staging, &mut answers)
                     && error.kind() == ErrorKind::NotConnected
                 {
                     eprintln!("vfawn: tun I/O stopped: device down");
@@ -357,16 +355,68 @@ fn io_loop(shared: Arc<Shared>, mut device: SyncDevice, writes: Receiver<Vec<Byt
     }
 }
 
+/// The writer half of the device: the write channel's one consumer.
+/// A batch arriving wakes it directly (the channel's own blocking
+/// receive — no event fd, no polling), a full queue is the
+/// backpressure senders wait on, and a refused write is backpressure
+/// or death by the same rules the read half lives by.
+fn write_loop(
+    shared: Arc<Shared>,
+    device: Arc<SharedTun>,
+    writes: Receiver<Vec<BytesMut>>,
+    vnet: bool,
+) {
+    let mut drop_counter = 0u64;
+    let mut gro_table = tun_rs::GROTable::default();
+    let mut staging: Vec<BytesMut> = Vec::new();
+    while !shared.stopped.load(Ordering::Acquire) {
+        let mut batch = match writes.recv_timeout(std::time::Duration::from_millis(50)) {
+            Ok(batch) => batch,
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                eprintln!("vfawn: tun writer stopped: writers gone");
+                return;
+            }
+        };
+        if let Err(error) = send_batch(&device.0, vnet, &mut gro_table, &mut staging, &mut batch) {
+            // A queue that cannot take the batch right now is
+            // backpressure, not death: the drop behaves like a qdisc
+            // drop (TCP above retransmits, UDP loses one datagram),
+            // which beats taking the whole interface down
+            // mid-transfer — the kernel removes the device with the
+            // last fd, and every route falls through to a bypass.
+            if error.kind() == ErrorKind::NotConnected {
+                eprintln!("vfawn: tun writer stopped: device down");
+                shared.stopped.store(true, Ordering::Release);
+                return;
+            }
+            drop_counter = drop_counter.wrapping_add(1);
+            if drop_counter == 1 || drop_counter.is_multiple_of(10_000) {
+                eprintln!("vfawn: tun write refused ({error}); dropped {drop_counter} batches");
+            }
+        }
+    }
+}
+
 /// One write batch onto the wire: staged into header-padded frames and
 /// handed over in a single kernel call on the offload path, one send
 /// per frame otherwise.
 fn send_batch(
-    device: &mut SyncDevice,
+    device: &SyncDevice,
+    vnet: bool,
     gro_table: &mut tun_rs::GROTable,
     staging: &mut Vec<BytesMut>,
-    batch: &[BytesMut],
+    batch: &mut [BytesMut],
 ) -> io::Result<()> {
-    for frame in batch {
+    if !vnet {
+        // Without the virtio header there is nothing to stage: the
+        // frames are the packets, and the batch's own buffers reach
+        // the kernel untouched — no per-frame copy, no per-frame
+        // allocation, on the one thread the whole pipeline shares.
+        device.send_multiple(gro_table, batch, 0)?;
+        return Ok(());
+    }
+    for frame in batch.iter() {
         let mut padded = BytesMut::with_capacity(VIRTIO_NET_HDR_LEN + frame.len());
         padded.resize(VIRTIO_NET_HDR_LEN, 0);
         padded.extend_from_slice(frame);
@@ -407,12 +457,14 @@ impl PacketDevice for TunDevice {
         }
         let batch: Vec<BytesMut> = bufs.iter_mut().map(std::mem::take).collect();
         let count = batch.len();
-        // Channel depth is the backpressure; the wake makes the I/O
-        // thread see the batch now rather than at the poll budget.
+        // Channel depth is the backpressure; the writer thread's
+        // blocking receive is the wake — no event fd rides the write
+        // path any more (one trigger per batch was thousands of extra
+        // syscalls per second on the reader once the downlink filled
+        // the pipe).
         if self.shared.writes.send(batch).is_err() {
             return Err(io::Error::new(ErrorKind::NotConnected, "device is down"));
         }
-        self.shared.event.trigger()?;
         Ok(count)
     }
 
