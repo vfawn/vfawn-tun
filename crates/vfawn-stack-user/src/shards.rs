@@ -533,6 +533,12 @@ impl Shards {
                 .spawn(move || {
                     let mut device = read_device;
                     let mut bufs = vec![BytesMut::new(); 8];
+                    // Fragment reassembly lives ahead of the flow hash:
+                    // a non-first fragment has no ports to hash, and a
+                    // first fragment alone is a truncated datagram —
+                    // the table releases whole datagrams back into this
+                    // stream as if the wire had never split them.
+                    let mut reassembler = crate::fragment::Reassembler::new();
                     'outer: loop {
                         if stop_all_for_producer.load(Ordering::Acquire) {
                             break;
@@ -540,8 +546,20 @@ impl Shards {
                         match device.read_batch(&mut bufs) {
                             Ok(0) => std::thread::sleep(Duration::from_millis(1)),
                             Ok(count) => {
+                                reassembler.sweep(Instant::now());
                                 for buf in bufs.iter_mut().take(count) {
-                                    let shard = flow_key(buf)
+                                    let packet = match reassembler.feed(buf, Instant::now()) {
+                                        crate::fragment::Outcome::Pass => std::mem::take(buf),
+                                        crate::fragment::Outcome::Held => {
+                                            *buf = producer_pool.packet(producer_mtu);
+                                            continue;
+                                        }
+                                        crate::fragment::Outcome::Complete(whole) => {
+                                            *buf = producer_pool.packet(producer_mtu);
+                                            whole
+                                        }
+                                    };
+                                    let shard = flow_key(&packet)
                                         .map(|flow| shard_hash_of(&flow, shard_count))
                                         .unwrap_or(0);
                                     let lane = &mut staging[shard];
@@ -557,12 +575,7 @@ impl Shards {
                                     if lane.capacity() == 0 {
                                         lane.reserve_exact(16);
                                     }
-                                    lane.push(Some(std::mem::take(buf)));
-                                    // The reader's slot refills from the
-                                    // pool: the buffer the writer released
-                                    // comes back around instead of the pool
-                                    // growing into a one-way sink.
-                                    *buf = producer_pool.packet(producer_mtu);
+                                    lane.push(Some(packet));
                                 }
                                 for shard in 0..shard_count {
                                     if !staging[shard].is_empty()
