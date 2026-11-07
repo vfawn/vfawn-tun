@@ -104,16 +104,24 @@ impl SpliceEntry {
     /// Seed the shared cursors from the machine's state. Called once,
     /// by the slot, on the first segment it sees for a registered
     /// flow; after this the io thread's dispatch claims the flow's
-    /// steady segments before they enter the read channel.
+    /// steady segments before they enter the read channel. Every
+    /// cursor the dispatch or the slot's sweep may later adopt is
+    /// seeded here — an unseeded one keeps the constructor's zero,
+    /// and adopting that zero (which the half-space test reads as
+    /// forward whenever the machine's own number lives in the upper
+    /// half of sequence space) has wiped both the receive cursor and
+    /// the send floor to zero, each in its turn.
     pub fn activate(
         &self,
         recv_nxt: u32,
         send_nxt: u32,
+        una: u32,
         window: u16,
         bell: Option<std::sync::Arc<crate::shards::ShardBell>>,
     ) {
         self.recv_nxt.store(recv_nxt, Ordering::Release);
         self.send_nxt.store(send_nxt, Ordering::Release);
+        self.peer_ack.store(una, Ordering::Release);
         self.window.store(window, Ordering::Release);
         self.armed.store(true, Ordering::Release);
         if let Some(bell) = bell
@@ -772,7 +780,7 @@ mod tests {
         assert!(!lane.try_dispatch(&packet, &mut staged));
 
         let entry = lane.entry_for(&key).expect("registered");
-        entry.activate(500, 900, 65535, None);
+        entry.activate(500, 900, 480, 65535, None);
 
         // In-order current segment: claimed, cursor advanced, the
         // payload staged (nothing on the socket yet — the batch has
@@ -889,9 +897,15 @@ mod tests {
         );
         assert_eq!(entry.recv_nxt_value(), 0);
 
-        entry.activate(500, 900, 65535, None);
+        entry.activate(500, 900, 480, 65535, None);
         assert!(entry.cursor_armed());
         assert_eq!(entry.recv_nxt_value(), 500);
+        // The send floor rides the same rule: the adoption reads this
+        // before any dispatch has heard an acknowledgment, and an
+        // unseeded zero there once read as a valid acknowledgment —
+        // the send floor wiped to zero, the in-flight arithmetic
+        // overflowed to gigabytes, and the drain starved forever.
+        assert_eq!(entry.latest_ack().0, 480);
 
         entry.deactivate();
         assert!(

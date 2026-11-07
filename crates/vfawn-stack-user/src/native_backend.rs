@@ -574,6 +574,7 @@ impl SlotLogic for TcpSlot {
                     entry.activate(
                         self.connection.recv_nxt(),
                         self.connection.send_nxt(),
+                        self.connection.send_una(),
                         self.connection.fast_window(),
                         Some(Arc::clone(&self.shard_wake)),
                     );
