@@ -362,24 +362,17 @@ fn io_loop(shared: Arc<Shared>, mut device: SyncDevice, writes: Receiver<Vec<Byt
 /// per frame otherwise.
 fn send_batch(
     device: &mut SyncDevice,
-    _gro_table: &mut tun_rs::GROTable,
+    gro_table: &mut tun_rs::GROTable,
     staging: &mut Vec<BytesMut>,
     batch: &[BytesMut],
 ) -> io::Result<()> {
-    // One write per frame, bypassing the send_multiple GRO pass:
-    // that pass merges our outgoing TCP segments (contiguous sequence
-    // numbers look mergeable to it), and the merged frame carries a
-    // GSO vnet header the kernel then tries to segment — a path our
-    // plain zero-header frames never asked for, and one that corrupts
-    // the byte stream (measured: downlink from gigabits to zero the
-    // moment sustained data flows). Reading keeps the kernel's GRO;
-    // writing keeps one plain frame per syscall.
     for frame in batch {
         let mut padded = BytesMut::with_capacity(VIRTIO_NET_HDR_LEN + frame.len());
         padded.resize(VIRTIO_NET_HDR_LEN, 0);
         padded.extend_from_slice(frame);
-        device.send(&padded)?;
+        staging.push(padded);
     }
+    device.send_multiple(gro_table, staging, VIRTIO_NET_HDR_LEN)?;
     staging.clear();
     Ok(())
 }
