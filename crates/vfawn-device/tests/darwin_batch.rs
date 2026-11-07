@@ -203,8 +203,12 @@ fn ip_checksum(header: &[u8]) -> u16 {
 }
 
 fn route_add(name: &str) {
+    route_add_on(name, ROUTED_NET)
+}
+
+fn route_add_on(name: &str, net: &str) {
     let status = Command::new("route")
-        .args(["-n", "add", "-net", ROUTED_NET, "-interface", name])
+        .args(["-n", "add", "-net", net, "-interface", name])
         .output()
         .expect("route command");
     assert!(
@@ -215,8 +219,12 @@ fn route_add(name: &str) {
 }
 
 fn route_del(name: &str) {
+    route_del_on(name, ROUTED_NET)
+}
+
+fn route_del_on(name: &str, net: &str) {
     let _ = Command::new("route")
-        .args(["-n", "delete", "-net", ROUTED_NET, "-interface", name])
+        .args(["-n", "delete", "-net", net, "-interface", name])
         .output();
 }
 
@@ -234,11 +242,18 @@ fn assert_root() {
 #[ignore]
 fn a_host_fd_is_adopted_and_reads() {
     assert_root();
+    // Its own address island: the sibling root test owns 198.18.0.x,
+    // and a shared island would let one test's teardown race the
+    // other's bind. This test lives on 198.18.2.x.
+    const ADOPTED_ADDR: Ipv4Addr = Ipv4Addr::new(198, 18, 2, 1);
+    const ADOPTED_NET: &str = "198.18.2.0/24";
+    const ADOPTED_PROBE: Ipv4Addr = Ipv4Addr::new(198, 18, 2, 7);
+
     // Create with the host's tooling — address included, as a host
     // that built the interface would have — then hand over only the fd.
     let owned = tun_rs::DeviceBuilder::new()
         .mtu(1500)
-        .ipv4(IFACE_ADDR, 15, None)
+        .ipv4(ADOPTED_ADDR, 24, None)
         .build_sync()
         .expect("host utun");
     let fd = owned.as_raw_fd();
@@ -249,11 +264,11 @@ fn a_host_fd_is_adopted_and_reads() {
     let mut device = unsafe { TunDevice::from_fd(fd) }.expect("adopt");
 
     let name = device.name().expect("name");
-    route_add(&name);
+    route_add_on(&name, ADOPTED_NET);
     let socket =
-        std::net::UdpSocket::bind(std::net::SocketAddr::from((IFACE_ADDR, 0))).expect("bind");
+        std::net::UdpSocket::bind(std::net::SocketAddr::from((ADOPTED_ADDR, 0))).expect("bind");
     socket
-        .connect(std::net::SocketAddr::from((PROBE_ADDR, PROBE_PORT)))
+        .connect(std::net::SocketAddr::from((ADOPTED_PROBE, PROBE_PORT)))
         .expect("connect");
     for _ in 0..8 {
         socket.send(b"adopted-fd-probe").expect("send");
@@ -267,6 +282,6 @@ fn a_host_fd_is_adopted_and_reads() {
         seen += count;
     }
     assert!(seen > 0, "the adopted fd reads the probes");
-    route_del(&name);
+    route_del_on(&name, ADOPTED_NET);
     device.shutdown().expect("shutdown");
 }

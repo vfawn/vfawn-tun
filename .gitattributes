@@ -1,0 +1,4 @@
+# The generated header must byte-match on every platform; the C
+# example compiles identically everywhere with LF.
+*.h text eol=lf
+*.c text eol=lf
