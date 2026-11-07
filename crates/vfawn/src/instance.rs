@@ -62,6 +62,9 @@ pub struct Instance {
     /// The firewall posture taken at start, for the symmetric removal
     /// at shutdown. None when nothing was taken.
     firewall_rule: Option<String>,
+    /// The instance's own session accounting, attached to every flow
+    /// the wrapper handler accepts.
+    tracker: Arc<crate::stats::InstanceTracker>,
 }
 
 impl Instance {
@@ -83,6 +86,7 @@ impl Instance {
             reconciler: None,
             orchestration: None,
             firewall_rule: None,
+            tracker: Arc::new(crate::stats::InstanceTracker::new()),
         })
     }
 
@@ -99,11 +103,35 @@ impl Instance {
                 "instance is already running",
             ));
         }
-        self.start_inner(handler)
+        // The instance counts every session through the same tracker
+        // pipe a host's own counting rides; the host handler is
+        // untouched below the wrapper.
+        let counted = Arc::new(crate::stats::StatsHandler::new(
+            handler,
+            Arc::clone(&self.tracker),
+        ));
+        self.start_inner(counted)
     }
 
     fn start_inner(&mut self, handler: Arc<dyn SessionHandler>) -> io::Result<()> {
-        let device = vfawn_device::TunDevice::create(&self.config.device)?;
+        // The host's own descriptor, when it supplies one: a network
+        // extension or a supervisor that created the interface itself
+        // hands over the fd instead of letting this process open a
+        // second one. The framing contract (raw IP, no packet
+        // information, no offload headers) is the host's to uphold.
+        let device = match self.config.device.file_descriptor {
+            #[cfg(unix)]
+            Some(fd) => {
+                // SAFETY: the configuration names a descriptor the
+                // host owns and intends to hand over; adoption takes
+                // its ownership for the instance's lifetime.
+                #[expect(unsafe_code)]
+                unsafe {
+                    vfawn_device::TunDevice::from_fd(fd)?
+                }
+            }
+            _ => vfawn_device::TunDevice::create(&self.config.device)?,
+        };
 
         // The policy resolves before the first packet: Auto consults
         // its matrix (platform, capture mode, kernel-path facts), the
@@ -333,9 +361,12 @@ impl Instance {
 
     /// Current counters.
     pub fn stats(&self) -> StatsSnapshot {
+        let (sessions_total, bytes_forward, bytes_reverse) = self.tracker.snapshot();
         StatsSnapshot {
+            sessions_total,
+            bytes_forward,
+            bytes_reverse,
             panics_contained: self.panics.load(Ordering::Relaxed),
-            ..StatsSnapshot::default()
         }
     }
 

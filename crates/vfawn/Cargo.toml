@@ -29,3 +29,4 @@ backend-native = ["dep:vfawn-stack-user", "vfawn-stack-user/backend-native", "de
 
 [dev-dependencies]
 vfawn-testsuite = { path = "../vfawn-testsuite" }
+vfawn-stack-user = { path = "../vfawn-stack-user", features = ["backend-native"] }

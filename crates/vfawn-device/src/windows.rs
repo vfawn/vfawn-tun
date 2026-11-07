@@ -96,6 +96,27 @@ impl TunDevice {
         Ok(self.name.clone().unwrap_or_else(|| "tun0".to_string()))
     }
 
+    /// Adopt a descriptor supplied by the host. This platform has no
+    /// such thing: a wintun adapter is adopted by name (the device
+    /// creation path opens an existing adapter under the configured
+    /// name), and a bare handle carries none of the ring state a
+    /// session needs. The call answers with
+    /// [`io::ErrorKind::Unsupported`] rather than pretending.
+    ///
+    /// # Safety
+    ///
+    /// The descriptor is not consumed; the caller keeps its ownership.
+    ///
+    /// The body touches nothing — no descriptor, no system state; the
+    /// error is the whole answer.
+    #[expect(unsafe_code)]
+    pub unsafe fn from_fd(_fd: std::os::windows::io::RawSocket) -> io::Result<Self> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "wintun adapters are adopted by name; descriptor adoption is a Unix concept",
+        ))
+    }
+
     /// A handle through which another thread can stop the device.
     pub fn shutdown_handle(&self) -> ShutdownHandle {
         ShutdownHandle {

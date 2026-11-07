@@ -64,7 +64,7 @@ jobs:
       # criterion wants on record.
       - name: darwin batch e2e (root)
         if: runner.os == 'macOS'
-        run: sudo -E env "PATH=$PATH" cargo test -p vfawn-device --test darwin_batch -- --ignored --exact --nocapture
+        run: sudo -E env "PATH=$PATH" cargo test -p vfawn-device --test darwin_batch -- --ignored --nocapture
 
       # The Windows acceptance: the runner is administrator, so the
       # embedded driver loads, the adapter appears, routes move

@@ -51,6 +51,9 @@ pub struct UdpSlot {
     /// reply the host wrote must not sit in the lane until the idle
     /// sweep or the next datagram notices it.
     shard_wake: Arc<ShardBell>,
+    /// The tracker the host's verdict attached, handed to the session
+    /// with the first datagram.
+    tracker: Option<Arc<dyn vfawn_core::FlowTrackerHook>>,
     judged: bool,
     flow: FlowInfo,
     /// The wire endpoints, as the emitter wants them (the captured
@@ -74,6 +77,7 @@ pub struct UdpHandoff {
     pub lane: Arc<std::sync::Mutex<VecDeque<PendingDatagram>>>,
     pub lane_bytes: Arc<AtomicUsize>,
     pub shard_wake: Arc<ShardBell>,
+    pub tracker: Option<Arc<dyn vfawn_core::FlowTrackerHook>>,
     pub client_addr: std::net::SocketAddrV4,
     pub server_addr: std::net::SocketAddrV4,
 }
@@ -91,6 +95,7 @@ impl UdpSlot {
             lane: Arc::new(std::sync::Mutex::new(VecDeque::new())),
             lane_bytes: Arc::new(AtomicUsize::new(0)),
             shard_wake,
+            tracker: None,
             judged: false,
             flow: FlowInfo {
                 network: Network::Udp,
@@ -123,10 +128,13 @@ impl UdpSlot {
             self.handler.judge_flow(&self.flow, &[])
         }))
         .unwrap_or(Verdict::Drop);
-        matches!(
-            vfawn_core::verdict::execute(verdict, &self.flow),
-            vfawn_core::verdict::VerdictAction::CreateSession { .. }
-        )
+        match vfawn_core::verdict::execute(verdict, &self.flow) {
+            vfawn_core::verdict::VerdictAction::CreateSession { tracker, .. } => {
+                self.tracker = tracker.map(|hook| hook as Arc<dyn vfawn_core::FlowTrackerHook>);
+                true
+            }
+            _ => false,
+        }
     }
 
     /// The session handoff: the channel pair and the lane, offered to
@@ -142,6 +150,7 @@ impl UdpSlot {
             lane: Arc::clone(&self.lane),
             lane_bytes: Arc::clone(&self.lane_bytes),
             shard_wake: Arc::clone(&self.shard_wake),
+            tracker: self.tracker.take(),
             client_addr: self.client_addr,
             server_addr: self.server_addr,
         };

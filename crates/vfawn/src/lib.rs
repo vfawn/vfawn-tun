@@ -30,6 +30,7 @@
 pub mod echo;
 pub mod instance;
 pub mod relay;
+pub mod stats;
 
 pub mod route_orchestration;
 

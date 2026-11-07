@@ -149,6 +149,9 @@ struct TcpSlot {
     keepalive_probes: u32,
     /// The flow's dispatch key, for the splice lane's lookup.
     flow_key: vfawn_wire::flow::FlowKey,
+    /// The tracker the host's verdict attached, handed to the session
+    /// when the handshake completes.
+    tracker: Option<Arc<dyn vfawn_core::FlowTrackerHook>>,
 }
 
 /// The first retransmission timeout and its ceiling (RFC 6298 §2's
@@ -199,6 +202,7 @@ impl TcpSlot {
             events: event_rx,
             write_lane: Arc::clone(&self.write_lane),
             shard_wake: Arc::clone(&self.shard_wake),
+            tracker: self.tracker.take(),
         };
         if self.sessions.send(handoff).is_ok() {
             let _ = event_tx.send(HostEvent::Established);
@@ -222,7 +226,9 @@ impl TcpSlot {
         }))
         .unwrap_or(Verdict::Drop);
         match vfawn_core::verdict::execute(verdict, &self.flow) {
-            vfawn_core::verdict::VerdictAction::CreateSession { .. } => {}
+            vfawn_core::verdict::VerdictAction::CreateSession { tracker, .. } => {
+                self.tracker = tracker.map(|hook| hook as Arc<dyn vfawn_core::FlowTrackerHook>);
+            }
             vfawn_core::verdict::VerdictAction::Reset => {
                 // The debt the transitional backend could not pay: the
                 // raw SYN is right here, so the RST is real (RFC 9293
@@ -1148,6 +1154,7 @@ struct SessionHandoff {
     events: tokio::sync::mpsc::UnboundedReceiver<HostEvent>,
     write_lane: Arc<std::sync::Mutex<WriteLane>>,
     shard_wake: Arc<ShardBell>,
+    tracker: Option<Arc<dyn vfawn_core::FlowTrackerHook>>,
 }
 
 impl StackBackend for NativeBackend {
@@ -1287,6 +1294,7 @@ impl StackBackend for NativeBackend {
                 diag_queued: 0,
                 keepalive_at: None,
                 keepalive_probes: 0,
+                tracker: None,
             })
         });
 
@@ -1337,7 +1345,8 @@ impl StackBackend for NativeBackend {
                         };
                         // Establish event first: the host sees the flow
                         // as live before any bytes.
-                        let session = TcpSession::new(handoff.flow, Box::new(transport), None);
+                        let session =
+                            TcpSession::new(handoff.flow, Box::new(transport), handoff.tracker);
                         handler.on_tcp(session).await;
                     });
                 }
@@ -1369,7 +1378,7 @@ impl StackBackend for NativeBackend {
                             let session = vfawn_core::UdpSession::new(
                                 handoff.flow,
                                 Box::new(transport),
-                                None,
+                                handoff.tracker,
                             );
                             handler.on_udp(session).await;
                         });
@@ -1501,6 +1510,7 @@ mod tests {
             diag_queued: 0,
             keepalive_at: None,
             keepalive_probes: 0,
+            tracker: None,
         };
         // Drive the slot to ESTABLISHED with a handshake like the
         // machine's own tests use.

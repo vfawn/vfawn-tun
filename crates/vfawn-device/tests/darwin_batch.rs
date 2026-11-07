@@ -222,3 +222,47 @@ fn assert_root() {
     let euid = unsafe { libc::geteuid() };
     assert_eq!(euid, 0, "this test routes real traffic; it needs root");
 }
+
+/// The host-supplied descriptor path: a utun created by the host's own
+/// tooling is adopted by fd, and reads flow. This is the network
+/// extension's shape — the interface exists before this process does.
+#[test]
+#[ignore]
+fn a_host_fd_is_adopted_and_reads() {
+    assert_root();
+    // Create with the host's tooling — address included, as a host
+    // that built the interface would have — then hand over only the fd.
+    let owned = tun_rs::DeviceBuilder::new()
+        .mtu(1500)
+        .ipv4(IFACE_ADDR, 15, None)
+        .build_sync()
+        .expect("host utun");
+    let fd = owned.as_raw_fd();
+    std::mem::forget(owned); // the adoption takes the ownership
+    // SAFETY: the fd above is a live utun descriptor this test just
+    // created and released its wrapper for.
+    #[expect(unsafe_code)]
+    let mut device = unsafe { TunDevice::from_fd(fd) }.expect("adopt");
+
+    let name = device.name().expect("name");
+    route_add(&name);
+    let socket =
+        std::net::UdpSocket::bind(std::net::SocketAddr::from((IFACE_ADDR, 0))).expect("bind");
+    socket
+        .connect(std::net::SocketAddr::from((PROBE_ADDR, PROBE_PORT)))
+        .expect("connect");
+    for _ in 0..8 {
+        socket.send(b"adopted-fd-probe").expect("send");
+    }
+
+    let mut bufs = vec![BytesMut::new(); 8];
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut seen = 0;
+    while seen == 0 && Instant::now() < deadline {
+        let count = device.read_batch(&mut bufs).expect("read");
+        seen += count;
+    }
+    assert!(seen > 0, "the adopted fd reads the probes");
+    route_del(&name);
+    device.shutdown().expect("shutdown");
+}
