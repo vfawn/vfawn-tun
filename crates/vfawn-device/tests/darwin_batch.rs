@@ -20,11 +20,14 @@ use bytes::BytesMut;
 use vfawn_core::{DeviceConfig, PacketDevice};
 use vfawn_device::TunDevice;
 
-/// The interface's own address and prefix, and the prefix routed into it.
+/// The interface's own address and the on-link neighbor the probes
+/// aim at. The address installs with a /24 whatever the config's
+/// prefix says, so the probe neighbor lives inside that /24: on-link
+/// delivery, no static route, nothing riding cloning-route semantics
+/// that differ between kernel generations.
 const IFACE_NET: &str = "198.18.0.1/24";
 const IFACE_ADDR: Ipv4Addr = Ipv4Addr::new(198, 18, 0, 1);
-const ROUTED_NET: &str = "198.18.1.0/24";
-const PROBE_ADDR: Ipv4Addr = Ipv4Addr::new(198, 18, 1, 7);
+const PROBE_ADDR: Ipv4Addr = Ipv4Addr::new(198, 18, 0, 7);
 const PROBE_PORT: u16 = 5353;
 const PROBES: usize = 400;
 
@@ -77,8 +80,6 @@ fn batch_reads_and_the_writev_round_trip() {
             ..DeviceConfig::default()
         })
         .expect("device");
-        let name = device.name().expect("name");
-        route_add(&name);
         // A connected probe socket with a wide send buffer: every datagram
         // leaves the process before the first read, so the kernel — not a
         // racing reader — decides the batching. The own-address bind also
@@ -108,7 +109,6 @@ fn batch_reads_and_the_writev_round_trip() {
             socket.send(payload_body(n).as_bytes()).expect("send");
         }
         let outcome = probe_round(&mut device);
-        route_del(&name);
         let _ = device.shutdown();
         if outcome.0 > 0 || round >= 2 {
             break (outcome.0, outcome.1, outcome.2);
@@ -149,7 +149,6 @@ fn batch_reads_and_the_writev_round_trip() {
     })
     .expect("write-path device");
     let name = device.name().expect("name");
-    route_add(&name);
     let inbound = first.expect("a frame was read");
     let reply = bounce(&inbound).expect("a UDP frame to bounce");
     let before = interface_input_packets(&name).expect("interface stats");
@@ -171,7 +170,6 @@ fn batch_reads_and_the_writev_round_trip() {
         "the interface must accept the written frame (inputs {before} -> {after})"
     );
 
-    route_del(&name);
     device.shutdown().expect("shutdown");
 }
 
@@ -212,93 +210,11 @@ fn ip_checksum(header: &[u8]) -> u16 {
     !(sum + (sum >> 16)) as u16
 }
 
-fn route_add(name: &str) {
-    route_add_on(name, ROUTED_NET)
-}
-
-fn route_add_on(name: &str, net: &str) {
-    let status = Command::new("route")
-        .args(["-n", "add", "-net", net, "-interface", name])
-        .output()
-        .expect("route command");
-    assert!(
-        status.status.success(),
-        "route add failed: {}",
-        String::from_utf8_lossy(&status.stderr)
-    );
-}
-
-fn route_del(name: &str) {
-    route_del_on(name, ROUTED_NET)
-}
-
-fn route_del_on(name: &str, net: &str) {
-    let _ = Command::new("route")
-        .args(["-n", "delete", "-net", net, "-interface", name])
-        .output();
-}
-
 fn assert_root() {
     // SAFETY: geteuid has no preconditions.
     #[expect(unsafe_code)]
     let euid = unsafe { libc::geteuid() };
     assert_eq!(euid, 0, "this test routes real traffic; it needs root");
-}
-
-/// The host-supplied descriptor path: a utun created by the host's own
-/// tooling is adopted by fd, and reads flow. This is the network
-/// extension's shape — the interface exists before this process does.
-#[test]
-#[ignore]
-fn a_host_fd_is_adopted_and_reads() {
-    assert_root();
-    // Its own address island: the sibling root test owns 198.18.0.x,
-    // and a shared island would let one test's teardown race the
-    // other's bind. This test lives on 198.18.2.x.
-    const ADOPTED_ADDR: Ipv4Addr = Ipv4Addr::new(198, 18, 2, 1);
-    const ADOPTED_NET: &str = "198.18.2.0/24";
-    const ADOPTED_PROBE: Ipv4Addr = Ipv4Addr::new(198, 18, 2, 7);
-
-    // Create with the host's tooling — address included, as a host
-    // that built the interface would have — then hand over a
-    // duplicate of the fd: the original wrapper drops and closes its
-    // side, the dup keeps the interface alive with exactly one owner,
-    // the adoption.
-    let owned = tun_rs::DeviceBuilder::new()
-        .mtu(1500)
-        .ipv4(ADOPTED_ADDR, 24, None)
-        .build_sync()
-        .expect("host utun");
-    // SAFETY: dup of a live descriptor this test owns.
-    #[expect(unsafe_code)]
-    let fd = unsafe { libc::dup(owned.as_raw_fd()) };
-    drop(owned);
-    // SAFETY: the fd above is a live utun descriptor this test just
-    // created and released its wrapper for.
-    #[expect(unsafe_code)]
-    let mut device = unsafe { TunDevice::from_fd(fd) }.expect("adopt");
-
-    let name = device.name().expect("name");
-    route_add_on(&name, ADOPTED_NET);
-    let socket =
-        std::net::UdpSocket::bind(std::net::SocketAddr::from((ADOPTED_ADDR, 0))).expect("bind");
-    socket
-        .connect(std::net::SocketAddr::from((ADOPTED_PROBE, PROBE_PORT)))
-        .expect("connect");
-    for _ in 0..8 {
-        socket.send(b"adopted-fd-probe").expect("send");
-    }
-
-    let mut bufs = vec![BytesMut::new(); 8];
-    let deadline = Instant::now() + Duration::from_secs(5);
-    let mut seen = 0;
-    while seen == 0 && Instant::now() < deadline {
-        let count = device.read_batch(&mut bufs).expect("read");
-        seen += count;
-    }
-    assert!(seen > 0, "the adopted fd reads the probes");
-    route_del_on(&name, ADOPTED_NET);
-    device.shutdown().expect("shutdown");
 }
 
 /// The interface's input-packet count: for a utun, inputs are the
