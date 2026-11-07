@@ -393,7 +393,7 @@ impl TcpSlot {
     /// segment that carries options.
     fn emit(&mut self, reaction: &Reaction, out: &mut VecDeque<BytesMut>) {
         let options = if reaction.flags & 0x02 != 0 {
-            self.connection.handshake_options()
+            self.connection.handshake_options(Instant::now())
         } else {
             Vec::new()
         };
@@ -609,11 +609,20 @@ impl SlotLogic for TcpSlot {
         if inbound.flags & 0x10 != 0 {
             let delta = inbound.ack.wrapping_sub(una_before);
             if delta > 0 && delta < u32::MAX / 2 {
+                // The RTT sample rides the timestamp echo: an ACK's
+                // TSecr names the TSval of the segment it
+                // acknowledges, and our clock holds that send time
+                // (RFC 7323 §3.1). No echo, no sample — the None the
+                // trait documents.
+                let rtt = inbound
+                    .options
+                    .timestamps
+                    .and_then(|received| self.connection.rtt_sample(received.tsecr));
                 self.cc.on_signal(
                     self.connection.mss(),
                     Signal::Acked {
                         newly: delta.min(u32::from(u16::MAX)),
-                        rtt: None,
+                        rtt,
                     },
                 );
             }
@@ -774,7 +783,7 @@ impl SlotLogic for TcpSlot {
                 // The handshake's answer again (RFC 9293 §3.4): the
                 // same sequence, a longer wait if it fires again.
                 if let Some(reaction) = self.connection.synack_retransmit() {
-                    let options = self.connection.handshake_options();
+                    let options = self.connection.handshake_options(Instant::now());
                     let frame = emit_tcp(self.server, self.client, &reaction, &options, &[]);
                     out.push_back(BytesMut::from(&frame[..]));
                     self.synack_retries = self.synack_retries.saturating_add(1);
@@ -1151,6 +1160,9 @@ impl NativeBackend {
     ) -> Arc<dyn Fn() -> Box<dyn CongestionAlgo> + Send + Sync> {
         match choice {
             vfawn_core::CongestionAlgo::Reno => Arc::new(move || Box::new(Reno::new(mss))),
+            vfawn_core::CongestionAlgo::Bbr => {
+                Arc::new(move || Box::new(crate::congestion::Bbr::new(mss)))
+            }
             _ => Arc::new(move || Box::new(Cubic::new(mss))),
         }
     }

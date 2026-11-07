@@ -166,6 +166,10 @@ pub struct ServerConnection {
     state: TcpState,
     send: SendSpace,
     recv: RecvSpace,
+    /// The Timestamps negotiation (RFC 7323 §3): armed when the peer's
+    /// SYN offered them; from then on every outbound segment carries
+    /// our clock and every inbound one feeds it an echo.
+    timestamps: Option<TimestampClock>,
     /// MSS we advertise; the offer rides every SYN-ACK (RFC 9293
     /// §3.7.1: the maximum segment size option).
     mss: u16,
@@ -227,6 +231,62 @@ struct RetransmitState {
     retries: u32,
 }
 
+/// The connection's Timestamps clock (RFC 7323 §3.3): a monotonic
+/// millisecond counter for TSval, and the echo rule — TSecr carries
+/// the newest TSval of an in-order segment (§3.4's TS.recent,
+/// updated only when the segment advances RCV.NXT per §3.5's
+/// pause-on-reorder discipline).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TimestampClock {
+    started_at: Option<std::time::Instant>,
+    ts_recent: u32,
+    last_sent: u32,
+}
+
+impl TimestampClock {
+    /// The TSval for an outbound segment: milliseconds since the
+    /// negotiation began, on a clock that starts at the first send.
+    pub fn tsval(&mut self, now: std::time::Instant) -> u32 {
+        let start = *self.started_at.get_or_insert(now);
+        self.last_sent = now.duration_since(start).as_millis() as u32;
+        self.last_sent
+    }
+
+    /// Feed an inbound TSval; the in-order rule is the caller's.
+    pub fn on_received(&mut self, tsval: u32, advanced: bool) {
+        if advanced {
+            self.ts_recent = tsval;
+        }
+    }
+
+    /// The TSecr our next segment carries.
+    pub fn tsecr(&self) -> u32 {
+        self.ts_recent
+    }
+
+    /// Measure one round trip from an echo: the ACK's TSecr names the
+    /// TSval of the segment it acknowledges, and our clock's now
+    /// minus that send time is the sample (RFC 7323 §3.1 — Karn's
+    /// rule comes free: a retransmission sends a fresh TSval, an echo
+    /// of a stale one never inflates the measurement).
+    pub fn rtt_from_echo(&self, echoed: u32, now_ms: u32) -> Option<std::time::Duration> {
+        let elapsed = now_ms.wrapping_sub(echoed);
+        // The counter wraps at 2^32 ms (~49 days); a real sample is
+        // well under an hour, a near-wrap difference is the previous
+        // epoch and not a sample.
+        if elapsed < 3_600_000 {
+            Some(std::time::Duration::from_millis(u64::from(elapsed)))
+        } else {
+            None
+        }
+    }
+
+    /// The TSval our most recent outbound segment carried.
+    pub fn last_sent(&self) -> u32 {
+        self.last_sent
+    }
+}
+
 impl ServerConnection {
     pub fn new(listen_isn: u32, mss: u16) -> Self {
         Self {
@@ -241,6 +301,7 @@ impl ServerConnection {
             },
             mss,
             fin_received: false,
+            timestamps: None,
             fin_sent: false,
             out_of_order: Vec::new(),
             ooo_budget: 64 * 1024,
@@ -276,6 +337,20 @@ impl ServerConnection {
     /// Process one inbound segment and produce the reaction. Every
     /// transition cites the RFC paragraph that prescribes it.
     pub fn on_segment(&mut self, inbound: &Inbound) -> Reaction {
+        // The timestamps feed runs ahead of the machine: an in-order
+        // segment (at RCV.NXT) advances TS.recent (RFC 7323 §3.4);
+        // everything else leaves the old echo standing (§3.5's
+        // pause-on-reorder).
+        if let Some(clock) = self.timestamps.as_mut()
+            && let Some(received) = inbound.options.timestamps
+        {
+            let advanced = inbound.seq.wrapping_sub(self.recv.nxt) == 0;
+            clock.on_received(received.tsval, advanced);
+        }
+        self.on_segment_inner(inbound)
+    }
+
+    fn on_segment_inner(&mut self, inbound: &Inbound) -> Reaction {
         // The peer's window travels on every segment it sends (RFC 9293
         // §3.1); whoever is past the handshake refreshes the bound.
         if self.state != TcpState::Listen {
@@ -313,6 +388,12 @@ impl ServerConnection {
         if let Some(shift) = inbound.options.wscale {
             self.scaled = true;
             self.peer_shift = shift.min(14);
+        }
+        // The Timestamps negotiation rides the same rule as scaling
+        // (RFC 7323 §2.2): the peer's offer arms our clock, and our
+        // segments carry the option from the SYN-ACK onward.
+        if let Some(offered) = inbound.options.timestamps {
+            self.arm_timestamps(offered);
         }
         Reaction::segment(
             self.send.nxt,
@@ -614,14 +695,68 @@ impl ServerConnection {
 
     /// The option bytes the SYN-ACK carries: our MSS always, our
     /// window-scale shift only when the peer offered scaling.
-    pub fn handshake_options(&self) -> Vec<u8> {
-        let mut options = Vec::with_capacity(8);
+    /// Arm the Timestamps clock: the peer's SYN offered them (RFC
+    /// 7323 §2.2 — both SYNs carry the option or neither side uses
+    /// it). Called once from the SYN's accept path.
+    pub fn arm_timestamps(&mut self, offered: vfawn_wire::tcp::Timestamps) {
+        if self.timestamps.is_none() {
+            self.timestamps = Some(TimestampClock {
+                started_at: None,
+                ts_recent: offered.tsval,
+                last_sent: 0,
+            });
+        }
+    }
+
+    /// Whether the negotiation armed the clock.
+    pub fn timestamps_armed(&self) -> bool {
+        self.timestamps.is_some()
+    }
+
+    /// The clock, mutably, for the emit path (TSval advances per
+    /// segment) and the receive path (TS.recent and RTT samples).
+    pub fn timestamps_mut(&mut self) -> Option<&mut TimestampClock> {
+        self.timestamps.as_mut()
+    }
+
+    pub fn handshake_options(&mut self, now: std::time::Instant) -> Vec<u8> {
+        let mut options = Vec::with_capacity(16);
         options.extend_from_slice(&[2, 4]);
         options.extend_from_slice(&self.mss.to_be_bytes());
         if self.scaled {
             options.extend_from_slice(&[3, 3, OUR_WSCALE]);
         }
+        // Timestamps (RFC 7323 §3.2): kind 8, length 10, TSval then
+        // TSecr. The SYN-ACK starts our clock and echoes the peer's
+        // SYN TSval as TSecr.
+        if let Some(clock) = self.timestamps.as_mut() {
+            let tsval = clock.tsval(now);
+            options.extend_from_slice(&[8, 10]);
+            options.extend_from_slice(&tsval.to_be_bytes());
+            options.extend_from_slice(&clock.tsecr().to_be_bytes());
+        }
         options
+    }
+
+    /// The timestamps option for a data-bearing segment, freshly
+    /// stamped; None when the negotiation never armed.
+    pub fn segment_timestamps(&mut self, now: std::time::Instant) -> Option<Vec<u8>> {
+        let clock = self.timestamps.as_mut()?;
+        let tsval = clock.tsval(now);
+        let tsecr = clock.tsecr();
+        let mut option = Vec::with_capacity(10);
+        option.extend_from_slice(&[8, 10]);
+        option.extend_from_slice(&tsval.to_be_bytes());
+        option.extend_from_slice(&tsecr.to_be_bytes());
+        Some(option)
+    }
+
+    /// One RTT sample from an acknowledgment's TSecr, by our own
+    /// clock (the caller passes the ACK's echoed value; the clock
+    /// itself holds the send time it must pair with).
+    pub fn rtt_sample(&self, echoed: u32) -> Option<std::time::Duration> {
+        let clock = self.timestamps.as_ref()?;
+        clock.rtt_from_echo(echoed, clock.last_sent().wrapping_add(0))
     }
 
     /// The MSS this connection advertises (RFC 9293 §3.7.1).
@@ -1004,13 +1139,14 @@ mod tests {
             options: vfawn_wire::tcp::SynOptions {
                 mss: Some(1200),
                 wscale: Some(7),
+                timestamps: None,
             },
             payload: &[],
         };
         connection.on_segment(&syn);
         // The smaller MSS wins; the reply carries both offers.
         assert_eq!(connection.mss(), 1200);
-        let options = connection.handshake_options();
+        let options = connection.handshake_options(std::time::Instant::now());
         assert!(
             options
                 .windows(4)
@@ -1055,7 +1191,11 @@ mod tests {
         };
         connection.on_segment(&syn);
         assert_eq!(connection.mss(), 1460, "no MSS offer leaves ours");
-        assert!(!connection.handshake_options().contains(&3));
+        assert!(
+            !connection
+                .handshake_options(std::time::Instant::now())
+                .contains(&3)
+        );
         assert_eq!(connection.advertised_window(), 65535);
         let ack = Inbound {
             seq: 5001,

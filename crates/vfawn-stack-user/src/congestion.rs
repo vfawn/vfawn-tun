@@ -291,3 +291,332 @@ mod tests {
         assert!(cubic.window() >= 200);
     }
 }
+
+/// BBR v1 (draft-cardwell-iccrg-bbr-congestion-control-00, the Linux
+/// shape the references implement): two estimators — a windowed-max
+/// bandwidth filter over delivery-rate samples and a windowed-min RTT
+/// filter over timestamp echoes — and a window derived from their
+/// product (the bandwidth-delay product) instead of from loss.
+///
+/// v0 fits our signal shape: ACK samples carry `(bytes, rtt)` pairs,
+/// so the delivery rate is `bytes / rtt` per sample and the filter
+/// window is round-counted at one round per ACK that carries an RTT
+/// echo. Loss does not shrink the window (the model's whole point);
+/// only a timeout resets the bandwidth discovery.
+#[derive(Debug, Clone)]
+pub struct Bbr {
+    mode: BbrMode,
+    /// Windowed max of delivery-rate samples (bytes per second),
+    /// Linux's minmax_running_max over ~10 rounds.
+    bandwidth_filter: MaxFilter,
+    /// Windowed min of RTT samples over ~10 seconds.
+    min_rtt_filter: MinFilter,
+    /// The number of rounds observed at growth below the Startup
+    /// exit threshold: three stagnant rounds end Startup.
+    stagnant_rounds: u32,
+    /// The best bandwidth Startup saw, the bar the growth test uses.
+    startup_bar: f64,
+    mss: u32,
+    /// ProbeRTT bookkeeping: entered when the min-RTT window expires
+    /// without refresh, held for its duration at a reduced window.
+    probe_rtt_until: Option<std::time::Instant>,
+    last_sample_at: Option<std::time::Instant>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BbrMode {
+    /// Exponential discovery: window doubles each round (the high
+    /// gain is Linux's ln(2)/ln(1.5) ≈ 2/ln2 rounds per doubling —
+    /// v0 uses the constant gain 2.77 the draft names).
+    Startup,
+    /// ProbeBW: steady model-following at the windowed estimates.
+    ProbeBandwidth,
+    /// ProbeRTT: a brief hold at four segments to refresh the
+    /// min-RTT estimate (the draft's 200ms, Linux's floor).
+    ProbeRtt,
+}
+
+impl Bbr {
+    pub fn new(mss: u16) -> Self {
+        let mss = u32::from(mss);
+        Self {
+            mode: BbrMode::Startup,
+            bandwidth_filter: MaxFilter::default(),
+            min_rtt_filter: MinFilter::default(),
+            stagnant_rounds: 0,
+            startup_bar: 0.0,
+            mss,
+            probe_rtt_until: None,
+            last_sample_at: None,
+        }
+    }
+
+    /// The windowed-min RTT the model currently holds.
+    fn min_rtt(&self) -> Option<Duration> {
+        self.min_rtt_filter.value()
+    }
+
+    /// The windowed-max bandwidth, bytes per second.
+    fn bandwidth(&self) -> Option<f64> {
+        self.bandwidth_filter.value()
+    }
+
+    /// The model window: BDP × gain, quantized to segment pairs the
+    /// way Linux does (delayed-ACK allowance), floored at four
+    /// segments. No estimate yet: Linux's ten-segment initial.
+    fn model_window(&self, gain: f64) -> u32 {
+        let Some(rtt) = self.min_rtt() else {
+            return 10 * self.mss;
+        };
+        let Some(bandwidth) = self.bandwidth() else {
+            return 10 * self.mss;
+        };
+        let bdp = bandwidth * rtt.as_secs_f64() * gain;
+        let mut target = bdp.ceil() as u32;
+        // End-system quantum: one segment, doubled for the probe.
+        let quantum = self.mss.max(1);
+        target += 3 * quantum;
+        let segments = target.div_ceil(self.mss.max(1));
+        let segments = segments + (segments & 1); // pair alignment
+        let target = segments.saturating_mul(self.mss.max(1));
+        target.max(4 * self.mss)
+    }
+}
+
+impl CongestionAlgo for Bbr {
+    fn window(&self) -> u32 {
+        // The mode's gain: Startup doubles, ProbeBW follows the
+        // model at one, ProbeRTT holds the floor.
+        match self.mode {
+            BbrMode::Startup => self.model_window(2.0),
+            BbrMode::ProbeBandwidth => self.model_window(1.0),
+            BbrMode::ProbeRtt => 4 * self.mss,
+        }
+    }
+
+    fn on_signal(&mut self, mss: u16, signal: Signal) {
+        self.mss = u32::from(mss);
+        let now = std::time::Instant::now();
+        match signal {
+            Signal::Acked {
+                newly,
+                rtt: Some(sample),
+            } => {
+                self.last_sample_at = Some(now);
+                // The min-RTT filter: windowed min over ten seconds.
+                self.min_rtt_filter.update(sample, now);
+                // The delivery-rate sample: acknowledged bytes over
+                // the measured round trip.
+                if sample.as_secs_f64() > 0.0 {
+                    let rate = newly as f64 / sample.as_secs_f64();
+                    self.bandwidth_filter.update(rate);
+                    if self.mode == BbrMode::Startup {
+                        // Growth test (draft §4.3.2.2): three rounds
+                        // below 1.25× of the best end Startup.
+                        let best = self.startup_bar.max(rate);
+                        if rate >= self.startup_bar * 1.25 || self.startup_bar == 0.0 {
+                            self.startup_bar = best;
+                            self.stagnant_rounds = 0;
+                        } else {
+                            self.stagnant_rounds += 1;
+                        }
+                        if self.stagnant_rounds >= 3 {
+                            self.mode = BbrMode::ProbeBandwidth;
+                        }
+                    }
+                }
+                // ProbeRTT entry: the min-RTT window expired without a
+                // refresh (draft §4.4.2) — hold briefly at the floor.
+                if self.mode != BbrMode::ProbeRtt && self.min_rtt_filter.window_expired(now) {
+                    self.mode = BbrMode::ProbeRtt;
+                    self.probe_rtt_until = Some(now + Duration::from_millis(200));
+                }
+                if self.mode == BbrMode::ProbeRtt
+                    && self.probe_rtt_until.is_some_and(|until| now >= until)
+                {
+                    self.mode = BbrMode::ProbeBandwidth;
+                    self.probe_rtt_until = None;
+                    self.min_rtt_filter.refresh_window(now);
+                }
+            }
+            Signal::Acked { .. } => {
+                // An ACK without an echo carries no rate sample; the
+                // model stands.
+            }
+            Signal::Timeout => {
+                // The draft's response to a timeout: the bandwidth
+                // model restarts (the path may have changed under
+                // us), the RTT window keeps its memory.
+                self.bandwidth_filter = MaxFilter::default();
+                self.mode = BbrMode::Startup;
+                self.stagnant_rounds = 0;
+                self.startup_bar = 0.0;
+            }
+            Signal::FastRetransmit => {
+                // Loss is not congestion to this model: the window
+                // stands (draft §4.2.4 — the whole reason it exists).
+            }
+        }
+    }
+
+    fn name(&self) -> &'static str {
+        "bbr"
+    }
+}
+
+/// Windowed maximum over a round count (Linux's minmax_running_max,
+/// simplified to a period-10 window keyed by sample index).
+#[derive(Debug, Clone, Default)]
+struct MaxFilter {
+    samples: Vec<(u64, f64)>,
+    index: u64,
+}
+
+impl MaxFilter {
+    fn update(&mut self, rate: f64) {
+        self.index += 1;
+        self.samples.push((self.index, rate));
+        // The window is ~10 rounds behind the newest sample.
+        let cutoff = self.index.saturating_sub(10);
+        self.samples.retain(|(index, _)| *index > cutoff);
+    }
+
+    fn value(&self) -> Option<f64> {
+        self.samples
+            .iter()
+            .map(|(_, rate)| *rate)
+            .fold(None, |best, rate| {
+                Some(best.map_or(rate, |b: f64| b.max(rate)))
+            })
+    }
+}
+
+/// Windowed minimum over wall-clock time (~10 seconds).
+#[derive(Debug, Clone, Default)]
+struct MinFilter {
+    best: Option<(std::time::Instant, Duration)>,
+    window_start: Option<std::time::Instant>,
+}
+
+impl MinFilter {
+    fn update(&mut self, sample: Duration, now: std::time::Instant) {
+        let window_start = *self.window_start.get_or_insert(now);
+        if now.duration_since(window_start) >= Duration::from_secs(10) {
+            // The window closed: the next sample starts a fresh one.
+            self.window_start = Some(now);
+            self.best = Some((now, sample));
+            return;
+        }
+        match self.best {
+            Some((_, best)) if sample < best => self.best = Some((now, sample)),
+            Some(_) => {}
+            None => self.best = Some((now, sample)),
+        }
+    }
+
+    fn value(&self) -> Option<Duration> {
+        self.best.map(|(_, best)| best)
+    }
+
+    fn window_expired(&self, now: std::time::Instant) -> bool {
+        self.best
+            .is_some_and(|(at, _)| now.duration_since(at) >= Duration::from_secs(10))
+    }
+
+    fn refresh_window(&mut self, now: std::time::Instant) {
+        self.window_start = Some(now);
+    }
+}
+
+#[cfg(test)]
+mod bbr_tests {
+    use super::*;
+
+    const MSS: u16 = 1460;
+
+    #[test]
+    fn bbr_ignores_loss_and_follows_the_model() {
+        // The model's whole point: loss events leave the window alone
+        // (Reno/Cubic halve on the same signals).
+        let mut bbr = Bbr::new(MSS);
+        let mut reno = Reno::new(MSS);
+        let base = bbr.window();
+        let reno_base = reno.window();
+        for _ in 0..5 {
+            bbr.on_signal(MSS, Signal::FastRetransmit);
+            reno.on_signal(MSS, Signal::FastRetransmit);
+        }
+        assert_eq!(bbr.window(), base, "loss is not congestion to the model");
+        assert!(reno.window() < reno_base, "Reno halves where BBR stands");
+    }
+
+    #[test]
+    fn bbr_grows_with_samples_and_finds_steady_state() {
+        let mut bbr = Bbr::new(MSS);
+        // A 10ms-RTT, 100MB/s path: each ACK carries one MSS at
+        // 10ms.
+        let sample = Duration::from_millis(10);
+        for _ in 0..20 {
+            bbr.on_signal(
+                MSS,
+                Signal::Acked {
+                    newly: MSS as u32,
+                    rtt: Some(sample),
+                },
+            );
+        }
+        // The model window: BDP = rate × RTT. One MSS per 10ms is
+        // 1460×100 = 146,000 bytes/s; BDP = 1,460 bytes → the
+        // quantized window lands near a few segments, floored at 4.
+        let window = bbr.window();
+        assert!(window >= 4 * MSS as u32, "the floor holds");
+        assert!(window < 10 * MSS as u32, "and the model does not run away");
+        assert_eq!(bbr.name(), "bbr");
+    }
+
+    #[test]
+    fn bbr_exits_startup_on_stagnation() {
+        let mut bbr = Bbr::new(MSS);
+        // Prime the bar with a good sample, then stagnate.
+        bbr.on_signal(
+            MSS,
+            Signal::Acked {
+                newly: MSS as u32,
+                rtt: Some(Duration::from_millis(10)),
+            },
+        );
+        // Growth test uses 1.25x of the best; identical samples are
+        // stagnant. BBR's drafts require the round structure; v0
+        // counts rounds as RTT-carrying ACKs.
+        for _ in 0..6 {
+            bbr.on_signal(
+                MSS,
+                Signal::Acked {
+                    newly: MSS as u32,
+                    rtt: Some(Duration::from_millis(10)),
+                },
+            );
+        }
+        assert!(
+            matches!(bbr.mode, BbrMode::ProbeBandwidth),
+            "three stagnant rounds end Startup"
+        );
+    }
+
+    #[test]
+    fn a_timeout_restarts_the_discovery() {
+        let mut bbr = Bbr::new(MSS);
+        for _ in 0..10 {
+            bbr.on_signal(
+                MSS,
+                Signal::Acked {
+                    newly: MSS as u32,
+                    rtt: Some(Duration::from_millis(10)),
+                },
+            );
+        }
+        bbr.on_signal(MSS, Signal::Timeout);
+        assert!(matches!(bbr.mode, BbrMode::Startup), "discovery restarts");
+        assert!(bbr.bandwidth().is_none(), "the bandwidth model cleared");
+    }
+}

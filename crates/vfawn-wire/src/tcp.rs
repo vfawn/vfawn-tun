@@ -67,6 +67,20 @@ pub struct TcpHeader {
 pub struct SynOptions {
     pub mss: Option<u16>,
     pub wscale: Option<u8>,
+    /// The Timestamps option (RFC 7323 §3.2, kind 8, length 10):
+    /// the sender's clock and its echo of ours. None when the peer
+    /// did not offer them.
+    pub timestamps: Option<Timestamps>,
+}
+
+/// The two clock words a Timestamps option carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Timestamps {
+    /// TSval: the sender's own clock at send time.
+    pub tsval: u32,
+    /// TSecr: the sender's echo of OUR latest clock, zero when it has
+    /// none yet (the SYN itself carries no echo).
+    pub tsecr: u32,
 }
 
 /// Parse a TCP segment's option region (between the fixed header and
@@ -98,6 +112,21 @@ pub fn syn_options(segment: &[u8]) -> SynOptions {
                     options.mss = Some(u16::from_be_bytes([segment[at + 2], segment[at + 3]]));
                 } else if kind == 3 && len == 3 {
                     options.wscale = Some(segment[at + 2]);
+                } else if kind == 8 && len == 10 && at + 10 <= end {
+                    options.timestamps = Some(Timestamps {
+                        tsval: u32::from_be_bytes([
+                            segment[at + 2],
+                            segment[at + 3],
+                            segment[at + 4],
+                            segment[at + 5],
+                        ]),
+                        tsecr: u32::from_be_bytes([
+                            segment[at + 6],
+                            segment[at + 7],
+                            segment[at + 8],
+                            segment[at + 9],
+                        ]),
+                    });
                 }
                 at += len;
             }
