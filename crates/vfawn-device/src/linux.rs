@@ -111,7 +111,9 @@ impl TunDevice {
         // queue needs the lane catch-up fix beside it — with it, the
         // uplink sustains two and a half gigabits where the shallow
         // queue held six hundred megabits.
-        let mut builder = DeviceBuilder::new().mtu(mtu as u16).tx_queue_len(10_000);
+        let mut builder = DeviceBuilder::new()
+            .mtu(mtu as u16)
+            .tx_queue_len(10_000);
         if let Some(name) = &config.name {
             builder = builder.name(name.clone());
         }
