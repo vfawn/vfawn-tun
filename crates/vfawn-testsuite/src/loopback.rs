@@ -69,7 +69,11 @@ impl PacketDevice for Loopback {
         let mut queue = self.queue.lock().unwrap();
         let count = bufs.len();
         for buf in bufs {
-            queue.push_back(buf.clone());
+            // The loopback is its own reader: what comes back must be
+            // the bare packet, or the stack would parse the emitter's
+            // headroom as a version-zero IP header.
+            let head = usize::from(buf.first() == Some(&0)) * vfawn_wire::VNET_HEADROOM;
+            queue.push_back(BytesMut::from(&buf[head..]));
         }
         Ok(count)
     }

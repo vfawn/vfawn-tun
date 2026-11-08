@@ -82,7 +82,11 @@ impl PacketDevice for MockDevice {
         let mut outbox = self.outbox.lock().unwrap();
         let count = bufs.len();
         for packet in bufs {
-            outbox.push_back(packet.clone());
+            // The wire never sees the emitter's headroom: every real
+            // device strips or consumes it, and the mock models the
+            // wire, not the buffer that carried the frame to it.
+            let head = usize::from(packet.first() == Some(&0)) * vfawn_wire::VNET_HEADROOM;
+            outbox.push_back(BytesMut::from(&packet[head..]));
         }
         Ok(count)
     }
