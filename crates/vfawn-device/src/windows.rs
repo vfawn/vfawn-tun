@@ -187,7 +187,13 @@ fn io_loop(shared: Arc<Shared>, device: SyncDevice, writes: Receiver<Vec<BytesMu
             match writes.try_recv() {
                 Ok(batch) => {
                     for frame in &batch {
-                        if device.send(frame).is_err() {
+                        // The pooled emitter's headroom: the first
+                        // zero byte names ten bytes the ring does not
+                        // want, and the slice keeps the buffer whole
+                        // for the pool's return trip.
+                        let head =
+                            usize::from(frame.first() == Some(&0)) * vfawn_wire::VNET_HEADROOM;
+                        if device.send(&frame[head..]).is_err() {
                             // A full ring is qdisc-shaped loss: the
                             // peer's loss recovery re-asks, and the
                             // interface lives on. Only the device's

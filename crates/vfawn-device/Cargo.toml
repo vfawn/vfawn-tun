@@ -11,6 +11,7 @@ workspace = true
 
 [dependencies]
 vfawn-core = { path = "../vfawn-core" }
+vfawn-wire = { path = "../vfawn-wire" }
 bytes.workspace = true
 ipnet.workspace = true
 tun-rs.workspace = true

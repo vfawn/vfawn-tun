@@ -483,6 +483,12 @@ fn io_loop(shared: Arc<Shared>, device: SyncDevice, writes: Receiver<Vec<BytesMu
                         if frame.is_empty() {
                             continue;
                         }
+                        // The pooled emitter's headroom: the first
+                        // zero byte names ten bytes no utun wants, and
+                        // the slice keeps the buffer whole for the
+                        // pool's return trip.
+                        let head = usize::from(frame[0] == 0) * vfawn_wire::VNET_HEADROOM;
+                        let frame = &frame[head..];
                         prefix.copy_from_slice(&family_prefix(frame));
                         let pair = [
                             libc::iovec {
