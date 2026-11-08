@@ -1603,6 +1603,7 @@ dependencies = [
  "libc",
  "tun-rs",
  "vfawn-core",
+ "vfawn-wire",
 ]
 
 [[package]]
