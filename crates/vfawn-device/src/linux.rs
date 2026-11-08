@@ -259,7 +259,6 @@ fn io_loop(shared: Arc<Shared>, device: Arc<SharedTun>, vnet: bool) {
     // capacity).
     let seg = 1514;
     let mut bufs: Vec<BytesMut> = (0..BATCH).map(|_| BytesMut::zeroed(seg)).collect();
-    let mut gro_table = tun_rs::GROTable::default();
     let mut staging: Vec<BytesMut> = Vec::new();
     let mut original = vec![0u8; VIRTIO_NET_HDR_LEN + 65535];
 
@@ -312,8 +311,7 @@ fn io_loop(shared: Arc<Shared>, device: Arc<SharedTun>, vnet: bool) {
                 // re-asks and the slot answers); only the device's
                 // death stops the loop.
                 if !answers.is_empty()
-                    && let Err(error) =
-                        send_batch(&device.0, vnet, &mut gro_table, &mut staging, &mut answers)
+                    && let Err(error) = send_batch(&device.0, vnet, &mut staging, &mut answers)
                     && error.kind() == ErrorKind::NotConnected
                 {
                     eprintln!("vfawn: tun I/O stopped: device down");
@@ -379,7 +377,6 @@ fn write_loop(
     vnet: bool,
 ) {
     let mut drop_counter = 0u64;
-    let mut gro_table = tun_rs::GROTable::default();
     let mut staging: Vec<BytesMut> = Vec::new();
     while !shared.stopped.load(Ordering::Acquire) {
         let mut batch = match writes.recv_timeout(std::time::Duration::from_millis(50)) {
@@ -390,7 +387,7 @@ fn write_loop(
                 return;
             }
         };
-        if let Err(error) = send_batch(&device.0, vnet, &mut gro_table, &mut staging, &mut batch) {
+        if let Err(error) = send_batch(&device.0, vnet, &mut staging, &mut batch) {
             // A queue that cannot take the batch right now is
             // backpressure, not death: the drop behaves like a qdisc
             // drop (TCP above retransmits, UDP loses one datagram),
@@ -410,13 +407,12 @@ fn write_loop(
     }
 }
 
-/// One write batch onto the wire: staged into header-padded frames and
-/// handed over in a single kernel call on the offload path, one send
-/// per frame otherwise.
+/// One write batch onto the wire: one kernel call per frame. The
+/// offload path stages each frame behind its virtio header first; the
+/// plain path hands the batch's own buffers over untouched.
 fn send_batch(
     device: &SyncDevice,
     vnet: bool,
-    gro_table: &mut tun_rs::GROTable,
     staging: &mut Vec<BytesMut>,
     batch: &mut [BytesMut],
 ) -> io::Result<()> {
@@ -425,16 +421,33 @@ fn send_batch(
         // frames are the packets, and the batch's own buffers reach
         // the kernel untouched — no per-frame copy, no per-frame
         // allocation, on the one thread the whole pipeline shares.
-        device.send_multiple(gro_table, batch, 0)?;
-        return Ok(());
+        let mut err = Ok(());
+        for frame in batch.iter() {
+            if let Err(error) = device.send(frame) {
+                err = Err(error);
+                break;
+            }
+        }
+        return err;
     }
+    // One frame, one write: merging the batch into GSO super-packets
+    // looked like the offload win but built a standing queue in the
+    // kernel's segmentation path — the peer's acknowledgments paced
+    // against a twenty-millisecond backlog and every metric sagged
+    // (the single flow held half of what plain frames sustain; the
+    // eight-flow retransmission count ran double). The per-frame
+    // syscall is the cheaper tax on the writer thread, which has a
+    // core of its own.
     for frame in batch.iter() {
         let mut padded = BytesMut::with_capacity(VIRTIO_NET_HDR_LEN + frame.len());
         padded.resize(VIRTIO_NET_HDR_LEN, 0);
         padded.extend_from_slice(frame);
         staging.push(padded);
+        if let Err(error) = device.send(padded) {
+            staging.clear();
+            return Err(error);
+        }
     }
-    device.send_multiple(gro_table, staging, VIRTIO_NET_HDR_LEN)?;
     staging.clear();
     Ok(())
 }
