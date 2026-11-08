@@ -414,14 +414,10 @@ fn send_batch(device: &SyncDevice, vnet: bool, batch: &mut [BytesMut]) -> io::Re
         // frames are the packets, and the batch's own buffers reach
         // the kernel untouched — no per-frame copy, no per-frame
         // allocation, on the one thread the whole pipeline shares.
-        let mut err = Ok(());
         for frame in batch.iter() {
-            if let Err(error) = device.send(frame) {
-                err = Err(error);
-                break;
-            }
+            device.send(frame)?;
         }
-        return err;
+        return Ok(());
     }
     // One frame, one write: merging the batch into GSO super-packets
     // looked like the offload win but built a standing queue in the
@@ -435,9 +431,7 @@ fn send_batch(device: &SyncDevice, vnet: bool, batch: &mut [BytesMut]) -> io::Re
         let mut padded = BytesMut::with_capacity(VIRTIO_NET_HDR_LEN + frame.len());
         padded.resize(VIRTIO_NET_HDR_LEN, 0);
         padded.extend_from_slice(frame);
-        if let Err(error) = device.send(&padded) {
-            return Err(error);
-        }
+        device.send(&padded)?;
     }
     Ok(())
 }
