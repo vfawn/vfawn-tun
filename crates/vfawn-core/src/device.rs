@@ -48,6 +48,10 @@ impl DeviceCaps {
 /// for instance), because no further claim arrives before it. Both
 /// run on the I/O loop's thread, so the pair may share staging state
 /// without locks against each other.
+/// The sink a device feeds write buffers to after the kernel has
+/// taken their bytes.
+pub type FrameRelease = std::sync::Arc<dyn Fn(&mut Vec<bytes::BytesMut>) + Send + Sync>;
+
 #[derive(Clone)]
 pub struct ReadDispatch {
     pub claim: ClaimFn,
@@ -101,4 +105,12 @@ pub trait PacketDevice: Send {
     /// claim is a device-side fast path, never a filter the stack
     /// above may rely on for correctness.
     fn set_read_dispatch(&self, _dispatch: ReadDispatch) {}
+
+    /// Install the sink for write buffers once the kernel has their
+    /// bytes. A device whose write path is asynchronous (frames cross
+    /// a channel to a writer thread) feeds the whole batch here after
+    /// its syscalls instead of dropping it, so a pooled emitter's
+    /// circulation closes. The default drops — honest for devices
+    /// that write synchronously.
+    fn set_write_release(&self, _release: FrameRelease) {}
 }

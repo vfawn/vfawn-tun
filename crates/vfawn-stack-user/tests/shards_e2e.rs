@@ -33,6 +33,7 @@ fn start(count: usize) -> (Shards, MockDevice) {
             ..ShardConfig::default()
         },
         std::sync::Arc::new(|_| Box::new(UdpEcho)),
+        std::sync::Arc::new(vfawn_stack_user::shards::BufferPool::new()),
     );
     (shards, device)
 }

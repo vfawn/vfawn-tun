@@ -39,3 +39,11 @@ pub use ipv6::{FragmentInfoV6, Ipv6Header, V6Payload};
 pub use protocol::IpProtocol;
 pub use tcp::{TcpFlags, TcpHeader};
 pub use udp::UdpHeader;
+
+/// The headroom every emitted frame carries: the virtio-net header's
+/// ten bytes, zeroed. A device with virtio headers sends the frame as
+/// it stands (the zero prefix is a valid no-offload header); a device
+/// without them skips it. The emitters never look at it, and no
+/// packet on the wire begins with a zero byte (the IP version nibble
+/// is four or six), so the boundary sniffs for itself.
+pub const VNET_HEADROOM: usize = 10;

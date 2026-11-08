@@ -81,6 +81,19 @@ impl BufferPool {
         }
     }
 
+    /// Return many buffers under one lock: the writer thread feeds
+    /// back a whole batch after its syscalls, and a lock per buffer
+    /// put the pool's mutex on the writer's critical path at the
+    /// downlink's frame rate.
+    pub fn release_packets(&self, buffers: &mut Vec<BytesMut>) {
+        let mut pool = self.packets.lock().expect("packet pool lock");
+        for buffer in buffers.drain(..) {
+            if pool.len() < POOL_PACKET_CAP {
+                pool.push(buffer);
+            }
+        }
+    }
+
     pub fn batch(&self) -> Vec<BytesMut> {
         self.batches
             .lock()
@@ -460,9 +473,9 @@ impl Shards {
         write_device: Box<dyn PacketDevice>,
         config: ShardConfig,
         logic: LogicFactory,
+        pool: Arc<BufferPool>,
     ) -> Self {
         let shard_count = config.shards.max(1);
-        let pool = Arc::new(BufferPool::new());
         let stop_all = Arc::new(AtomicBool::new(false));
         let writer_ping: Arc<(Mutex<()>, std::sync::Condvar)> =
             Arc::new((Mutex::new(()), std::sync::Condvar::new()));
@@ -641,8 +654,16 @@ impl Shards {
                                 // fragments when it exceeds that (DF
                                 // set keeps the sender's refusal —
                                 // the frame drops as the sender asked).
-                                if packet.len() > writer_mtu {
-                                    match vfawn_wire::fragment_out::split(&packet, writer_mtu) {
+                                // The promise covers the packet, not
+                                // the pooled buffer's headroom riding
+                                // in front of it.
+                                let head = usize::from(packet.first() == Some(&0))
+                                    * vfawn_wire::VNET_HEADROOM;
+                                if packet.len() > writer_mtu + head {
+                                    match vfawn_wire::fragment_out::split(
+                                        &packet[head..],
+                                        writer_mtu,
+                                    ) {
                                         Some(pieces) => {
                                             writer_pool.release_packet(packet);
                                             for piece in pieces {

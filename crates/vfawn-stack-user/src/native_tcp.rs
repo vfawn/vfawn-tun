@@ -907,10 +907,38 @@ pub fn emit_v4(
     options: &[u8],
     payload: &[u8],
 ) -> Vec<u8> {
+    let mut frame = bytes::BytesMut::new();
+    emit_v4_into(&mut frame, src, dst, reaction, options, payload);
+    // The headroom belongs to the pooled path's writer; the classic
+    // shape hands back the bare packet the byte-exact callers — the
+    // differential oracle above all — have always compared.
+    frame[vfawn_wire::VNET_HEADROOM..].to_vec()
+}
+
+/// The pooled shape of [`emit_v4`]: the frame is written into the
+/// caller's buffer behind its zeroed headroom, and the buffer's own
+/// allocation is the only one the segment ever pays.
+pub fn emit_v4_into(
+    packet: &mut bytes::BytesMut,
+    src: std::net::SocketAddrV4,
+    dst: std::net::SocketAddrV4,
+    reaction: &Reaction,
+    options: &[u8],
+    payload: &[u8],
+) {
     // The option region pads to whole words (RFC 9293 §3.1: the data
     // offset counts them); no-operations are the filler.
     let options_len = options.len().div_ceil(4) * 4;
-    let mut packet = Vec::with_capacity(20 + 20 + options_len + payload.len());
+    let base = vfawn_wire::VNET_HEADROOM;
+    // The headroom must be zero whatever the buffer carried before:
+    // the writer sniffs its first byte to tell a pooled frame from a
+    // bare one, and a recycled read buffer's old leading bytes would
+    // masquerade as a bare frame and leave as garbage.
+    packet.truncate(base);
+    if packet.len() < base {
+        packet.resize(base, 0);
+    }
+    packet[..base].fill(0);
     let total = 20 + 20 + options_len + payload.len();
     // IPv4 header (RFC 791): protocol 6, correct total length.
     packet.extend_from_slice(&[0x45, 0x00]);
@@ -923,8 +951,7 @@ pub fn emit_v4(
     packet.extend_from_slice(&dst.port().to_be_bytes());
     packet.extend_from_slice(&reaction.seq.to_be_bytes());
     packet.extend_from_slice(&reaction.ack.to_be_bytes());
-    packet.push((((20 + options_len) / 4) as u8) << 4);
-    packet.push(reaction.flags);
+    packet.extend_from_slice(&[(((20 + options_len) / 4) as u8) << 4, reaction.flags]);
     packet.extend_from_slice(&reaction.window.to_be_bytes());
     packet.extend_from_slice(&[0, 0]); // checksum, fixed below
     packet.extend_from_slice(&[0, 0]); // urgent pointer
@@ -937,14 +964,13 @@ pub fn emit_v4(
         *dst.ip(),
         IpProtocol::Tcp,
         (20 + options_len + payload.len()) as u32,
-    ) + vfawn_wire::checksum::sum_words(&packet[20..]);
+    ) + vfawn_wire::checksum::sum_words(&packet[base + 20..]);
     let fixed = !vfawn_wire::checksum::fold(sum);
-    packet[36..38].copy_from_slice(&fixed.to_be_bytes());
+    packet[base + 36..base + 38].copy_from_slice(&fixed.to_be_bytes());
 
-    let header_sum = vfawn_wire::checksum::sum_words(&packet[..20]);
+    let header_sum = vfawn_wire::checksum::sum_words(&packet[base..base + 20]);
     let fixed = !vfawn_wire::checksum::fold(header_sum);
-    packet[10..12].copy_from_slice(&fixed.to_be_bytes());
-    packet
+    packet[base + 10..base + 12].copy_from_slice(&fixed.to_be_bytes());
 }
 
 /// The family-general emit: one shape, two envelopes. The TCP
@@ -970,6 +996,29 @@ pub fn emit_tcp(
     }
 }
 
+/// The family-general pooled emit: one shape, two envelopes, the
+/// caller's buffer behind its headroom.
+pub fn emit_tcp_into(
+    packet: &mut bytes::BytesMut,
+    src: std::net::SocketAddr,
+    dst: std::net::SocketAddr,
+    reaction: &Reaction,
+    options: &[u8],
+    payload: &[u8],
+) {
+    match (src, dst) {
+        (std::net::SocketAddr::V4(src), std::net::SocketAddr::V4(dst)) => {
+            emit_v4_into(packet, src, dst, reaction, options, payload)
+        }
+        (std::net::SocketAddr::V6(src), std::net::SocketAddr::V6(dst)) => {
+            emit_v6_into(packet, src, dst, reaction, options, payload)
+        }
+        // Endpoints were named together by the flow's first packet;
+        // a mismatch has no honest envelope: the packet empties.
+        _ => packet.clear(),
+    }
+}
+
 /// The v6 twin of [`emit_v4`]: a 40-byte envelope, no header checksum
 /// (v6 carries none), and the TCP checksum over the v6 pseudo-header.
 pub fn emit_v6(
@@ -979,21 +1028,42 @@ pub fn emit_v6(
     options: &[u8],
     payload: &[u8],
 ) -> Vec<u8> {
+    let mut frame = bytes::BytesMut::new();
+    emit_v6_into(&mut frame, src, dst, reaction, options, payload);
+    frame[vfawn_wire::VNET_HEADROOM..].to_vec()
+}
+
+/// The pooled shape of [`emit_v6`], the v6 twin of [`emit_v4_into`].
+pub fn emit_v6_into(
+    packet: &mut bytes::BytesMut,
+    src: std::net::SocketAddrV6,
+    dst: std::net::SocketAddrV6,
+    reaction: &Reaction,
+    options: &[u8],
+    payload: &[u8],
+) {
     let options_len = options.len().div_ceil(4) * 4;
-    let mut packet = Vec::with_capacity(40 + 20 + options_len + payload.len());
+    let base = vfawn_wire::VNET_HEADROOM;
+    // The headroom must be zero whatever the buffer carried before:
+    // the writer sniffs its first byte to tell a pooled frame from a
+    // bare one, and a recycled read buffer's old leading bytes would
+    // masquerade as a bare frame and leave as garbage.
+    packet.truncate(base);
+    if packet.len() < base {
+        packet.resize(base, 0);
+    }
+    packet[..base].fill(0);
     packet.extend_from_slice(&[0x60, 0, 0, 0]); // version, class, label
     let tcp_len = 20 + options_len + payload.len();
     packet.extend_from_slice(&(tcp_len as u16).to_be_bytes());
-    packet.push(IpProtocol::Tcp.number());
-    packet.push(64); // hop budget, one hop from this endpoint
+    packet.extend_from_slice(&[IpProtocol::Tcp.number(), 64]); // hop budget, one hop from this endpoint
     packet.extend_from_slice(&src.ip().octets());
     packet.extend_from_slice(&dst.ip().octets());
     packet.extend_from_slice(&src.port().to_be_bytes());
     packet.extend_from_slice(&dst.port().to_be_bytes());
     packet.extend_from_slice(&reaction.seq.to_be_bytes());
     packet.extend_from_slice(&reaction.ack.to_be_bytes());
-    packet.push((((20 + options_len) / 4) as u8) << 4);
-    packet.push(reaction.flags);
+    packet.extend_from_slice(&[(((20 + options_len) / 4) as u8) << 4, reaction.flags]);
     packet.extend_from_slice(&reaction.window.to_be_bytes());
     packet.extend_from_slice(&[0, 0]); // checksum, fixed below
     packet.extend_from_slice(&[0, 0]); // urgent pointer
@@ -1006,10 +1076,9 @@ pub fn emit_v6(
         *dst.ip(),
         IpProtocol::Tcp,
         tcp_len as u32,
-    ) + vfawn_wire::checksum::sum_words(&packet[40..]);
+    ) + vfawn_wire::checksum::sum_words(&packet[base + 40..]);
     let fixed = !vfawn_wire::checksum::fold(sum);
-    packet[56..58].copy_from_slice(&fixed.to_be_bytes());
-    packet
+    packet[base + 56..base + 58].copy_from_slice(&fixed.to_be_bytes());
 }
 
 /// The differential driver's native side: the same scenario, the same

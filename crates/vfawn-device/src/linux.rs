@@ -59,6 +59,10 @@ struct Shared {
     /// once per read batch, not per packet, and is otherwise
     /// uncontended.
     dispatch: Mutex<Option<vfawn_core::device::ReadDispatch>>,
+    /// The sink for write buffers after their syscall: the pooled
+    /// emitter's circulation closes here, or the default drop stands
+    /// in when no pool owns the frames.
+    release: Mutex<Option<vfawn_core::device::FrameRelease>>,
 }
 
 /// One end of the device: the reader's half by construction, the
@@ -198,6 +202,7 @@ impl TunDevice {
             event,
             stopped: AtomicBool::new(false),
             dispatch: Mutex::new(None),
+            release: Mutex::new(None),
         });
         // The descriptor is full duplex: reads and writes are
         // independent halves of the tun socket, so the write side
@@ -392,7 +397,14 @@ fn write_loop(
                 return;
             }
         };
-        if let Err(error) = send_batch(&device.0, vnet, &mut batch, &mut scratch) {
+        let outcome = send_batch(&device.0, vnet, &mut batch, &mut scratch);
+        // The buffers' bytes are in the kernel; a pool that owns them
+        // takes them back here, and without one the drop is the
+        // honest end.
+        if let Some(release) = shared.release.lock().expect("write release").as_ref() {
+            release(&mut batch);
+        }
+        if let Err(error) = outcome {
             // A queue that cannot take the batch right now is
             // backpressure, not death: the drop behaves like a qdisc
             // drop (TCP above retransmits, UDP loses one datagram),
@@ -422,12 +434,13 @@ fn send_batch(
     scratch: &mut Vec<u8>,
 ) -> io::Result<()> {
     if !vnet {
-        // Without the virtio header there is nothing to stage: the
-        // frames are the packets, and the batch's own buffers reach
-        // the kernel untouched — no per-frame copy, no per-frame
-        // allocation, on the one thread the whole pipeline shares.
+        // Without the virtio header the headroom is the only thing to
+        // undo: frames born in the pool carry it (their first byte is
+        // the zero the pool left there), control frames built bare do
+        // not, and no packet on the wire starts with a zero byte.
         for frame in batch.iter() {
-            device.send(frame)?;
+            let head = usize::from(frame.first() == Some(&0)) * VIRTIO_NET_HDR_LEN;
+            device.send(&frame[head..])?;
         }
         return Ok(());
     }
@@ -440,10 +453,19 @@ fn send_batch(
     // syscall is the cheaper tax on the writer thread, which has a
     // core of its own.
     for frame in batch.iter() {
-        scratch.clear();
-        scratch.resize(VIRTIO_NET_HDR_LEN, 0);
-        scratch.extend_from_slice(frame);
-        device.send(scratch)?;
+        if frame.first() == Some(&0) {
+            // Born pooled: the headroom IS the virtio header — the
+            // zeros say no-offload honestly — and the frame reaches
+            // the kernel without a single copy.
+            device.send(frame)?;
+        } else {
+            // Built bare: the header is staged in front, the one copy
+            // the control frames' rarity can well afford.
+            scratch.clear();
+            scratch.resize(VIRTIO_NET_HDR_LEN, 0);
+            scratch.extend_from_slice(frame);
+            device.send(scratch)?;
+        }
     }
     Ok(())
 }
@@ -510,6 +532,10 @@ impl PacketDevice for TunDevice {
             caps: self.caps,
             name: self.name.clone(),
         }))
+    }
+
+    fn set_write_release(&self, release: vfawn_core::device::FrameRelease) {
+        *self.shared.release.lock().expect("write release") = Some(release);
     }
 
     fn set_read_dispatch(&self, dispatch: vfawn_core::device::ReadDispatch) {

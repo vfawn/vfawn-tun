@@ -86,6 +86,11 @@ struct WriteLane {
 /// from owing the process gigabytes.
 const LANE_CAP: usize = 256 * 1024;
 
+/// The circulating emit buffer's size: the virtio headroom plus an
+/// MTU's frame. Every pooled frame a slot emits draws one of these
+/// and the writer's completion returns it.
+const EMIT_PACKET: usize = vfawn_wire::VNET_HEADROOM + 1514;
+
 impl WriteLane {
     fn new() -> Self {
         Self {
@@ -149,6 +154,8 @@ struct TcpSlot {
     flow_key: vfawn_wire::flow::FlowKey,
     /// The tracker the host's verdict attached, handed to the session
     /// when the handshake completes.
+    /// The frame pool the pooled emitter draws from.
+    frame_pool: Arc<crate::shards::BufferPool>,
     tracker: Option<Arc<dyn vfawn_core::FlowTrackerHook>>,
 }
 
@@ -315,8 +322,20 @@ impl TcpSlot {
                 held: false,
                 gap_filled: false,
             };
-            let frame = emit_tcp(self.server, self.client, &reaction, &[], &write[..take]);
-            out.push_back(BytesMut::from(&frame[..]));
+            // The pooled emit: the frame is born in a circulating
+            // buffer behind its headroom — no per-segment allocation,
+            // no hand-off copy, the writer sends the buffer as it
+            // stands and the pool takes it back on completion.
+            let mut frame = self.frame_pool.packet(EMIT_PACKET);
+            crate::native_tcp::emit_tcp_into(
+                &mut frame,
+                self.server,
+                self.client,
+                &reaction,
+                &[],
+                &write[..take],
+            );
+            out.push_back(frame);
             if self.flight.is_empty() {
                 self.flight_base = self.connection.send_nxt();
                 self.data_sent_at = Some(Instant::now());
@@ -398,8 +417,16 @@ impl TcpSlot {
         } else {
             Vec::new()
         };
-        let frame = emit_tcp(self.server, self.client, reaction, &options, &[]);
-        out.push_back(BytesMut::from(&frame[..]));
+        let mut frame = self.frame_pool.packet(EMIT_PACKET);
+        crate::native_tcp::emit_tcp_into(
+            &mut frame,
+            self.server,
+            self.client,
+            reaction,
+            &options,
+            &[],
+        );
+        out.push_back(frame);
         self.connection
             .send_advance(u32::from(reaction.flags & 0x03 != 0));
     }
@@ -1278,102 +1305,118 @@ impl StackBackend for NativeBackend {
 
         let factory_shared = Arc::clone(&shared);
         let icmp_table = Arc::new(crate::icmp::IcmpTable::new());
+        // The frame pool is born here so the slot factory and the
+        // shard pipeline share one circulation: emitted frames draw
+        // pooled buffers and the writer returns them on completion.
+        let frame_pool = Arc::new(crate::shards::BufferPool::new());
         // The error lane's reader rides with the session surfaces
         // (the close-on-IcmpError wiring); the sender end is live the
         // moment the first datagram slot exists.
         let (error_tx, _error_lane) = mpsc::sync_channel::<FlowInfo>(1024);
         let icmp_handler = Arc::clone(&shared.handler);
         let icmp_table_for_slots = Arc::clone(&icmp_table);
-        let logic_factory: LogicFactory = Arc::new(move |flow: &FlowKey| {
-            // Every flow's slot knows its shard's doorbell — the host's
-            // writes ring it through the slot's lane — resolved here so
-            // the datagram slots and the connection slots share one
-            // lookup shape. Before the shards exist (nothing has flowed
-            // yet) a private bell stands in; it rings nothing.
-            let shard_bell = factory_shared
-                .shard_wakes
-                .get()
-                .and_then(|bells| {
-                    bells
-                        .get(crate::shards::shard_hash_of(flow, bells.len()))
-                        .cloned()
+        let logic_factory: LogicFactory = {
+            let frame_pool = Arc::clone(&frame_pool);
+            Arc::new(move |flow: &FlowKey| {
+                // Every flow's slot knows its shard's doorbell — the host's
+                // writes ring it through the slot's lane — resolved here so
+                // the datagram slots and the connection slots share one
+                // lookup shape. Before the shards exist (nothing has flowed
+                // yet) a private bell stands in; it rings nothing.
+                let shard_bell = factory_shared
+                    .shard_wakes
+                    .get()
+                    .and_then(|bells| {
+                        bells
+                            .get(crate::shards::shard_hash_of(flow, bells.len()))
+                            .cloned()
+                    })
+                    .unwrap_or_else(|| Arc::new(ShardBell::new()));
+                // ICMP flows ride the datagram slot: echo answered in
+                // place, errors correlated, no connection to hold — both
+                // families, the kinds tell them apart.
+                if flow.protocol == IpProtocol::Icmp || flow.protocol == IpProtocol::Icmpv6 {
+                    return Box::new(crate::icmp_slot::IcmpSlot::new(
+                        Arc::clone(&icmp_handler),
+                        Arc::clone(&icmp_table_for_slots),
+                        error_tx.clone(),
+                    )) as Box<dyn SlotLogic>;
+                }
+                // Datagram flows ride their own slot: no handshake, no
+                // sequence space — the first datagram earns the session
+                // and the idle clock owns the rest.
+                if flow.protocol == IpProtocol::Udp {
+                    return Box::new(crate::udp_slot::UdpSlot::new(
+                        Arc::clone(&factory_shared.handler),
+                        factory_shared.udp_sessions.clone(),
+                        shard_bell,
+                    )) as Box<dyn SlotLogic>;
+                }
+                // Only v4 flows ride the native stack; anything else gets a
+                // sink slot so the shard keeps flowing.
+                let Some((client, server)) = v4_ends(flow) else {
+                    return Box::new(SinkSlot) as Box<dyn SlotLogic>;
+                };
+                // The accept layer's say on the new flow: cookie mode
+                // hands every SYN a secret-keyed ISN at no cost, backlog
+                // mode drops the SYN outright once the queue is full.
+                let source = std::net::SocketAddr::new(flow.src, flow.src_port);
+                let Some(isn) = factory_shared
+                    .accept
+                    .lock()
+                    .expect("accept lock")
+                    .admit(source, Instant::now())
+                else {
+                    return Box::new(SinkSlot) as Box<dyn SlotLogic>;
+                };
+                let write_lane = Arc::new(std::sync::Mutex::new(WriteLane::new()));
+
+                Box::new(TcpSlot {
+                    connection: ServerConnection::new(isn, factory_shared.mss),
+                    flow_key: *flow,
+                    client,
+                    server,
+                    handler: Arc::clone(&factory_shared.handler),
+                    accept: Arc::clone(&factory_shared.accept),
+                    sessions: factory_shared.sessions.clone(),
+                    flow: FlowInfo {
+                        network: Network::Tcp,
+                        source,
+                        destination: std::net::SocketAddr::new(flow.dst, flow.dst_port),
+                    },
+                    write_lane,
+                    shard_wake: shard_bell,
+                    cc: (factory_shared.cc_factory)(),
+                    to_host: None,
+                    judged: false,
+                    refused: false,
+                    flight: Vec::new(),
+                    flight_base: 0,
+                    data_sent_at: None,
+                    data_retries: 0,
+                    synack_at: None,
+                    synack_retries: 0,
+                    fin_at: None,
+                    persist_at: None,
+                    persist_retries: 0,
+                    diag_at: None,
+                    diag_queued: 0,
+                    keepalive_at: None,
+                    keepalive_probes: 0,
+                    tracker: None,
+                    frame_pool: Arc::clone(&frame_pool),
                 })
-                .unwrap_or_else(|| Arc::new(ShardBell::new()));
-            // ICMP flows ride the datagram slot: echo answered in
-            // place, errors correlated, no connection to hold — both
-            // families, the kinds tell them apart.
-            if flow.protocol == IpProtocol::Icmp || flow.protocol == IpProtocol::Icmpv6 {
-                return Box::new(crate::icmp_slot::IcmpSlot::new(
-                    Arc::clone(&icmp_handler),
-                    Arc::clone(&icmp_table_for_slots),
-                    error_tx.clone(),
-                )) as Box<dyn SlotLogic>;
-            }
-            // Datagram flows ride their own slot: no handshake, no
-            // sequence space — the first datagram earns the session
-            // and the idle clock owns the rest.
-            if flow.protocol == IpProtocol::Udp {
-                return Box::new(crate::udp_slot::UdpSlot::new(
-                    Arc::clone(&factory_shared.handler),
-                    factory_shared.udp_sessions.clone(),
-                    shard_bell,
-                )) as Box<dyn SlotLogic>;
-            }
-            // Only v4 flows ride the native stack; anything else gets a
-            // sink slot so the shard keeps flowing.
-            let Some((client, server)) = v4_ends(flow) else {
-                return Box::new(SinkSlot) as Box<dyn SlotLogic>;
-            };
-            // The accept layer's say on the new flow: cookie mode
-            // hands every SYN a secret-keyed ISN at no cost, backlog
-            // mode drops the SYN outright once the queue is full.
-            let source = std::net::SocketAddr::new(flow.src, flow.src_port);
-            let Some(isn) = factory_shared
-                .accept
-                .lock()
-                .expect("accept lock")
-                .admit(source, Instant::now())
-            else {
-                return Box::new(SinkSlot) as Box<dyn SlotLogic>;
-            };
-            let write_lane = Arc::new(std::sync::Mutex::new(WriteLane::new()));
-
-            Box::new(TcpSlot {
-                connection: ServerConnection::new(isn, factory_shared.mss),
-                flow_key: *flow,
-                client,
-                server,
-                handler: Arc::clone(&factory_shared.handler),
-                accept: Arc::clone(&factory_shared.accept),
-                sessions: factory_shared.sessions.clone(),
-                flow: FlowInfo {
-                    network: Network::Tcp,
-                    source,
-                    destination: std::net::SocketAddr::new(flow.dst, flow.dst_port),
-                },
-                write_lane,
-                shard_wake: shard_bell,
-                cc: (factory_shared.cc_factory)(),
-                to_host: None,
-                judged: false,
-                refused: false,
-                flight: Vec::new(),
-                flight_base: 0,
-                data_sent_at: None,
-                data_retries: 0,
-                synack_at: None,
-                synack_retries: 0,
-                fin_at: None,
-                persist_at: None,
-                persist_retries: 0,
-                diag_at: None,
-                diag_queued: 0,
-                keepalive_at: None,
-                keepalive_probes: 0,
-                tracker: None,
             })
-        });
+        };
 
+        // The pool's circulation closes in the device: every frame
+        // the writer thread hands the kernel comes back here, and a
+        // cold pool (nothing ever returned) once cost the downlink
+        // twentyfold in allocator storms.
+        device.set_write_release(Arc::new({
+            let frame_pool = Arc::clone(&frame_pool);
+            move |buffers| frame_pool.release_packets(buffers)
+        }));
         let shard_count = self.shards;
         let shards = Shards::start(
             device,
@@ -1384,6 +1427,7 @@ impl StackBackend for NativeBackend {
                 ..ShardConfig::default()
             },
             logic_factory,
+            Arc::clone(&frame_pool),
         );
         let _ = shard_wakes.set(
             (0..shard_count)
@@ -1552,6 +1596,7 @@ mod tests {
         let (sessions_tx, _sessions_rx) = mpsc::sync_channel(4);
         let mut slot = TcpSlot {
             connection: ServerConnection::new(1000, 1460),
+            frame_pool: Arc::new(crate::shards::BufferPool::new()),
             flow_key: vfawn_wire::flow::FlowKey {
                 src: client.ip(),
                 src_port: client.port(),
