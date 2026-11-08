@@ -259,7 +259,6 @@ fn io_loop(shared: Arc<Shared>, device: Arc<SharedTun>, vnet: bool) {
     // capacity).
     let seg = 1514;
     let mut bufs: Vec<BytesMut> = (0..BATCH).map(|_| BytesMut::zeroed(seg)).collect();
-    let mut staging: Vec<BytesMut> = Vec::new();
     let mut original = vec![0u8; VIRTIO_NET_HDR_LEN + 65535];
 
     loop {
@@ -311,7 +310,7 @@ fn io_loop(shared: Arc<Shared>, device: Arc<SharedTun>, vnet: bool) {
                 // re-asks and the slot answers); only the device's
                 // death stops the loop.
                 if !answers.is_empty()
-                    && let Err(error) = send_batch(&device.0, vnet, &mut staging, &mut answers)
+                    && let Err(error) = send_batch(&device.0, vnet, &mut answers)
                     && error.kind() == ErrorKind::NotConnected
                 {
                     eprintln!("vfawn: tun I/O stopped: device down");
@@ -377,7 +376,6 @@ fn write_loop(
     vnet: bool,
 ) {
     let mut drop_counter = 0u64;
-    let mut staging: Vec<BytesMut> = Vec::new();
     while !shared.stopped.load(Ordering::Acquire) {
         let mut batch = match writes.recv_timeout(std::time::Duration::from_millis(50)) {
             Ok(batch) => batch,
@@ -387,7 +385,7 @@ fn write_loop(
                 return;
             }
         };
-        if let Err(error) = send_batch(&device.0, vnet, &mut staging, &mut batch) {
+        if let Err(error) = send_batch(&device.0, vnet, &mut batch) {
             // A queue that cannot take the batch right now is
             // backpressure, not death: the drop behaves like a qdisc
             // drop (TCP above retransmits, UDP loses one datagram),
@@ -410,12 +408,7 @@ fn write_loop(
 /// One write batch onto the wire: one kernel call per frame. The
 /// offload path stages each frame behind its virtio header first; the
 /// plain path hands the batch's own buffers over untouched.
-fn send_batch(
-    device: &SyncDevice,
-    vnet: bool,
-    staging: &mut Vec<BytesMut>,
-    batch: &mut [BytesMut],
-) -> io::Result<()> {
+fn send_batch(device: &SyncDevice, vnet: bool, batch: &mut [BytesMut]) -> io::Result<()> {
     if !vnet {
         // Without the virtio header there is nothing to stage: the
         // frames are the packets, and the batch's own buffers reach
@@ -442,13 +435,10 @@ fn send_batch(
         let mut padded = BytesMut::with_capacity(VIRTIO_NET_HDR_LEN + frame.len());
         padded.resize(VIRTIO_NET_HDR_LEN, 0);
         padded.extend_from_slice(frame);
-        staging.push(padded);
-        if let Err(error) = device.send(padded) {
-            staging.clear();
+        if let Err(error) = device.send(&padded) {
             return Err(error);
         }
     }
-    staging.clear();
     Ok(())
 }
 
