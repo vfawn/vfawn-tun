@@ -310,7 +310,7 @@ fn io_loop(shared: Arc<Shared>, device: Arc<SharedTun>, vnet: bool) {
                 // re-asks and the slot answers); only the device's
                 // death stops the loop.
                 if !answers.is_empty()
-                    && let Err(error) = send_batch(&device.0, vnet, &mut answers)
+                    && let Err(error) = send_batch(&device.0, vnet, &mut answers, &mut Vec::new())
                     && error.kind() == ErrorKind::NotConnected
                 {
                     eprintln!("vfawn: tun I/O stopped: device down");
@@ -376,6 +376,13 @@ fn write_loop(
     vnet: bool,
 ) {
     let mut drop_counter = 0u64;
+    // One scratch for the whole thread: the offload path's per-frame
+    // prefix staging once allocated a buffer per frame — a hundred
+    // seventy thousand allocations a second at the downlink's peak,
+    // all on the thread that was saturating. The scratch grows to the
+    // frame ceiling once and the allocator never hears from this
+    // loop again.
+    let mut scratch: Vec<u8> = Vec::new();
     while !shared.stopped.load(Ordering::Acquire) {
         let mut batch = match writes.recv_timeout(std::time::Duration::from_millis(50)) {
             Ok(batch) => batch,
@@ -385,7 +392,7 @@ fn write_loop(
                 return;
             }
         };
-        if let Err(error) = send_batch(&device.0, vnet, &mut batch) {
+        if let Err(error) = send_batch(&device.0, vnet, &mut batch, &mut scratch) {
             // A queue that cannot take the batch right now is
             // backpressure, not death: the drop behaves like a qdisc
             // drop (TCP above retransmits, UDP loses one datagram),
@@ -408,7 +415,12 @@ fn write_loop(
 /// One write batch onto the wire: one kernel call per frame. The
 /// offload path stages each frame behind its virtio header first; the
 /// plain path hands the batch's own buffers over untouched.
-fn send_batch(device: &SyncDevice, vnet: bool, batch: &mut [BytesMut]) -> io::Result<()> {
+fn send_batch(
+    device: &SyncDevice,
+    vnet: bool,
+    batch: &mut [BytesMut],
+    scratch: &mut Vec<u8>,
+) -> io::Result<()> {
     if !vnet {
         // Without the virtio header there is nothing to stage: the
         // frames are the packets, and the batch's own buffers reach
@@ -428,10 +440,10 @@ fn send_batch(device: &SyncDevice, vnet: bool, batch: &mut [BytesMut]) -> io::Re
     // syscall is the cheaper tax on the writer thread, which has a
     // core of its own.
     for frame in batch.iter() {
-        let mut padded = BytesMut::with_capacity(VIRTIO_NET_HDR_LEN + frame.len());
-        padded.resize(VIRTIO_NET_HDR_LEN, 0);
-        padded.extend_from_slice(frame);
-        device.send(&padded)?;
+        scratch.clear();
+        scratch.resize(VIRTIO_NET_HDR_LEN, 0);
+        scratch.extend_from_slice(frame);
+        device.send(scratch)?;
     }
     Ok(())
 }
