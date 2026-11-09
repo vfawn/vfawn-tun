@@ -49,6 +49,7 @@ impl Script {
         }
     }
 
+    #[expect(clippy::too_many_arguments)]
     fn tcp_v4_with_options(
         &self,
         client: SocketAddrV4,
@@ -215,6 +216,7 @@ impl Script {
     /// TCP segment on top, and the transport checksum the family
     /// makes mandatory (RFC 8200 §8.1: an upper-layer checksum must
     /// cover the v6 pseudo-header).
+    #[expect(clippy::too_many_arguments)]
     fn tcp_v6_with_options(
         &self,
         client: std::net::SocketAddrV6,
