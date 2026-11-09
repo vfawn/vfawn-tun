@@ -139,9 +139,65 @@ fn desired_state_of(
         table_index: config.route.table_index,
         rule_index: config.route.rule_index,
         mark: config.route.mark,
+        bypass_mark: bypass_mark_of(config),
         strict_route: config.route.strict_route,
         dns_leak_prevention: false,
         include_uid: &config.route.include_uid,
         exclude_uid: &config.route.exclude_uid,
     })
+}
+
+/// The bypass mark the policy rules honor: the configured one when the
+/// per-flow bypass is on, zero (no rule) otherwise.
+pub(crate) fn bypass_mark_of(config: &VfawnConfig) -> u32 {
+    let redirect = &config.route.auto_redirect;
+    if redirect.enabled {
+        redirect.output_mark
+    } else {
+        0
+    }
+}
+
+/// Install the per-flow kernel bypass when the configuration asks for
+/// it. A host without the queue modules, the nft binary or the
+/// privilege keeps running on the plain capture: every flow then takes
+/// the device path, which is correct, only slower for bypassed flows.
+#[cfg(target_os = "linux")]
+pub(crate) fn install_auto_redirect(
+    config: &VfawnConfig,
+    interface: &str,
+    addresses: &[ipnet::IpNet],
+    handler: Arc<dyn vfawn_core::SessionHandler>,
+) -> Option<vfawn_platform::linux::AutoRedirect> {
+    use vfawn_platform::linux::{AutoRedirect, RedirectParams, auto_redirect};
+
+    let redirect = &config.route.auto_redirect;
+    if !redirect.enabled {
+        return None;
+    }
+    let mut excluded = DesiredState::default_exclusions();
+    excluded.extend_from_slice(&config.route.route_exclude_address);
+    let params = RedirectParams {
+        interface,
+        tun_addresses: addresses,
+        excluded: &excluded,
+        escape_mark: config.route.mark,
+        output_mark: redirect.output_mark,
+        reset_mark: redirect.reset_mark,
+        queue: redirect.queue,
+    };
+    match AutoRedirect::install(&params, handler) {
+        Ok(installed) => {
+            if let Some(egress) = vfawn_platform::linux::default_if::current_default_interface()
+                && let Some(warning) = auto_redirect::rp_filter_warning(&egress.name)
+            {
+                eprintln!("vfawn: auto_redirect: {warning}");
+            }
+            Some(installed)
+        }
+        Err(e) => {
+            eprintln!("vfawn: auto_redirect unavailable, every flow takes the device path ({e})");
+            None
+        }
+    }
 }

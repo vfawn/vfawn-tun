@@ -139,6 +139,41 @@ pub struct RouteConfig {
     /// policy forbids programmatic rule edits. Disabled touches
     /// nothing. Inert on the other platforms.
     pub windows_firewall: WindowsFirewallMode,
+    /// Per-flow kernel bypass (Linux, needs `auto_route`).
+    pub auto_redirect: AutoRedirectConfig,
+}
+
+/// Per-flow kernel bypass: netfilter hands each new TCP connection's
+/// SYN to `judge_flow` before the packet reaches the device, and a
+/// `Bypass` verdict marks the whole connection past the capture — it
+/// never touches the device or the stack. Every other verdict leaves
+/// the flow on the captured path, where the stack judges it again.
+///
+/// Off by default. When the kernel lacks the queue modules or the
+/// process lacks the privilege, the instance logs the reason and runs
+/// without it rather than refusing to start.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AutoRedirectConfig {
+    pub enabled: bool,
+    /// The mark a bypassed connection carries; a policy rule sends it
+    /// to the main table. Must differ from `route.mark`.
+    pub output_mark: u32,
+    /// The mark that turns a rejected SYN into a TCP reset.
+    pub reset_mark: u32,
+    /// The NFQUEUE number the SYNs are handed through.
+    pub queue: u16,
+}
+
+impl Default for AutoRedirectConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            output_mark: 0x2024,
+            reset_mark: 0x2025,
+            queue: 100,
+        }
+    }
 }
 
 /// The Windows firewall posture for the process's own executable.
@@ -172,6 +207,7 @@ impl Default for RouteConfig {
             rule_index: 9000,
             mark: 0x2022,
             windows_firewall: WindowsFirewallMode::Auto,
+            auto_redirect: AutoRedirectConfig::default(),
         }
     }
 }
@@ -475,6 +511,24 @@ impl VfawnConfig {
                 what: "table_index",
             });
         }
+        let ar = &r.auto_redirect;
+        if ar.enabled {
+            if !r.auto_route {
+                return Err(ConfigError::OutOfRange {
+                    what: "auto_redirect without auto_route",
+                });
+            }
+            // Zero is "no mark" to the kernel, and two roles sharing
+            // one mark would route one as the other.
+            let distinct = ar.output_mark != ar.reset_mark
+                && ar.output_mark != r.mark
+                && ar.reset_mark != r.mark;
+            if ar.output_mark == 0 || ar.reset_mark == 0 || !distinct {
+                return Err(ConfigError::OutOfRange {
+                    what: "auto_redirect marks",
+                });
+            }
+        }
 
         check_count("dns addresses", self.dns.address.len(), limits::ADDRESSES)?;
 
@@ -578,6 +632,31 @@ mod tests {
             Err(ConfigError::OutOfRange { .. })
         ));
     }
+    #[test]
+    fn auto_redirect_is_off_and_validated_when_on() {
+        let cfg = VfawnConfig::default();
+        assert!(!cfg.route.auto_redirect.enabled);
+        assert!(cfg.validate().is_ok());
+
+        let json = r#"{"route": {"auto_route": true, "auto_redirect": {"enabled": true}}}"#;
+        let cfg: VfawnConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.route.auto_redirect.output_mark, 0x2024);
+        assert_eq!(cfg.route.auto_redirect.queue, 100);
+        assert!(cfg.validate().is_ok());
+
+        let mut lone = cfg.clone();
+        lone.route.auto_route = false;
+        assert!(lone.validate().is_err());
+
+        let mut clash = cfg.clone();
+        clash.route.auto_redirect.output_mark = clash.route.mark;
+        assert!(clash.validate().is_err());
+
+        let mut zero = cfg;
+        zero.route.auto_redirect.reset_mark = 0;
+        assert!(zero.validate().is_err());
+    }
+
     #[test]
     fn hook_serializes_as_intent_only() {
         let mut cfg = VfawnConfig::default();

@@ -17,9 +17,13 @@ netlink-packet-route.workspace = true
 serde.workspace = true
 tokio.workspace = true
 futures = "0.3"
+nfq = "0.2.6"
+socket2.workspace = true
+vfawn-wire.workspace = true
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 libc = "0.2"
+async-trait.workspace = true
 
 [lints]
 workspace = true

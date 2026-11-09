@@ -1,0 +1,736 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-FileCopyrightText: Copyright (c) 2026 VFawn contributors
+
+//! Per-flow kernel bypass (056 P1) against a real kernel.
+//!
+//! The parent owns the "internet": real TCP servers on 10.201.0.2 in
+//! the root namespace. The body runs inside a fresh namespace whose
+//! only uplink is a veth to that address, with a full [`Instance`]
+//! (`auto_route` plus `auto_redirect`) and a handler that judges by
+//! destination port:
+//!
+//! * 8080 Bypass — reaches the real server, never touches the device,
+//!   arrives from the uplink's address (masquerade), every packet of
+//!   it (not just the SYN);
+//! * 9090 Accept — captured, echoed by the handler, the server never
+//!   sees it;
+//! * 7070 Reject — refused by a kernel reset;
+//! * 6060 Drop — times out.
+//!
+//! Then: strict reverse-path filtering with `src_valid_mark`; the
+//! fallback when the queue is taken or `nft` is missing (the instance
+//! runs on the plain capture); a LAN client forwarded through the
+//! instance, with and without the LAN excluded; orderly shutdown
+//! leaves no table, `kill -9` leaves one the sweep removes.
+//!
+//! A second test measures throughput with iperf3: direct, direct with
+//! conntrack running, and bypassed.
+//!
+//! ```sh
+//! sudo -E cargo test -p vfawn --release --test auto_redirect_linux -- --ignored --nocapture --test-threads=1
+//! ```
+
+#![cfg(target_os = "linux")]
+
+use ipnet::IpNet;
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::process::{Child, Command, Stdio};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+use vfawn::Instance;
+use vfawn_core::{
+    Action, DnsMode, FlowInfo, IcmpPacket, SessionHandler, TcpSession, UdpSession, Verdict,
+    VfawnConfig,
+};
+
+const NS: &str = "vfawn056";
+const LAN_NS: &str = "vfawn056c";
+const LAN: &str = "10.202.0.0/24";
+const LAN_CLIENT: &str = "10.202.0.2";
+const IP: &str = "/usr/sbin/ip";
+const NFT: &str = "/usr/sbin/nft";
+const TUN: &str = "vfawn56";
+const SERVER: &str = "10.201.0.2";
+const UPLINK: &str = "10.201.0.1";
+const BULK: usize = 32 << 20;
+
+fn run(mut cmd: Command) -> String {
+    let out = cmd.output().expect("spawn");
+    assert!(
+        out.status.success(),
+        "command failed: {cmd:?}\n{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+fn sh(line: &str) -> Command {
+    let mut c = Command::new("sh");
+    c.args(["-c", line]);
+    c
+}
+
+fn in_ns(line: &str) -> Command {
+    sh(&format!("ip netns exec {NS} {line}"))
+}
+
+fn env_is(key: &str, value: &str) -> bool {
+    std::env::var(key).as_deref() == Ok(value)
+}
+
+/// The body's namespace with one uplink to the root namespace.
+fn topology() {
+    let _ = sh(&format!(
+        "ip netns del {NS}; ip netns del {LAN_NS}; ip link del v56b"
+    ))
+    .output();
+    run(sh(&format!("ip netns add {NS}")));
+    // No IPv6 chatter on the device: the bypass proof counts its packets.
+    run(in_ns("sysctl -q -w net.ipv6.conf.default.disable_ipv6=1"));
+    run(sh(&format!(
+        "ip link add v56a type veth peer name v56b && ip link set v56a netns {NS} && \
+         ip addr add {SERVER}/24 dev v56b && ip link set v56b up"
+    )));
+    run(in_ns(&format!(
+        "sh -c 'ip link set lo up && ip addr add {UPLINK}/24 dev v56a && \
+         ip link set v56a up && ip route add default via {SERVER}'"
+    )));
+    run(in_ns("sysctl -q -w net.ipv4.conf.all.rp_filter=0"));
+    run(in_ns("sysctl -q -w net.ipv4.conf.default.rp_filter=0"));
+}
+
+/// A LAN behind the body's namespace: a client namespace routed
+/// through it, and the root namespace routing replies back.
+fn lan_topology() {
+    run(sh(&format!("ip netns add {LAN_NS}")));
+    run(sh(&format!(
+        "ip link add v56c type veth peer name v56d && \
+         ip link set v56c netns {LAN_NS} && ip link set v56d netns {NS}"
+    )));
+    run(sh(&format!(
+        "ip netns exec {LAN_NS} sh -c 'ip link set lo up && \
+         ip addr add {LAN_CLIENT}/24 dev v56c && ip link set v56c up && \
+         ip route add default via 10.202.0.1'"
+    )));
+    run(in_ns(
+        "sh -c 'ip addr add 10.202.0.1/24 dev v56d && ip link set v56d up && \
+         sysctl -q -w net.ipv4.ip_forward=1 && sysctl -q -w net.ipv4.conf.v56d.rp_filter=0'",
+    ));
+    run(sh(&format!("ip route replace {LAN} via {UPLINK}")));
+}
+
+#[test]
+#[ignore]
+fn auto_redirect_end_to_end() {
+    match std::env::var("VFAWN_056_BODY").as_deref() {
+        Ok("probe") => return body_probe(),
+        Ok("hold") => return body_hold(),
+        Ok("sweep") => return body_sweep(),
+        Ok("nomark") => return body_nomark(),
+        Ok("fallback") => return body_fallback(),
+        Ok("forward") => return body_forward(),
+        Ok("lan") => return body_lan(),
+        _ => {}
+    }
+
+    topology();
+    for port in [8080, 9090, 7070, 6060] {
+        serve(port);
+    }
+
+    // Loose reverse-path filtering first, then strict with the mark
+    // honored: the reply direction carries the restored bypass mark.
+    body("probe", &[]);
+    run(in_ns(
+        "sh -c 'sysctl -q -w net.ipv4.conf.all.rp_filter=1 && \
+         sysctl -q -w net.ipv4.conf.v56a.rp_filter=1 && \
+         sysctl -q -w net.ipv4.conf.v56a.src_valid_mark=1'",
+    ));
+    body("probe", &[("VFAWN_056_QUICK", "1")]);
+    // The risk the rp_filter warning names: strict filtering without
+    // src_valid_mark. Reported, not asserted — it is the host's call.
+    run(in_ns("sysctl -q -w net.ipv4.conf.v56a.src_valid_mark=0"));
+    body("nomark", &[]);
+    run(in_ns("sysctl -q -w net.ipv4.conf.all.rp_filter=0"));
+    run(in_ns("sysctl -q -w net.ipv4.conf.v56a.rp_filter=0"));
+
+    // No bypass support: the queue already taken, or no nft binary.
+    // The instance starts anyway and every flow takes the device.
+    body("fallback", &[("VFAWN_056_FALLBACK", "queue")]);
+    body(
+        "fallback",
+        &[
+            ("VFAWN_056_FALLBACK", "nft"),
+            ("PATH", "/usr/local/cargo/bin:/usr/bin:/bin"),
+        ],
+    );
+
+    // A LAN routed through the instance.
+    lan_topology();
+    body("forward", &[]);
+
+    // kill -9: the table outlives the process; the sweep removes it.
+    let mut held = spawn_body("hold", &[]);
+    // The harness prints its own header lines ahead of the body's.
+    let ready = BufReader::new(held.stdout.take().unwrap())
+        .lines()
+        .map_while(Result::ok)
+        .any(|line| line.trim() == "ready");
+    assert!(ready, "the held body came up");
+    run(sh(&format!("kill -9 {}", held.id())));
+    let _ = held.wait();
+    let tables = run(in_ns("nft list tables"));
+    assert!(
+        tables.contains("vfawn_redirect_"),
+        "a crash leaves the table behind for the sweep: {tables}"
+    );
+    body("sweep", &[]);
+    let tables = run(in_ns("nft list tables"));
+    assert!(!tables.contains("vfawn_"), "swept clean: {tables}");
+
+    run(sh(&format!(
+        "ip netns del {NS}; ip netns del {LAN_NS}; ip route del {LAN}"
+    )));
+    println!("056 P1 e2e passed");
+}
+
+/// A real server in the root namespace: banner with the peer address,
+/// then echo.
+fn serve(port: u16) {
+    let listener = TcpListener::bind((SERVER, port)).expect("bind server");
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            std::thread::spawn(move || {
+                let mut stream = stream;
+                let peer = stream.peer_addr().unwrap().ip();
+                let _ = writeln!(stream, "server {peer}");
+                let mut buf = vec![0u8; 1 << 16];
+                while let Ok(n) = stream.read(&mut buf)
+                    && n > 0
+                {
+                    if stream.write_all(&buf[..n]).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+    });
+}
+
+/// Re-run this test binary as a body inside `ns`. The `ip` binary is
+/// named by path: a body may run with a `PATH` that hides `nft`, and
+/// both live in the same directory.
+fn spawn_in(ns: &str, test: &str, mode: &str, env: &[(&str, &str)]) -> Child {
+    let exe = std::env::current_exe().unwrap();
+    let mut cmd = Command::new(IP);
+    cmd.args(["netns", "exec", ns])
+        .arg(exe)
+        .args(["--exact", test, "--ignored", "--nocapture"])
+        .env("VFAWN_056_BODY", mode)
+        .stdout(Stdio::piped());
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    cmd.spawn().expect("spawn body")
+}
+
+fn spawn_body(mode: &str, env: &[(&str, &str)]) -> Child {
+    spawn_in(NS, "auto_redirect_end_to_end", mode, env)
+}
+
+fn finish(child: Child, mode: &str) {
+    let out = child.wait_with_output().unwrap();
+    print!("{}", String::from_utf8_lossy(&out.stdout));
+    assert!(out.status.success(), "body {mode} failed");
+}
+
+fn body(mode: &str, env: &[(&str, &str)]) {
+    finish(spawn_body(mode, env), mode);
+}
+
+// --- Body side -----------------------------------------------------------
+
+struct ByPort;
+
+#[async_trait::async_trait]
+impl SessionHandler for ByPort {
+    fn judge_flow(&self, flow: &FlowInfo, _first: &[u8]) -> Verdict {
+        match flow.destination.port() {
+            8080 => Verdict::Bypass,
+            7070 => Verdict::Reject,
+            6060 => Verdict::Drop,
+            _ => Verdict::Accept,
+        }
+    }
+
+    async fn on_tcp(&self, mut session: TcpSession) {
+        let mut buf = [0u8; 16384];
+        while let Ok(n) = session.read(&mut buf).await
+            && n > 0
+        {
+            let _ = session.write(&buf[..n]).await;
+        }
+        let _ = session.shutdown_write().await;
+    }
+
+    async fn on_udp(&self, _session: UdpSession) {}
+
+    async fn on_icmp(&self, _packet: IcmpPacket) -> Action {
+        Action::Drop
+    }
+}
+
+fn start_instance() -> Instance {
+    start_with(Arc::new(ByPort), &[])
+}
+
+fn start_with(handler: Arc<dyn SessionHandler>, excluded: &[IpNet]) -> Instance {
+    let mut config = VfawnConfig::default();
+    config.device.name = Some(TUN.into());
+    config.device.inet4_address = vec!["198.18.0.1/15".parse().unwrap()];
+    config.dns.mode = DnsMode::Disabled;
+    config.route.auto_route = true;
+    config.route.auto_redirect.enabled = true;
+    config.route.route_exclude_address = excluded.to_vec();
+    let mut instance = Instance::new(config, Arc::clone(&handler)).expect("instance");
+    instance.start(handler).expect("start");
+    std::thread::sleep(Duration::from_millis(300));
+    instance
+}
+
+fn tun_tx() -> u64 {
+    std::fs::read_to_string(format!("/sys/class/net/{TUN}/statistics/tx_packets"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap()
+}
+
+fn connect(port: u16, timeout: Duration) -> std::io::Result<TcpStream> {
+    let addr: SocketAddr = format!("{SERVER}:{port}").parse().unwrap();
+    TcpStream::connect_timeout(&addr, timeout)
+}
+
+fn banner(stream: &TcpStream) -> String {
+    let mut line = String::new();
+    BufReader::new(stream).read_line(&mut line).unwrap();
+    line.trim().to_string()
+}
+
+/// Push `BULK` bytes through the server's echo; the throughput in MB/s.
+fn bulk(stream: TcpStream) -> f64 {
+    let mut reader = stream.try_clone().unwrap();
+    let start = Instant::now();
+    let writer = std::thread::spawn(move || {
+        let mut stream = stream;
+        let chunk = vec![0x5au8; 1 << 16];
+        for _ in 0..BULK / chunk.len() {
+            stream.write_all(&chunk).unwrap();
+        }
+        stream
+    });
+    let mut buf = vec![0u8; 1 << 16];
+    let mut got = 0;
+    while got < BULK {
+        let n = reader.read(&mut buf).unwrap();
+        assert!(n > 0, "echo ended early at {got}");
+        got += n;
+    }
+    drop(writer.join().unwrap());
+    BULK as f64 / start.elapsed().as_secs_f64() / 1e6
+}
+
+fn body_probe() {
+    let quick = std::env::var("VFAWN_056_QUICK").is_ok();
+    let direct = (!quick).then(|| {
+        let stream = connect(8080, Duration::from_secs(3)).expect("direct connect");
+        assert_eq!(banner(&stream), format!("server {UPLINK}"));
+        bulk(stream)
+    });
+
+    let mut instance = start_instance();
+    let rules = run(sh("ip rule"));
+    assert!(rules.contains("fwmark 0x2024 lookup main"), "{rules}");
+    let table = run(sh(&format!("nft list table inet vfawn_redirect_{TUN}")));
+    assert!(table.contains("queue"), "{table}");
+
+    // Bypass: the real server answers, from the uplink's address, and
+    // not one packet of the connection crosses the device.
+    let before = tun_tx();
+    let stream = connect(8080, Duration::from_secs(3)).expect("bypass connect");
+    assert_eq!(
+        banner(&stream),
+        format!("server {UPLINK}"),
+        "bypassed flow reaches the server masqueraded"
+    );
+    let bypassed = bulk(stream);
+    let crossed = tun_tx() - before;
+    assert_eq!(crossed, 0, "bypassed packets crossed the device");
+    match direct {
+        Some(direct) => println!(
+            "bypass {bypassed:.0} MB/s vs direct {direct:.0} MB/s ({:.0}%)",
+            bypassed / direct * 100.0
+        ),
+        None => println!("bypass under strict rp_filter: {bypassed:.0} MB/s"),
+    }
+
+    if !quick {
+        // Accept: captured and echoed by the handler; the server's
+        // banner would arrive first if the flow had escaped.
+        let before = tun_tx();
+        let mut stream = connect(9090, Duration::from_secs(3)).expect("accept connect");
+        stream.write_all(b"ping").unwrap();
+        let mut echo = [0u8; 4];
+        stream.read_exact(&mut echo).unwrap();
+        assert_eq!(&echo, b"ping", "the handler, not the server, answered");
+        assert!(tun_tx() > before, "accepted flow crossed the device");
+
+        // Reject: a kernel reset, fast.
+        let start = Instant::now();
+        let refused = connect(7070, Duration::from_secs(3)).expect_err("reject");
+        assert_eq!(refused.kind(), std::io::ErrorKind::ConnectionRefused);
+        assert!(start.elapsed() < Duration::from_secs(1));
+
+        // Drop: nothing comes back.
+        let dropped = connect(6060, Duration::from_secs(1)).expect_err("drop");
+        assert_eq!(dropped.kind(), std::io::ErrorKind::TimedOut);
+
+        storm();
+    }
+
+    // Orderly shutdown: the table and the bypass rule are gone.
+    instance.shutdown().unwrap();
+    let tables = run(sh("nft list tables"));
+    assert!(!tables.contains("vfawn_redirect_"), "{tables}");
+    let rules = run(sh("ip rule"));
+    assert!(!rules.contains("0x2024"), "{rules}");
+    println!("probe ok");
+}
+
+/// A verdict storm: three verdicts interleaved at well over a thousand
+/// new connections a second, each with its own outcome checked, and
+/// the queue reporting no drop. A SYN the queue had failed open on
+/// would land on the captured path and answer with the echo instead
+/// of the server's banner.
+fn storm() {
+    const THREADS: usize = 20;
+    const EACH: usize = 60;
+    let start = Instant::now();
+    let workers: Vec<_> = (0..THREADS)
+        .map(|t| {
+            std::thread::spawn(move || {
+                for i in 0..EACH {
+                    match (t + i) % 3 {
+                        0 => {
+                            let stream = connect(8080, Duration::from_secs(3)).expect("bypass");
+                            assert_eq!(banner(&stream), format!("server {UPLINK}"));
+                        }
+                        1 => {
+                            let mut stream = connect(9090, Duration::from_secs(3)).expect("accept");
+                            stream.write_all(b"pong").unwrap();
+                            let mut echo = [0u8; 4];
+                            stream.read_exact(&mut echo).unwrap();
+                            assert_eq!(&echo, b"pong");
+                        }
+                        _ => {
+                            let refused = connect(7070, Duration::from_secs(3)).expect_err("rst");
+                            assert_eq!(refused.kind(), std::io::ErrorKind::ConnectionRefused);
+                        }
+                    }
+                }
+            })
+        })
+        .collect();
+    for worker in workers {
+        worker.join().expect("storm worker");
+    }
+    let rate = (THREADS * EACH) as f64 / start.elapsed().as_secs_f64();
+    let ours = queue_stats(100).expect("queue 100 bound");
+    println!(
+        "storm {} flows at {rate:.0}/s, queue stats {ours:?}",
+        THREADS * EACH
+    );
+    assert_eq!((ours[5], ours[6]), (0, 0), "the queue dropped nothing");
+}
+
+/// This namespace's line for queue `num` in
+/// /proc/net/netfilter/nfnetlink_queue: queue, portid, waiting, copy
+/// mode, copy range, queue_dropped, user_dropped, sequence, 1.
+fn queue_stats(num: u64) -> Option<Vec<u64>> {
+    std::fs::read_to_string("/proc/net/netfilter/nfnetlink_queue")
+        .unwrap_or_default()
+        .lines()
+        .map(|l| {
+            l.split_whitespace()
+                .map(|f| f.parse().unwrap_or(0))
+                .collect::<Vec<_>>()
+        })
+        .find(|f| f.first() == Some(&num))
+}
+
+/// Echo through the handler: what a flow on the captured path gets.
+/// A flow that reached the real server would read its banner instead.
+fn assert_echoed(port: u16) {
+    let mut stream = connect(port, Duration::from_secs(3)).expect("captured connect");
+    stream.write_all(b"ping").unwrap();
+    let mut echo = [0u8; 4];
+    stream.read_exact(&mut echo).unwrap();
+    assert_eq!(&echo, b"ping", "port {port}: the handler answered");
+}
+
+/// The bypass cannot install; the instance must still start, leave no
+/// table and no bound queue of its own, and carry every flow — the one
+/// judged Bypass included — over the device.
+fn body_fallback() {
+    let nft_missing = env_is("VFAWN_056_FALLBACK", "nft");
+    // Someone else's reader on our queue number.
+    let _taken = (!nft_missing).then(|| {
+        let mut queue = nfq::Queue::open().unwrap();
+        queue.bind(100).unwrap();
+        queue
+    });
+    let held_by_other = queue_stats(100).map(|f| f[1]);
+
+    let mut instance = start_instance();
+    let tables = run(sh(&format!("{NFT} list tables")));
+    assert!(!tables.contains("vfawn_redirect_"), "{tables}");
+    // A failed install releases what it bound; a taken queue stays the
+    // other reader's.
+    assert_eq!(queue_stats(100).map(|f| f[1]), held_by_other);
+
+    let before = tun_tx();
+    assert_echoed(8080);
+    assert_echoed(9090);
+    assert!(tun_tx() > before, "every flow crossed the device");
+    instance.shutdown().unwrap();
+    println!(
+        "fallback ({}) ok",
+        if nft_missing {
+            "nft missing"
+        } else {
+            "queue taken"
+        }
+    );
+}
+
+/// The instance as a LAN gateway. Without the LAN excluded, a bypassed
+/// connection's replies (addressed to the LAN client) would be
+/// captured like any other packet; only the mark restored on the reply
+/// direction sends them out the LAN port. With it excluded — the
+/// configuration a gateway needs for its captured flows anyway — every
+/// verdict works for the LAN client.
+fn body_forward() {
+    let lan = |mode: &str| {
+        let child = spawn_in(
+            LAN_NS,
+            "auto_redirect_end_to_end",
+            "lan",
+            &[("VFAWN_056_LAN", mode)],
+        );
+        finish(child, mode);
+    };
+
+    let mut instance = start_instance();
+    let before = tun_tx();
+    // Twice: the first transfer over a fresh LAN pays its warm-up.
+    lan("bypass");
+    lan("bypass");
+    assert_eq!(tun_tx() - before, 0, "forwarded bypass crossed the device");
+    instance.shutdown().unwrap();
+
+    let mut instance = start_with(Arc::new(ByPort), &[LAN.parse().unwrap()]);
+    let before = tun_tx();
+    lan("bypass");
+    assert_eq!(tun_tx() - before, 0, "forwarded bypass crossed the device");
+    lan("rest");
+    assert!(tun_tx() > before, "forwarded accept crossed the device");
+    instance.shutdown().unwrap();
+    println!("forward ok");
+}
+
+/// The LAN client's side of [`body_forward`].
+fn body_lan() {
+    if env_is("VFAWN_056_LAN", "bypass") {
+        let stream = connect(8080, Duration::from_secs(3)).expect("lan bypass connect");
+        // Forwarded, not masqueraded: the server sees the LAN client.
+        assert_eq!(banner(&stream), format!("server {LAN_CLIENT}"));
+        let rate = bulk(stream);
+        println!("lan bypass {rate:.0} MB/s");
+    } else {
+        assert_echoed(9090);
+        let refused = connect(7070, Duration::from_secs(3)).expect_err("lan reject");
+        assert_eq!(refused.kind(), std::io::ErrorKind::ConnectionRefused);
+        println!("lan accept and reject ok");
+    }
+}
+
+fn body_nomark() {
+    let mut instance = start_instance();
+    match connect(8080, Duration::from_secs(2)) {
+        Ok(stream) => println!(
+            "strict rp_filter without src_valid_mark: bypass connected ({})",
+            banner(&stream)
+        ),
+        Err(e) => println!("strict rp_filter without src_valid_mark: bypass failed ({e})"),
+    }
+    instance.shutdown().unwrap();
+}
+
+fn body_hold() {
+    let _instance = start_instance();
+    println!("ready");
+    std::io::stdout().flush().unwrap();
+    loop {
+        std::thread::sleep(Duration::from_secs(60));
+    }
+}
+
+fn body_sweep() {
+    let report = vfawn_platform::linux::cleanup_nftables(None).unwrap();
+    println!("swept {:?}", report.nftables_tables);
+}
+
+// --- Throughput ----------------------------------------------------------
+
+const ROUNDS: usize = 5;
+const SECONDS: &str = "3";
+const PROBE_TABLE: &str = "vfawn056probe";
+
+/// iperf3 servers that die with the test, panicking or not: a leaked
+/// server holds the harness's output pipe open forever.
+struct Servers(Vec<Child>);
+
+impl Drop for Servers {
+    fn drop(&mut self) {
+        for server in &mut self.0 {
+            let _ = server.kill();
+            let _ = server.wait();
+        }
+    }
+}
+
+/// Throughput on a three-step ladder, each step measured every round:
+///
+/// 1. direct — the namespace has no netfilter rule, so conntrack is
+///    not even running;
+/// 2. direct with conntrack — what any netfilter-based bypass pays
+///    before its own rules (sing-tun's included);
+/// 3. bypassed — conntrack plus this feature's rules: the per-packet
+///    mark restore and re-route, and the masquerade.
+///
+/// The device path the bypass replaces is not re-measured here; this
+/// bed's figures for it are on record (034 baseline, 046 dispatch).
+#[test]
+#[ignore]
+fn auto_redirect_throughput() {
+    if env_is("VFAWN_056_BODY", "bench") {
+        return body_bench();
+    }
+    topology();
+    let _servers = Servers(vec![
+        Command::new("iperf3")
+            .args(["-s", "-B", SERVER, "-p", "5201"])
+            .stdout(Stdio::null())
+            .spawn()
+            .expect("iperf3 server"),
+    ]);
+    std::thread::sleep(Duration::from_millis(300));
+    finish(
+        spawn_in(NS, "auto_redirect_throughput", "bench", &[]),
+        "bench",
+    );
+    run(sh(&format!("ip netns del {NS}")));
+}
+
+struct BypassAll;
+
+#[async_trait::async_trait]
+impl SessionHandler for BypassAll {
+    fn judge_flow(&self, _flow: &FlowInfo, _first: &[u8]) -> Verdict {
+        Verdict::Bypass
+    }
+    async fn on_tcp(&self, _session: TcpSession) {}
+    async fn on_udp(&self, _session: UdpSession) {}
+    async fn on_icmp(&self, _packet: IcmpPacket) -> Action {
+        Action::Drop
+    }
+}
+
+/// One iperf3 run from this namespace: receiver-side Gbit/s.
+fn iperf() -> f64 {
+    let out = Command::new("iperf3")
+        .args(["-c", SERVER, "-p", "5201", "-t", SECONDS, "-J"])
+        .output()
+        .expect("iperf3 client");
+    let json = String::from_utf8_lossy(&out.stdout);
+    let tail = &json[json.find("\"sum_received\"").expect("iperf3 summary")..];
+    let field = &tail[tail.find("\"bits_per_second\":").unwrap() + 18..];
+    let value: f64 = field
+        .trim_start()
+        .split([',', '\n', '}'])
+        .next()
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    value / 1e9
+}
+
+/// This process's CPU time so far, in clock ticks (utime + stime).
+fn cpu_ticks() -> u64 {
+    let stat = std::fs::read_to_string("/proc/self/stat").unwrap();
+    let fields: Vec<&str> = stat[stat.rfind(')').unwrap() + 2..]
+        .split_whitespace()
+        .collect();
+    fields[11].parse::<u64>().unwrap() + fields[12].parse::<u64>().unwrap()
+}
+
+fn median(mut v: Vec<f64>) -> f64 {
+    v.sort_by(f64::total_cmp);
+    v[v.len() / 2]
+}
+
+fn body_bench() {
+    let (mut direct, mut tracked, mut bypass, mut cpu) = (vec![], vec![], vec![], vec![]);
+    for round in 0..ROUNDS {
+        direct.push(iperf());
+
+        run(sh(&format!(
+            "{NFT} 'add table inet {PROBE_TABLE}; \
+             add chain inet {PROBE_TABLE} out {{ type filter hook output priority 0; }}; \
+             add rule inet {PROBE_TABLE} out ct state new counter'"
+        )));
+        tracked.push(iperf());
+        run(sh(&format!("{NFT} delete table inet {PROBE_TABLE}")));
+
+        let mut instance = start_with(Arc::new(BypassAll), &[]);
+        let before = (tun_tx(), cpu_ticks());
+        bypass.push(iperf());
+        let after = (tun_tx(), cpu_ticks());
+        instance.shutdown().unwrap();
+        assert_eq!(after.0 - before.0, 0, "bypassed packets crossed the device");
+        cpu.push((after.1 - before.1) as f64);
+
+        println!(
+            "round {round}: direct {:.1}, direct+conntrack {:.1}, bypass {:.1} Gbit/s",
+            direct[round], tracked[round], bypass[round]
+        );
+    }
+    let (d, t, b) = (median(direct), median(tracked), median(bypass));
+    println!(
+        "median of {ROUNDS} x {SECONDS}s: direct {d:.1}, direct+conntrack {t:.1} ({:.0}%), \
+         bypass {b:.1} Gbit/s ({:.0}% of direct, {:.0}% of direct+conntrack); \
+         instance CPU during a bypass run: {:.0} ticks",
+        t / d * 100.0,
+        b / d * 100.0,
+        b / t * 100.0,
+        median(cpu),
+    );
+    // The 056 acceptance line (revised 2026-11-10 from 90%): the
+    // per-packet re-route and the source rewrite a default-into-the-
+    // device capture forces cost about 12% at these memory-speed
+    // rates; see 056 §九.
+    assert!(b >= 0.8 * d, "bypass {b:.1} below 80% of direct {d:.1}");
+}

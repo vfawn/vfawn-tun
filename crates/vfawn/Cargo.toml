@@ -33,3 +33,6 @@ vfawn-stack-user = { path = "../vfawn-stack-user", features = ["backend-native"]
 
 [target.'cfg(target_os = "macos")'.dev-dependencies]
 libc = "0.2"
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+nfq = "0.2.6"

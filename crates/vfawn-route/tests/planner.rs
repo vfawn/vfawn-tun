@@ -15,6 +15,7 @@ fn test_desired() -> DesiredState {
         table_index: 2022,
         rule_index: 9000,
         mark: 0,
+        bypass_mark: 0,
         strict_route: true,
         dns_leak_prevention: true,
         include_uid: &[],
@@ -280,6 +281,7 @@ fn the_escape_rule_precedes_every_capture_rule() {
         table_index: 2022,
         rule_index: 9000,
         mark: 0x2022,
+        bypass_mark: 0,
         strict_route: false,
         dns_leak_prevention: false,
         include_uid: &[],
@@ -301,12 +303,68 @@ fn the_escape_rule_precedes_every_capture_rule() {
         table_index: 2022,
         rule_index: 9000,
         mark: 0,
+        bypass_mark: 0,
         strict_route: false,
         dns_leak_prevention: false,
         include_uid: &[],
         exclude_uid: &[],
     });
     assert!(unmarked.rules.iter().all(|r| r.selector.fwmark.is_none()));
+}
+
+#[test]
+fn the_bypass_rule_follows_the_escape_and_precedes_the_capture() {
+    let d = desired_from_config(&RouteParams {
+        interface: "tun0",
+        addresses: &["198.18.0.1/15".parse().unwrap()],
+        captured: &["0.0.0.0/0".parse().unwrap()],
+        excluded: &["192.168.0.0/16".parse().unwrap()],
+        table_index: 2022,
+        rule_index: 9000,
+        mark: 0x2022,
+        bypass_mark: 0x2024,
+        strict_route: true,
+        dns_leak_prevention: false,
+        include_uid: &[],
+        exclude_uid: &[1000..=1999],
+    });
+    let marks: Vec<_> = d.rules.iter().map(|r| r.selector.fwmark).collect();
+    assert_eq!(marks[..2], [Some(0x2022), Some(0x2024)]);
+    let bypass = &d.rules[1];
+    assert_eq!(bypass.priority, 9001);
+    assert_eq!(bypass.action, RuleAction::Lookup(254));
+    // Strict route's family block and the capture both come later: a
+    // bypassed flow must never be routed into the device.
+    let capture = d
+        .rules
+        .iter()
+        .find(|r| r.action == RuleAction::Lookup(2022))
+        .expect("a capture rule");
+    assert!(capture.priority > bypass.priority);
+    assert!(
+        d.rules
+            .iter()
+            .filter(|r| r.action == RuleAction::Unreachable)
+            .all(|r| r.priority > bypass.priority)
+    );
+
+    // Bypass on, escape off: the bypass rule alone leads.
+    let alone = desired_from_config(&RouteParams {
+        interface: "tun0",
+        addresses: &[],
+        captured: &[],
+        excluded: &[],
+        table_index: 2022,
+        rule_index: 9000,
+        mark: 0,
+        bypass_mark: 0x2024,
+        strict_route: false,
+        dns_leak_prevention: false,
+        include_uid: &[],
+        exclude_uid: &[],
+    });
+    assert_eq!(alone.rules[0].selector.fwmark, Some(0x2024));
+    assert_eq!(alone.rules[0].priority, 9000);
 }
 
 #[test]
@@ -319,6 +377,7 @@ fn strict_route_adds_unreachable_rule() {
         table_index: 2022,
         rule_index: 9000,
         mark: 0,
+        bypass_mark: 0,
         strict_route: true,
         dns_leak_prevention: false,
         include_uid: &[],
@@ -339,6 +398,7 @@ fn strict_route_adds_unreachable_rule() {
         table_index: 2022,
         rule_index: 9000,
         mark: 0,
+        bypass_mark: 0,
         strict_route: false,
         dns_leak_prevention: false,
         include_uid: &[],
@@ -362,6 +422,7 @@ fn dns_leak_prevention_adds_rule() {
         table_index: 2022,
         rule_index: 9000,
         mark: 0,
+        bypass_mark: 0,
         strict_route: false,
         dns_leak_prevention: true,
         include_uid: &[],
@@ -375,6 +436,7 @@ fn dns_leak_prevention_adds_rule() {
         table_index: 2022,
         rule_index: 9000,
         mark: 0,
+        bypass_mark: 0,
         strict_route: false,
         dns_leak_prevention: false,
         include_uid: &[],
@@ -544,6 +606,7 @@ fn uid_desired(
         table_index: 2022,
         rule_index: 9000,
         mark: 0,
+        bypass_mark: 0,
         strict_route: false,
         dns_leak_prevention: false,
         include_uid: inc,

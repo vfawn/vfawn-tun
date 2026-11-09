@@ -58,6 +58,10 @@ pub struct Instance {
     handle: Option<StackHandle>,
     panics: Arc<AtomicU64>,
     reconciler: Option<Reconciler>,
+    /// The per-flow kernel bypass. Declared ahead of the orchestration
+    /// so a drop removes its rules before the routes they lean on.
+    #[cfg(target_os = "linux")]
+    auto_redirect: Option<vfawn_platform::linux::AutoRedirect>,
     orchestration: Option<crate::route_orchestration::RouteOrchestration>,
     /// The firewall posture taken at start, for the symmetric removal
     /// at shutdown. None when nothing was taken.
@@ -84,6 +88,8 @@ impl Instance {
             handle: None,
             panics: Arc::new(AtomicU64::new(0)),
             reconciler: None,
+            #[cfg(target_os = "linux")]
+            auto_redirect: None,
             orchestration: None,
             firewall_rule: None,
             tracker: Arc::new(crate::stats::InstanceTracker::new()),
@@ -252,6 +258,15 @@ impl Instance {
                 &interface,
                 &addresses,
             )?);
+            #[cfg(target_os = "linux")]
+            {
+                self.auto_redirect = crate::route_orchestration::install_auto_redirect(
+                    &self.config,
+                    &interface,
+                    &addresses,
+                    Arc::clone(&handler),
+                );
+            }
             // The Windows firewall posture rides the same gate: a
             // capture that swallows the host's network is also the
             // moment a default-deny firewall starts swallowing this
@@ -294,7 +309,10 @@ impl Instance {
             vfawn_platform::firewall_gate_remove()?;
         }
         // Routing rules outlive a process crash by design; they
-        // must not outlive an orderly shutdown.
+        // must not outlive an orderly shutdown. The bypass rules go
+        // first: they mark traffic toward routes about to disappear.
+        #[cfg(target_os = "linux")]
+        drop(self.auto_redirect.take());
         #[cfg(target_os = "linux")]
         if let Some(mut orchestration) = self.orchestration.take() {
             orchestration
@@ -323,6 +341,7 @@ impl Instance {
             table_index: config.route.table_index,
             rule_index: config.route.rule_index,
             mark: config.route.mark,
+            bypass_mark: crate::route_orchestration::bypass_mark_of(config),
             strict_route: config.route.strict_route,
             dns_leak_prevention: config.dns.mode == vfawn_core::DnsMode::Hijack,
             include_uid: &config.route.include_uid,
@@ -410,6 +429,42 @@ mod tests {
     }
 
     #[test]
+    fn auto_redirect_changes_need_a_restart() {
+        let mut base = VfawnConfig::default();
+        base.route.auto_route = true;
+        let mut on = base.clone();
+        on.route.auto_redirect.enabled = true;
+
+        // Toggling either way, or retuning while on.
+        assert!(needs_restart_desired(&base, &on).is_some());
+        assert!(needs_restart_desired(&on, &base).is_some());
+        let mut retuned = on.clone();
+        retuned.route.auto_redirect.queue = 101;
+        assert!(needs_restart_desired(&on, &retuned).is_some());
+
+        // The escape mark matters only while the bypass is on.
+        let mut remarked = on.clone();
+        remarked.route.mark = 0x2030;
+        assert!(needs_restart_desired(&on, &remarked).is_some());
+        let mut remarked_off = base.clone();
+        remarked_off.route.mark = 0x2030;
+        assert!(needs_restart_desired(&base, &remarked_off).is_none());
+
+        // Exclusions stay hot.
+        let mut excluded = on.clone();
+        excluded.route.route_exclude_address = vec!["10.0.0.0/8".parse().unwrap()];
+        assert!(needs_restart_desired(&on, &excluded).is_none());
+
+        // And the public path refuses before touching any kernel state.
+        let handler = Arc::new(crate::echo::EchoHandler::new());
+        let mut instance = Instance::new(on, handler).unwrap();
+        assert!(matches!(
+            instance.apply_config(&base),
+            Err(ApplyError::NeedsRestart(_))
+        ));
+    }
+
+    #[test]
     fn stats_default_is_zeroed() {
         let config = VfawnConfig::default();
         let handler = Arc::new(crate::echo::EchoHandler::new());
@@ -468,6 +523,22 @@ fn needs_restart_desired(old: &VfawnConfig, new: &VfawnConfig) -> Option<String>
     }
     if old.device.name != new.device.name {
         return Some("interface name changed".to_string());
+    }
+    // The bypass's netfilter table and queue reader are installed once,
+    // from the config the instance started with; the route engine alone
+    // would follow a hot change, leaving the bypass rule and the marks
+    // netfilter writes out of step. Exclusion changes stay hot: a newly
+    // excluded prefix judged once more still routes to the main table.
+    let (was, now) = (&old.route.auto_redirect, &new.route.auto_redirect);
+    if was != now {
+        return Some(format!("auto_redirect {was:?} -> {now:?}"));
+    }
+    // The table spares this process's own sockets by their mark.
+    if was.enabled && old.route.mark != new.route.mark {
+        return Some(format!(
+            "mark {:#x} -> {:#x} under auto_redirect",
+            old.route.mark, new.route.mark
+        ));
     }
     None
 }

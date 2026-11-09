@@ -205,6 +205,9 @@ pub struct RouteParams<'a> {
     /// The routing mark on this process's own sockets; zero disables
     /// the escape rule.
     pub mark: u32,
+    /// The mark netfilter puts on a connection `judge_flow` bypassed;
+    /// zero disables the bypass rule.
+    pub bypass_mark: u32,
     pub strict_route: bool,
     pub dns_leak_prevention: bool,
     /// UID ranges to capture (Linux FRA_UID_RANGE): the per-app
@@ -233,6 +236,7 @@ pub fn desired_from_config(params: &RouteParams<'_>) -> DesiredState {
         table_index,
         rule_index,
         mark,
+        bypass_mark,
         strict_route,
         dns_leak_prevention,
         ..
@@ -283,22 +287,28 @@ pub fn desired_from_config(params: &RouteParams<'_>) -> DesiredState {
     // and die. Marked traffic answers to the main table before any
     // capture rule sees it, and the mark survives default-interface
     // changes a socket binding cannot.
-    if mark != 0 {
-        rules.push(PolicyRule {
-            priority,
-            selector: RuleSelector {
-                destination: None,
-                source: None,
-                incoming_interface: None,
-                fwmark: Some(mark),
-                suppress_prefixlen: None,
-                dport: None,
-                uid_range: None,
-            },
-            action: RuleAction::Lookup(254),
-            tag: tag.clone(),
-        });
-        priority += 1;
+    //
+    // Step 0.5: the per-flow bypass. A connection netfilter marked
+    // after `judge_flow` said Bypass answers to the main table the
+    // same way, so it never reaches the device.
+    for mark in [mark, bypass_mark] {
+        if mark != 0 {
+            rules.push(PolicyRule {
+                priority,
+                selector: RuleSelector {
+                    destination: None,
+                    source: None,
+                    incoming_interface: None,
+                    fwmark: Some(mark),
+                    suppress_prefixlen: None,
+                    dport: None,
+                    uid_range: None,
+                },
+                action: RuleAction::Lookup(254),
+                tag: tag.clone(),
+            });
+            priority += 1;
+        }
     }
 
     // Step 1: exclusion rules (bypass the dedicated table).

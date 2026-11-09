@@ -924,6 +924,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "nfq"
+version = "0.2.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b36d0d229b49eb06057d61a09d7bcba023e31920530ddd00031d6ce6d256ccfe"
+dependencies = [
+ "bytes",
+ "libc",
+ "rustix",
+ "zerocopy",
+]
+
+[[package]]
 name = "nix"
 version = "0.27.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1550,6 +1562,7 @@ dependencies = [
  "bytes",
  "ipnet",
  "libc",
+ "nfq",
  "socket2 0.5.10",
  "tokio",
  "vfawn-core",
@@ -1626,15 +1639,19 @@ version = "0.1.0"
 name = "vfawn-platform"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "futures",
  "ipnet",
  "libc",
  "netlink-packet-route 0.19.0",
+ "nfq",
  "rtnetlink",
  "serde",
+ "socket2 0.5.10",
  "tokio",
  "vfawn-core",
  "vfawn-route",
+ "vfawn-wire",
  "windows",
  "windows-sys 0.61.2",
 ]
