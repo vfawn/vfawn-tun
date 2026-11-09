@@ -7,6 +7,7 @@
 pub mod anti_loop;
 pub mod auto_redirect;
 pub mod default_if;
+pub mod docker_firewall;
 pub mod monitor;
 pub mod netlink;
 pub mod nftables;

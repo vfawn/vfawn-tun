@@ -1647,6 +1647,7 @@ dependencies = [
  "nfq",
  "rtnetlink",
  "serde",
+ "serde_json",
  "socket2 0.5.10",
  "tokio",
  "vfawn-core",

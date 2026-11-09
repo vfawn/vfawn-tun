@@ -340,6 +340,8 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 pub struct AutoRedirect {
     table: String,
     queue: u16,
+    /// sing-tun starts its Docker firewall monitor with the table.
+    docker: Option<crate::linux::docker_firewall::DockerFirewall>,
     stop: Arc<AtomicBool>,
     reader: Option<JoinHandle<nfq::Queue>>,
     workers: Vec<JoinHandle<()>>,
@@ -370,6 +372,7 @@ impl AutoRedirect {
         let mut installed = Self {
             table: table_name(p.interface),
             queue: p.queue,
+            docker: None,
             stop: Arc::clone(&stop),
             reader: None,
             workers: Vec::new(),
@@ -399,6 +402,18 @@ impl AutoRedirect {
             installed.remove();
             return Err(e);
         }
+        let (ipv4, ipv6) = (
+            p.tun_addresses.iter().any(|a| matches!(a, IpNet::V4(_))),
+            p.tun_addresses.iter().any(|a| matches!(a, IpNet::V6(_))),
+        );
+        installed.docker = Some(crate::linux::docker_firewall::DockerFirewall::start(
+            crate::linux::docker_firewall::DockerCompat::new(
+                p.interface,
+                &installed.table,
+                ipv4,
+                ipv6,
+            ),
+        ));
         Ok(installed)
     }
 
@@ -409,6 +424,8 @@ impl AutoRedirect {
             "table inet {t} {{}}\ndelete table inet {t}\n",
             t = self.table
         ));
+        // sing-tun's cleanupNFTables: the Docker rules go with the table.
+        drop(self.docker.take());
         self.stop.store(true, Ordering::Release);
         // The reader drops the job channel on its way out, which is
         // what lets the judges finish.

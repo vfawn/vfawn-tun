@@ -710,8 +710,108 @@ fn body_forward() {
     assert_eq!(tun_tx() - before, 0, "forwarded bypass crossed the device");
     lan("rest");
     assert!(tun_tx() > before, "forwarded accept crossed the device");
+
+    // Docker comes up after us: its forward path drops by policy, and
+    // the monitor puts our two exceptions at the head of DOCKER-USER.
+    docker_up();
+    wait_for_docker_rules(2);
+    lan("rest");
+    // Both directions went through our exceptions, not around them:
+    // DOCKER-USER's own rule returns into a dropping policy.
+    let chain = run(sh(&format!("{NFT} list chain ip filter DOCKER-USER")));
+    let counted = chain
+        .lines()
+        .filter(|l| l.contains("Docker compatibility") && !l.contains("packets 0 "))
+        .count();
+    assert_eq!(counted, 2, "both exceptions carried the flow: {chain}");
+    // Docker restarts and rebuilds its tables.
+    run(sh(&format!("{NFT} delete table ip filter")));
+    docker_up();
+    wait_for_docker_rules(2);
+    lan("rest");
+    // One of ours deleted from outside comes back; a stray copy goes.
+    let handle = docker_rule_handles()[0];
+    run(sh(&format!(
+        "{NFT} delete rule ip filter DOCKER-USER handle {handle}"
+    )));
+    wait_for_docker_rules(2);
+    nft_f(&format!(
+        "insert rule ip filter DOCKER-USER oifname \"{TUN}\" counter accept \
+         comment \"!vfawn_redirect_{TUN}: Docker compatibility output to tun\"\n"
+    ));
+    wait_for_docker_rules(2);
+    // Shutdown takes ours and leaves Docker's.
     instance.shutdown().unwrap();
-    println!("forward ok");
+    assert_eq!(
+        docker_rule_handles().len(),
+        0,
+        "our docker rules outlived us"
+    );
+    let chain = run(sh(&format!("{NFT} list chain ip filter DOCKER-USER")));
+    assert!(
+        chain.contains("return"),
+        "docker's own rule survived: {chain}"
+    );
+
+    // Docker already there when we start: the rules go in with us.
+    let mut instance = start_with(Arc::new(ByPort), &[LAN.parse().unwrap()]);
+    assert_eq!(docker_rule_handles().len(), 2, "rules installed at start");
+    lan("rest");
+    instance.shutdown().unwrap();
+    assert_eq!(docker_rule_handles().len(), 0);
+    run(sh(&format!("{NFT} delete table ip filter")));
+    println!("forward ok (docker compatibility included)");
+}
+
+/// Docker's iptables-nft shape, as far as forwarding is concerned: a
+/// forward chain dropping by policy after jumping to DOCKER-USER, whose
+/// own rule returns.
+fn docker_up() {
+    let script = "table ip filter {\n\
+         \tchain DOCKER-USER {\n\t\tcounter return\n\t}\n\
+         \tchain FORWARD {\n\t\ttype filter hook forward priority 0; policy drop;\n\
+         \t\tjump DOCKER-USER\n\t}\n}\n";
+    nft_f(script);
+}
+
+fn nft_f(script: &str) {
+    let mut child = Command::new(NFT)
+        .args(["-f", "-"])
+        .stdin(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(script.as_bytes())
+        .unwrap();
+    assert!(child.wait().unwrap().success(), "nft -f: {script}");
+}
+
+/// Handles of our compatibility rules in DOCKER-USER.
+fn docker_rule_handles() -> Vec<u32> {
+    let out = Command::new(NFT)
+        .args(["-a", "list", "chain", "ip", "filter", "DOCKER-USER"])
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter(|l| l.contains("Docker compatibility"))
+        .filter_map(|l| l.rsplit("handle ").next()?.trim().parse().ok())
+        .collect()
+}
+
+fn wait_for_docker_rules(count: usize) {
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while docker_rule_handles().len() != count {
+        assert!(
+            Instant::now() < deadline,
+            "docker rules: {:?}, wanted {count}",
+            docker_rule_handles()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
 
 /// The LAN client's side of [`body_forward`].
