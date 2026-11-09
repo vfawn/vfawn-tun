@@ -182,8 +182,10 @@ pub(crate) fn install_auto_redirect(
     let params = RedirectParams {
         interface,
         tun_addresses: addresses,
+        captured: &config.route.route_address,
         excluded: &excluded,
         escape_mark: config.route.mark,
+        dns_hijack: config.dns.mode == vfawn_core::DnsMode::Hijack,
         input_mark: redirect.input_mark,
         output_mark: redirect.output_mark,
         reset_mark: redirect.reset_mark,

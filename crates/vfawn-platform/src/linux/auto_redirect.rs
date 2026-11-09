@@ -73,10 +73,16 @@ pub struct RedirectParams<'a> {
     /// The device's own addresses: the source a bypassed local flow
     /// carries until masquerade rewrites it.
     pub tun_addresses: &'a [IpNet],
+    /// The capture range (`route_address`); empty means everything. A
+    /// destination outside it is never queued.
+    pub captured: &'a [IpNet],
     /// Destinations the capture already spares; never queued.
     pub excluded: &'a [IpNet],
     /// This process's own socket mark; zero when unused.
     pub escape_mark: u32,
+    /// DNS is hijacked in the stack: local port-53 flows are never
+    /// judged, so no verdict can carry one past the hijack.
+    pub dns_hijack: bool,
     pub input_mark: u32,
     pub output_mark: u32,
     pub reset_mark: u32,
@@ -245,19 +251,62 @@ pub fn ruleset(p: &RedirectParams<'_>) -> String {
         format!("{:#x}", p.reset_mark),
     );
     let queue = format!("counter queue num {} bypass", p.queue);
+    let (ipv4, ipv6) = families(p.tun_addresses);
     // First in both chains (our addition, see the module comment): the
     // bypass mark back onto the packet, in either direction.
     let restore = format!("\t\tct mark {out} meta mark set ct mark return\n");
-    let judged = format!(
+    // `nftablesAddPreMatchRules` up to the exclusions: reply direction
+    // out, the marks mirrored, a family the capture lacks out, only the
+    // judged protocols on, only pure SYNs for TCP, a reset honored.
+    let mut judged = format!(
         "\t\tct direction reply return\n\
          \t\tmeta mark {out} ct mark set meta mark return\n\
          \t\tmeta mark {input} ct mark set meta mark return\n\
-         \t\tct mark {input} meta mark set ct mark return\n\
-         \t\tmeta l4proto != {{ tcp, udp, icmp, ipv6-icmp }} return\n\
-         \t\ttcp flags & (syn | ack) != syn return\n\
-         \t\tmeta mark {reset} counter reject with tcp reset\n\
-         \t\tfib daddr type local return\n"
+         \t\tct mark {input} meta mark set ct mark return\n"
     );
+    if ipv4 != ipv6 {
+        let disabled = if ipv4 { "ipv6" } else { "ipv4" };
+        judged.push_str(&format!("\t\tmeta nfproto {disabled} return\n"));
+    }
+    judged.push_str(&format!(
+        "\t\tmeta l4proto != {{ tcp, udp, icmp, ipv6-icmp }} return\n\
+         \t\ttcp flags & (syn | ack) != syn return\n\
+         \t\tmeta mark {reset} counter reject with tcp reset\n"
+    ));
+    // `nftablesCreateExcludeRules`: destinations outside the capture
+    // range, the excluded ones, DNS in hijack mode, local destinations. Its DNS rule differs by hook: on
+    // output every non-loopback query, on prerouting the queries from a
+    // local source (sing-tun reads that from its local address set; the
+    // fib answers the same question here, as for destinations).
+    let excludes = |dns_scope: &str| {
+        let mut e = String::new();
+        let (in4, in6) = split_families(p.captured);
+        if !in4.is_empty() {
+            e.push_str(&format!("\t\tip daddr != {{ {} }} return\n", join(&in4)));
+        }
+        if !in6.is_empty() {
+            e.push_str(&format!("\t\tip6 daddr != {{ {} }} return\n", join(&in6)));
+        }
+        let (v4, v6) = split_families(p.excluded);
+        if !v4.is_empty() {
+            e.push_str(&format!("\t\tip daddr {{ {} }} return\n", join(&v4)));
+        }
+        if !v6.is_empty() {
+            e.push_str(&format!("\t\tip6 daddr {{ {} }} return\n", join(&v6)));
+        }
+        if p.dns_hijack {
+            for (enabled, family) in [(ipv4, "ipv4"), (ipv6, "ipv6")] {
+                if enabled {
+                    e.push_str(&format!(
+                        "\t\tmeta nfproto {family} {dns_scope} meta l4proto {{ tcp, udp }} \
+                         th dport 53 counter return\n"
+                    ));
+                }
+            }
+        }
+        e.push_str("\t\tfib daddr type local return\n");
+        e
+    };
     let queued = format!(
         "\t\tmeta l4proto {{ tcp, udp }} {queue}\n\
          \t\ticmp type echo-request icmp code 0 {queue}\n\
@@ -276,13 +325,7 @@ pub fn ruleset(p: &RedirectParams<'_>) -> String {
     s.push_str(&restore);
     s.push_str(&format!("\t\tiifname {tun} return\n"));
     s.push_str(&judged);
-    let (v4, v6) = split_families(p.excluded);
-    if !v4.is_empty() {
-        s.push_str(&format!("\t\tip daddr {{ {} }} return\n", join(&v4)));
-    }
-    if !v6.is_empty() {
-        s.push_str(&format!("\t\tip6 daddr {{ {} }} return\n", join(&v6)));
-    }
+    s.push_str(&excludes("fib saddr type local"));
     s.push_str(&queued);
 
     // Local traffic. A route chain: a mark changed here re-routes.
@@ -293,6 +336,7 @@ pub fn ruleset(p: &RedirectParams<'_>) -> String {
         s.push_str(&format!("\t\tmeta mark {:#x} return\n", p.escape_mark));
     }
     s.push_str(&judged);
+    s.push_str(&excludes("oifname != \"lo\""));
     // Only what the capture would put into the device is judged: the
     // capture mark routes into the device, and a flow the routes spare
     // (an excluded uid, an excluded prefix) must stay spared.
@@ -402,10 +446,7 @@ impl AutoRedirect {
             installed.remove();
             return Err(e);
         }
-        let (ipv4, ipv6) = (
-            p.tun_addresses.iter().any(|a| matches!(a, IpNet::V4(_))),
-            p.tun_addresses.iter().any(|a| matches!(a, IpNet::V6(_))),
-        );
+        let (ipv4, ipv6) = families(p.tun_addresses);
         installed.docker = Some(crate::linux::docker_firewall::DockerFirewall::start(
             crate::linux::docker_firewall::DockerCompat::new(
                 p.interface,
@@ -610,6 +651,15 @@ fn nft_script(script: &str) -> io::Result<()> {
     Ok(())
 }
 
+/// Which families the capture covers: sing-tun's `enableIPv4` and
+/// `enableIPv6`, from the device's addresses.
+fn families(tun_addresses: &[IpNet]) -> (bool, bool) {
+    (
+        tun_addresses.iter().any(|a| matches!(a, IpNet::V4(_))),
+        tun_addresses.iter().any(|a| matches!(a, IpNet::V6(_))),
+    )
+}
+
 fn host_addresses(prefixes: &[IpNet]) -> Vec<IpNet> {
     prefixes.iter().map(|p| IpNet::from(p.addr())).collect()
 }
@@ -765,12 +815,17 @@ mod tests {
         RedirectParams {
             interface: "tun0",
             tun_addresses: Box::leak(Box::new(["198.18.0.1/15".parse().unwrap()])),
+            captured: Box::leak(Box::new([
+                "198.51.100.0/24".parse().unwrap(),
+                "203.0.113.0/24".parse().unwrap(),
+            ])),
             excluded: Box::leak(Box::new([
                 "10.0.0.0/8".parse().unwrap(),
                 "10.1.0.0/16".parse().unwrap(),
                 "fe80::/10".parse().unwrap(),
             ])),
             escape_mark: 0x2022,
+            dns_hijack: true,
             input_mark: 0x2023,
             output_mark: 0x2024,
             reset_mark: 0x2025,
@@ -800,9 +855,14 @@ mod tests {
                 "meta mark 0x2024 ct mark set meta mark return",
                 "meta mark 0x2023 ct mark set meta mark return",
                 "ct mark 0x2023 meta mark set ct mark return",
+                // An IPv4-only capture leaves IPv6 alone.
+                "meta nfproto ipv6 return",
                 "meta l4proto != { tcp, udp, icmp, ipv6-icmp } return",
                 "tcp flags & (syn | ack) != syn return",
                 "meta mark 0x2025 counter reject with tcp reset",
+                "ip daddr != { 198.51.100.0/24, 203.0.113.0/24 } return",
+                "ip daddr { 10.0.0.0/8 } return",
+                "meta nfproto ipv4 ",
                 "fib daddr type local return",
                 "meta l4proto { tcp, udp } counter queue num 100 bypass",
                 "icmp type echo-request icmp code 0 counter queue num 100 bypass",
@@ -823,6 +883,18 @@ mod tests {
         assert!(s.contains("ip6 daddr { fe80::/10 } return"));
         assert!(s.contains("meta mark 0x2024 ip saddr { 198.18.0.1/32 } counter masquerade"));
         assert!(!s.contains("ip6 saddr"));
+        // DNS in hijack mode is never judged: every non-loopback query
+        // from this host, the queries from a local source on prerouting.
+        assert!(s.contains(
+            "meta nfproto ipv4 oifname != \"lo\" meta l4proto { tcp, udp } th dport 53 counter return"
+        ));
+        assert!(s.contains(
+            "meta nfproto ipv4 fib saddr type local meta l4proto { tcp, udp } th dport 53 counter return"
+        ));
+        assert!(
+            !s.contains("meta nfproto ipv6 oifname"),
+            "no IPv6 in the capture"
+        );
     }
 
     #[test]
@@ -830,8 +902,21 @@ mod tests {
         let mut p = params();
         p.escape_mark = 0;
         p.excluded = &[];
+        p.captured = &[];
+        p.dns_hijack = false;
         let s = ruleset(&p);
+        assert!(
+            !s.contains("daddr !="),
+            "an unbounded capture judges every destination"
+        );
         assert!(!s.contains("meta mark 0x0 return"));
         assert!(!s.contains("ip daddr {"));
+        assert!(!s.contains("th dport 53"), "DNS judged when not hijacked");
+        // Both families in the capture: neither is skipped.
+        p.tun_addresses = Box::leak(Box::new([
+            "198.18.0.1/15".parse().unwrap(),
+            "fdfe:dcba:9876::1/126".parse().unwrap(),
+        ]));
+        assert!(!ruleset(&p).contains("meta nfproto ipv6 return"));
     }
 }

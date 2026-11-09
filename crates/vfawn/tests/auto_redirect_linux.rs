@@ -141,6 +141,7 @@ fn auto_redirect_end_to_end() {
         Ok("fallback") => return body_fallback(),
         Ok("forward") => return body_forward(),
         Ok("lan") => return body_lan(),
+        Ok("dns") => return body_dns(),
         _ => {}
     }
 
@@ -148,13 +149,14 @@ fn auto_redirect_end_to_end() {
     for port in [8080, 9090, 7070, 6060] {
         serve(port);
     }
-    for port in [8080, 8081, 9090, 7070, 6060] {
+    for port in [8080, 8081, 9090, 7070, 6060, 53] {
         serve_udp(port);
     }
 
     // Loose reverse-path filtering first, then strict with the mark
     // honored: the reply direction carries the restored bypass mark.
     body("probe", &[]);
+    body("dns", &[]);
     run(in_ns(
         "sh -c 'sysctl -q -w net.ipv4.conf.all.rp_filter=1 && \
          sysctl -q -w net.ipv4.conf.v56a.rp_filter=1 && \
@@ -288,7 +290,7 @@ impl SessionHandler for ByPort {
             };
         }
         match flow.destination.port() {
-            8080 => Verdict::Bypass,
+            8080 | 53 => Verdict::Bypass,
             8081 => {
                 std::thread::sleep(Duration::from_millis(1500));
                 Verdict::Bypass
@@ -326,10 +328,24 @@ fn start_instance() -> Instance {
 }
 
 fn start_with(handler: Arc<dyn SessionHandler>, excluded: &[IpNet]) -> Instance {
+    start_dns(handler, excluded, DnsMode::Disabled)
+}
+
+fn start_dns(handler: Arc<dyn SessionHandler>, excluded: &[IpNet], dns: DnsMode) -> Instance {
+    start_config(handler, excluded, &[], dns)
+}
+
+fn start_config(
+    handler: Arc<dyn SessionHandler>,
+    excluded: &[IpNet],
+    captured: &[IpNet],
+    dns: DnsMode,
+) -> Instance {
     let mut config = VfawnConfig::default();
+    config.route.route_address = captured.to_vec();
     config.device.name = Some(TUN.into());
     config.device.inet4_address = vec!["198.18.0.1/15".parse().unwrap()];
-    config.dns.mode = DnsMode::Disabled;
+    config.dns.mode = dns;
     config.route.auto_route = true;
     config.route.auto_redirect.enabled = true;
     config.route.route_exclude_address = excluded.to_vec();
@@ -498,7 +514,16 @@ fn storm() {
 
 /// One datagram to the server's `port`, the first answer (if any).
 fn udp_exchange(socket: &UdpSocket, port: u16, payload: &[u8]) -> std::io::Result<String> {
-    socket.send_to(payload, (SERVER, port))?;
+    udp_exchange_with(socket, SERVER, port, payload)
+}
+
+fn udp_exchange_with(
+    socket: &UdpSocket,
+    host: &str,
+    port: u16,
+    payload: &[u8],
+) -> std::io::Result<String> {
+    socket.send_to(payload, (host, port))?;
     let mut buf = [0u8; 2048];
     let (n, _) = socket.recv_from(&mut buf)?;
     Ok(String::from_utf8_lossy(&buf[..n]).into_owned())
@@ -576,6 +601,39 @@ fn udp_and_icmp() {
     assert_eq!(tun_tx() - before, 0, "bypassed echo crossed the device");
     assert!(!ping(SERVER), "captured ping is the handler's to drop");
     println!("udp and icmp ok");
+}
+
+/// DNS against the pre-match, by mode (sing-tun's exclude rules): with
+/// DNS hijacked, a local query never reaches the queue, so even a host
+/// that would bypass port 53 cannot carry it past the hijack — the
+/// stack takes it, and the handler (an echo) answers. Without the
+/// hijack, the same verdict sends it to the real server.
+fn body_dns() {
+    let mut instance = start_dns(Arc::new(ByPort), &[], DnsMode::Hijack);
+    let judged = queue_stats(100).expect("queue bound")[7];
+    let before = tun_tx();
+    let socket = udp_socket(Duration::from_secs(2));
+    assert_eq!(
+        udp_exchange(&socket, 53, b"query").expect("hijacked answer"),
+        "query",
+        "the hijack, not the server, answered"
+    );
+    assert_eq!(
+        queue_stats(100).unwrap()[7],
+        judged,
+        "a hijacked query was queued"
+    );
+    assert!(tun_tx() > before, "the hijacked query crossed the device");
+    instance.shutdown().unwrap();
+
+    let mut instance = start_dns(Arc::new(ByPort), &[], DnsMode::Disabled);
+    let socket = udp_socket(Duration::from_secs(2));
+    assert_eq!(
+        udp_exchange(&socket, 53, b"query").expect("bypassed dns"),
+        format!("server {UPLINK}")
+    );
+    instance.shutdown().unwrap();
+    println!("dns ok");
 }
 
 /// sing-tun judges without blocking packet processing: a 1.5 s
@@ -760,7 +818,40 @@ fn body_forward() {
     instance.shutdown().unwrap();
     assert_eq!(docker_rule_handles().len(), 0);
     run(sh(&format!("{NFT} delete table ip filter")));
-    println!("forward ok (docker compatibility included)");
+
+    // A bounded capture (route_address): the server's address is
+    // outside it, the ping target's inside. Outside, nothing is judged
+    // and nothing enters the device — local or forwarded alike.
+    let captured: IpNet = format!("{PING_BYPASS}/32").parse().unwrap();
+    let mut instance = start_config(Arc::new(ByPort), &[], &[captured], DnsMode::Disabled);
+    let judged = queue_stats(100).expect("queue bound")[7];
+    let before = tun_tx();
+    let socket = udp_socket(Duration::from_secs(2));
+    assert_eq!(
+        udp_exchange(&socket, 9090, b"ping").expect("uncaptured udp"),
+        format!("server {UPLINK}"),
+        "outside the range the real server answers"
+    );
+    lan("outside");
+    assert_eq!(tun_tx() - before, 0, "uncaptured flows crossed the device");
+    assert_eq!(
+        queue_stats(100).unwrap()[7],
+        judged,
+        "uncaptured flows were judged"
+    );
+    // Inside the range: judged (accepted) and answered by the handler.
+    let socket = udp_socket(Duration::from_secs(2));
+    assert_eq!(
+        udp_exchange_with(&socket, PING_BYPASS, 9090, b"ping").expect("captured udp"),
+        "ping"
+    );
+    assert!(tun_tx() > before, "the captured flow crossed the device");
+    assert!(
+        queue_stats(100).unwrap()[7] > judged,
+        "the captured flow was judged"
+    );
+    instance.shutdown().unwrap();
+    println!("forward ok (docker compatibility and capture range included)");
 }
 
 /// Docker's iptables-nft shape, as far as forwarding is concerned: a
@@ -816,7 +907,15 @@ fn wait_for_docker_rules(count: usize) {
 
 /// The LAN client's side of [`body_forward`].
 fn body_lan() {
-    if env_is("VFAWN_056_LAN", "bypass") {
+    if env_is("VFAWN_056_LAN", "outside") {
+        // Forwarded, untouched: the server sees the LAN client itself.
+        let socket = udp_socket(Duration::from_secs(2));
+        assert_eq!(
+            udp_exchange(&socket, 9090, b"ping").expect("lan uncaptured udp"),
+            format!("server {LAN_CLIENT}")
+        );
+        println!("lan outside the capture ok");
+    } else if env_is("VFAWN_056_LAN", "bypass") {
         let stream = connect(8080, Duration::from_secs(3)).expect("lan bypass connect");
         // Forwarded, not masqueraded: the server sees the LAN client.
         assert_eq!(banner(&stream), format!("server {LAN_CLIENT}"));
