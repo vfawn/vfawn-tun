@@ -103,7 +103,7 @@ impl WriteLane {
 /// One flow inside a shard: the connection, the congestion controller
 /// that bounds its send side, and the host lane that earns a channel
 /// only when the handshake completes.
-struct TcpSlot {
+pub struct TcpSlot {
     connection: ServerConnection,
     client: std::net::SocketAddr,
     server: std::net::SocketAddr,
@@ -287,13 +287,22 @@ impl TcpSlot {
         let sendable = self.cc.window().min(self.connection.peer_window());
         let mut budget = sendable.saturating_sub(inflight) as usize;
         let mut lane = self.write_lane.lock().expect("write lane");
-        while let Some(write) = lane.writes.front_mut() {
+        while budget > 0 && !lane.writes.is_empty() {
+            // The front write leaves the lane whole: nibbling a
+            // segment off its head once memmoved the remaining
+            // kilobytes every segment — a forty-fold write
+            // amplification the drain paid on the hottest thread
+            // (measured: the per-segment cost halved the moment the
+            // slicing turned into pointer arithmetic). The offset
+            // walks the taken-out buffer, and the uneaten tail —
+            // only when the budget or the write's end stops the
+            // pass — returns to the front in one copy.
+            let mut write = lane.writes.pop_front().expect("front held a write");
             if write.is_empty() {
-                // The host's shutdown marker: a FIN after any data. The
-                // FIN is one byte past the stream and leaves ungated;
-                // a window with no room must not wedge the close.
-                let marker = lane.writes.pop_front().expect("front held the marker");
-                let _ = marker;
+                // The host's shutdown marker: a FIN after any data.
+                // The FIN is one byte past the stream and leaves
+                // ungated; a window with no room must not wedge the
+                // close.
                 drop(lane);
                 let reaction = self.connection.fin_reaction();
                 if reaction.flags != 0 {
@@ -308,49 +317,50 @@ impl TcpSlot {
                 }
                 return;
             }
-            if budget == 0 {
-                break;
+            let mut offset = 0usize;
+            while budget > 0 && offset < write.len() {
+                let take = (write.len() - offset)
+                    .min(budget)
+                    .min(self.connection.mss() as usize);
+                let more_after = offset + take < write.len();
+                let reaction = Reaction {
+                    seq: self.connection.send_nxt(),
+                    ack: self.connection.recv_nxt(),
+                    flags: if more_after { 0x10 } else { 0x18 },
+                    window: self.connection.advertised_window(),
+                    delivered: Vec::new(),
+                    held: false,
+                    gap_filled: false,
+                };
+                // The pooled emit: the frame is born in a circulating
+                // buffer behind its headroom — no per-segment
+                // allocation, no hand-off copy, the writer sends the
+                // buffer as it stands and the pool takes it back on
+                // completion.
+                let mut frame = self.frame_pool.packet(EMIT_PACKET);
+                crate::native_tcp::emit_tcp_into(
+                    &mut frame,
+                    self.server,
+                    self.client,
+                    &reaction,
+                    &[],
+                    &write[offset..offset + take],
+                );
+                out.push_back(frame);
+                if self.flight.is_empty() {
+                    self.flight_base = self.connection.send_nxt();
+                    self.data_sent_at = Some(Instant::now());
+                    self.data_retries = 0;
+                }
+                self.flight.extend_from_slice(&write[offset..offset + take]);
+                self.connection.send_advance(take as u32);
+                budget -= take;
+                lane.bytes -= take;
+                offset += take;
             }
-            let take = write.len().min(budget).min(self.connection.mss() as usize);
-            let more_after = write.len() > take;
-            let reaction = Reaction {
-                seq: self.connection.send_nxt(),
-                ack: self.connection.recv_nxt(),
-                flags: if more_after { 0x10 } else { 0x18 },
-                window: self.connection.advertised_window(),
-                delivered: Vec::new(),
-                held: false,
-                gap_filled: false,
-            };
-            // The pooled emit: the frame is born in a circulating
-            // buffer behind its headroom — no per-segment allocation,
-            // no hand-off copy, the writer sends the buffer as it
-            // stands and the pool takes it back on completion.
-            let mut frame = self.frame_pool.packet(EMIT_PACKET);
-            crate::native_tcp::emit_tcp_into(
-                &mut frame,
-                self.server,
-                self.client,
-                &reaction,
-                &[],
-                &write[..take],
-            );
-            out.push_back(frame);
-            if self.flight.is_empty() {
-                self.flight_base = self.connection.send_nxt();
-                self.data_sent_at = Some(Instant::now());
-                self.data_retries = 0;
-            }
-            self.flight.extend_from_slice(&write[..take]);
-            self.connection.send_advance(take as u32);
-            let drained_dry = {
-                write.drain(..take);
-                write.is_empty()
-            };
-            budget -= take;
-            lane.bytes -= take;
-            if drained_dry {
-                lane.writes.pop_front();
+            if offset < write.len() {
+                let rest = write.split_off(offset);
+                lane.writes.push_front(rest);
             }
         }
         // The stalled-drain alarm: output this drain left behind. A
@@ -1556,6 +1566,102 @@ impl SlotLogic for SinkSlot {
         _pool: &BufferPool,
         _mtu: usize,
     ) {
+    }
+}
+
+/// A slot built the way the in-file tests build one, for external
+/// timing probes of the slow path. Not part of any contract.
+#[doc(hidden)]
+pub mod cost_probe_support {
+    use super::*;
+
+    struct ProbeHandler;
+
+    #[async_trait::async_trait]
+    impl vfawn_core::SessionHandler for ProbeHandler {
+        fn judge_flow(&self, _flow: &FlowInfo, _first: &[u8]) -> vfawn_core::Verdict {
+            vfawn_core::Verdict::Accept
+        }
+        async fn on_tcp(&self, _session: vfawn_core::TcpSession) {}
+        async fn on_udp(&self, _session: vfawn_core::UdpSession) {}
+        async fn on_icmp(&self, _packet: vfawn_core::IcmpPacket) -> vfawn_core::Action {
+            vfawn_core::Action::Drop
+        }
+    }
+
+    /// The connection's send cursors, for probes that acknowledge
+    /// exactly what has left.
+    pub fn send_cursor(slot: &TcpSlot) -> (u32, u32) {
+        (slot.connection.send_nxt(), slot.connection.send_una())
+    }
+
+    /// Load the write lane as the relay would: one contiguous write of
+    /// the given size, charged to the lane's accounting.
+    pub fn refill_lane(slot: &mut TcpSlot, bytes: usize) {
+        let mut lane = slot.write_lane.lock().expect("write lane");
+        lane.bytes += bytes;
+        lane.writes.push_back(vec![7u8; bytes]);
+    }
+
+    /// An established-able connection slot with no host session: the
+    /// state machine, the lane, and the congestion controller are real;
+    /// nothing else is wired.
+    pub fn slot_for_cost_probe() -> TcpSlot {
+        let client = std::net::SocketAddr::V4(std::net::SocketAddrV4::new(
+            std::net::Ipv4Addr::new(10, 0, 0, 2),
+            44444,
+        ));
+        let server = std::net::SocketAddr::V4(std::net::SocketAddrV4::new(
+            std::net::Ipv4Addr::new(10, 0, 0, 1),
+            443,
+        ));
+        let write_lane = Arc::new(std::sync::Mutex::new(WriteLane::new()));
+        let (sessions_tx, _sessions_rx) = mpsc::sync_channel(4);
+        TcpSlot {
+            connection: ServerConnection::new(1000, 1460),
+            frame_pool: Arc::new(crate::shards::BufferPool::new()),
+            flow_key: vfawn_wire::flow::FlowKey {
+                src: client.ip(),
+                src_port: client.port(),
+                dst: server.ip(),
+                dst_port: server.port(),
+                protocol: IpProtocol::Tcp,
+            },
+            client,
+            server,
+            handler: Arc::new(ProbeHandler),
+            accept: Arc::new(std::sync::Mutex::new(AcceptQueue::new(
+                true,
+                64,
+                Box::new(crate::accept::FixedSecret(0)),
+            ))),
+            sessions: sessions_tx,
+            flow: FlowInfo {
+                network: Network::Tcp,
+                source: client,
+                destination: server,
+            },
+            write_lane,
+            shard_wake: Arc::new(ShardBell::new()),
+            cc: Box::new(crate::congestion::Cubic::new(1460)),
+            to_host: None,
+            judged: true,
+            refused: false,
+            flight: Vec::new(),
+            flight_base: 0,
+            data_sent_at: None,
+            data_retries: 0,
+            synack_at: None,
+            synack_retries: 0,
+            fin_at: None,
+            persist_at: None,
+            persist_retries: 0,
+            diag_at: None,
+            diag_queued: 0,
+            keepalive_at: None,
+            keepalive_probes: 0,
+            tracker: None,
+        }
     }
 }
 
