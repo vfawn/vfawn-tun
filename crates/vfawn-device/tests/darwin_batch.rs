@@ -21,13 +21,22 @@ use vfawn_core::{DeviceConfig, PacketDevice};
 use vfawn_device::TunDevice;
 
 /// The interface's own address and the on-link neighbor the probes
-/// aim at. The address installs with a /24 whatever the config's
-/// prefix says, so the probe neighbor lives inside that /24: on-link
-/// delivery, no static route, nothing riding cloning-route semantics
-/// that differ between kernel generations.
-const IFACE_NET: &str = "198.18.0.1/24";
-const IFACE_ADDR: Ipv4Addr = Ipv4Addr::new(198, 18, 0, 1);
-const PROBE_ADDR: Ipv4Addr = Ipv4Addr::new(198, 18, 0, 7);
+/// aim at, one island per round: the address installs with a /24
+/// whatever the config's prefix says, so the probe neighbor lives
+/// inside that /24. The islands never repeat — two live interfaces
+/// claiming one subnet leave the connected route's winner to the
+/// kernel's interface ordering, which a pool's kernel generation
+/// changed under this test once: every probe silently routed to the
+/// other (already dying) island and the fresh interface read zero
+/// with its routes and addresses all present.
+fn island(round: u32) -> (String, Ipv4Addr, Ipv4Addr) {
+    let octet = 40 + round as u8;
+    (
+        format!("198.18.{octet}.1/24"),
+        Ipv4Addr::new(198, 18, octet, 1),
+        Ipv4Addr::new(198, 18, octet, 7),
+    )
+}
 const PROBE_PORT: u16 = 5353;
 const PROBES: usize = 400;
 
@@ -67,33 +76,36 @@ fn batch_reads_and_the_writev_round_trip() {
     // Root hands us the address; the route is the system's own tool.
     assert_root();
 
-    // This exchange runs when VFAWN_DARWIN_BATCH is set: on the CI
-    // pool's newer kernel generation, freshly created interfaces read
-    // zero for this probe shape (routes and addresses all present),
-    // while the adopted-fd test beside it reads the same shape fine.
-    // The batching evidence is banked from the pool generation that
-    // read it (§二十一 of the record); re-enable by root-causing the
-    // zero-read before deleting this gate.
-    if std::env::var_os("VFAWN_DARWIN_BATCH").is_none() {
-        println!("skipped: set VFAWN_DARWIN_BATCH=1 to run the batch exchange");
-        return;
-    }
     let mut round = 0;
     let (frames, batches, first) = loop {
         round += 1;
+        let (net, iface_addr, probe_addr) = island(round);
         let mut device = TunDevice::create(&DeviceConfig {
             mtu: 1500,
-            inet4_address: vec![IFACE_NET.parse().expect("interface prefix")],
+            inet4_address: vec![net.parse().expect("interface prefix")],
             ..DeviceConfig::default()
         })
         .expect("device");
+        // The kernel's own answer to which interface the probes will
+        // enter: printed before any read, so a zero-read round leaves
+        // the routing truth beside it.
+        let picked = Command::new("route")
+            .args(["-n", "get", &probe_addr.to_string()])
+            .output();
+        if let Ok(output) = picked {
+            for line in String::from_utf8_lossy(&output.stdout).lines() {
+                if line.contains("interface:") {
+                    println!("round {round}: {line}");
+                }
+            }
+        }
         // A connected probe socket with a wide send buffer: every datagram
         // leaves the process before the first read, so the kernel — not a
         // racing reader — decides the batching. The own-address bind also
         // decides the bounce: a reply destined to the interface's address
         // passes the kernel's interface check.
         let socket =
-            std::net::UdpSocket::bind(std::net::SocketAddr::from((IFACE_ADDR, 0))).expect("bind");
+            std::net::UdpSocket::bind(std::net::SocketAddr::from((iface_addr, 0))).expect("bind");
         let sndbuf: libc::c_int = 1 << 20;
         // SAFETY: a plain integer socket option on a descriptor this
         // process owns.
@@ -108,7 +120,7 @@ fn batch_reads_and_the_writev_round_trip() {
             );
         }
         socket
-            .connect(std::net::SocketAddr::from((PROBE_ADDR, PROBE_PORT)))
+            .connect(std::net::SocketAddr::from((probe_addr, PROBE_PORT)))
             .expect("connect");
 
         let payload_body = |n: usize| format!("vfawn-batch-probe-{n:04}");
@@ -117,10 +129,10 @@ fn batch_reads_and_the_writev_round_trip() {
         }
         let outcome = probe_round(&mut device);
         let _ = device.shutdown();
-        if outcome.0 > 0 || round >= 2 {
+        if outcome.0 > 0 || round >= 3 {
             break (outcome.0, outcome.1, outcome.2);
         }
-        println!("round {round} read zero; retrying on a fresh interface");
+        println!("round {round} read zero; retrying on a fresh island");
     };
     if frames == 0 {
         // The diagnosis the zero deserves: where the routes point and
@@ -147,11 +159,12 @@ fn batch_reads_and_the_writev_round_trip() {
     );
 
     // The write path needs a live device again: the probe rounds tore
-    // theirs down. A fresh one, a bounced frame, the interface's own
-    // input counter as the kernel's receipt.
+    // theirs down. A fresh island, a bounced frame, the interface's
+    // own input counter as the kernel's receipt.
+    let (net, _iface_addr, _probe_addr) = island(9);
     let mut device = TunDevice::create(&DeviceConfig {
         mtu: 1500,
-        inet4_address: vec![IFACE_NET.parse().expect("interface prefix")],
+        inet4_address: vec![net.parse().expect("interface prefix")],
         ..DeviceConfig::default()
     })
     .expect("write-path device");
