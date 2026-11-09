@@ -246,6 +246,13 @@ impl NetlinkBackend {
                 end: *range.end(),
             })
         });
+        // The interface filter's kernel face (FRA_IIFNAME); locally
+        // originated traffic arrives on "lo".
+        let iif = rule
+            .selector
+            .incoming_interface
+            .clone()
+            .map(RuleAttribute::Iifname);
         let result = match dest {
             IpAddr::V4(d) => {
                 let mut req = self.handle.rule().add().v4();
@@ -268,6 +275,9 @@ impl NetlinkBackend {
                 }
                 if let Some(range) = uid_range {
                     req.message_mut().attributes.push(range);
+                }
+                if let Some(iif) = iif {
+                    req.message_mut().attributes.push(iif);
                 }
                 req.execute().await
             }
@@ -292,6 +302,9 @@ impl NetlinkBackend {
                 }
                 if let Some(range) = uid_range {
                     req.message_mut().attributes.push(range);
+                }
+                if let Some(iif) = iif {
+                    req.message_mut().attributes.push(iif);
                 }
                 req.execute().await
             }
@@ -332,6 +345,9 @@ impl NetlinkBackend {
                 start: *range.start(),
                 end: *range.end(),
             }));
+        }
+        if let Some(iif) = &rule.selector.incoming_interface {
+            msg.attributes.push(RuleAttribute::Iifname(iif.clone()));
         }
         self.handle.rule().del(msg).execute().await.map_err(nl_err)
     }
@@ -478,6 +494,7 @@ fn parse_rule(msg: &RuleMessage) -> Option<PolicyRule> {
     let mut suppress_prefixlen = None;
     let mut fwmark = None;
     let mut uid_range = None;
+    let mut incoming_interface = None;
 
     for attr in &msg.attributes {
         match attr {
@@ -485,6 +502,7 @@ fn parse_rule(msg: &RuleMessage) -> Option<PolicyRule> {
             RuleAttribute::Table(t) => table = *t,
             RuleAttribute::FwMark(m) => fwmark = Some(*m),
             RuleAttribute::UidRange(range) => uid_range = Some(range.start..=range.end),
+            RuleAttribute::Iifname(name) => incoming_interface = Some(name.clone()),
             RuleAttribute::SuppressPrefixLen(len) => {
                 suppress_prefixlen = Some((*len).min(u8::MAX as u32) as u8)
             }
@@ -520,7 +538,7 @@ fn parse_rule(msg: &RuleMessage) -> Option<PolicyRule> {
         selector: RuleSelector {
             source,
             destination,
-            incoming_interface: None,
+            incoming_interface,
             fwmark,
             suppress_prefixlen,
             dport: None,

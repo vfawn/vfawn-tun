@@ -347,6 +347,8 @@ impl Instance {
             dns_leak_prevention: config.dns.mode == vfawn_core::DnsMode::Hijack,
             include_uid: &config.route.include_uid,
             exclude_uid: &config.route.exclude_uid,
+            include_interface: &config.route.include_interface,
+            exclude_interface: &config.route.exclude_interface,
         });
         if let Some(reason) = needs_restart_desired(&self.config, config) {
             return Err(ApplyError::NeedsRestart(reason));
@@ -456,6 +458,20 @@ mod tests {
         excluded.route.route_exclude_address = vec!["10.0.0.0/8".parse().unwrap()];
         assert!(needs_restart_desired(&on, &excluded).is_none());
 
+        // What the pre-match bakes in is not hot while the bypass is on.
+        let mut ranged = on.clone();
+        ranged.route.route_address = vec!["10.0.0.0/8".parse().unwrap()];
+        assert!(needs_restart_desired(&on, &ranged).is_some());
+        let mut filtered = on.clone();
+        filtered.route.include_interface = vec!["lo".into()];
+        assert!(needs_restart_desired(&on, &filtered).is_some());
+        let mut dns = on.clone();
+        dns.dns.mode = vfawn_core::DnsMode::Disabled;
+        assert!(needs_restart_desired(&on, &dns).is_some());
+        let mut ranged_off = base.clone();
+        ranged_off.route.route_address = vec!["10.0.0.0/8".parse().unwrap()];
+        assert!(needs_restart_desired(&base, &ranged_off).is_none());
+
         // And the public path refuses before touching any kernel state.
         let handler = Arc::new(crate::echo::EchoHandler::new());
         let mut instance = Instance::new(on, handler).unwrap();
@@ -540,6 +556,26 @@ fn needs_restart_desired(old: &VfawnConfig, new: &VfawnConfig) -> Option<String>
             "mark {:#x} -> {:#x} under auto_redirect",
             old.route.mark, new.route.mark
         ));
+    }
+    // The pre-match bakes in the capture range, the interface filters
+    // and the DNS mode; the route engine alone would follow a change.
+    if was.enabled {
+        let (o, n) = (&old.route, &new.route);
+        let changed = [
+            (o.route_address != n.route_address, "route_address"),
+            (
+                o.include_interface != n.include_interface,
+                "include_interface",
+            ),
+            (
+                o.exclude_interface != n.exclude_interface,
+                "exclude_interface",
+            ),
+            (old.dns.mode != new.dns.mode, "dns mode"),
+        ];
+        if let Some((_, what)) = changed.iter().find(|(changed, _)| *changed) {
+            return Some(format!("{what} changed under auto_redirect"));
+        }
     }
     None
 }

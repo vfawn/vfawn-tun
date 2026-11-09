@@ -21,6 +21,8 @@ fn test_desired() -> DesiredState {
         dns_leak_prevention: true,
         include_uid: &[],
         exclude_uid: &[],
+        include_interface: &[],
+        exclude_interface: &[],
     })
 }
 
@@ -288,6 +290,8 @@ fn the_escape_rule_precedes_every_capture_rule() {
         dns_leak_prevention: false,
         include_uid: &[],
         exclude_uid: &[],
+        include_interface: &[],
+        exclude_interface: &[],
     });
     let first = d.rules.first().expect("the escape rule exists");
     assert_eq!(first.selector.fwmark, Some(0x2022));
@@ -311,6 +315,8 @@ fn the_escape_rule_precedes_every_capture_rule() {
         dns_leak_prevention: false,
         include_uid: &[],
         exclude_uid: &[],
+        include_interface: &[],
+        exclude_interface: &[],
     });
     assert!(unmarked.rules.iter().all(|r| r.selector.fwmark.is_none()));
 }
@@ -331,6 +337,8 @@ fn the_bypass_rule_follows_the_escape_and_precedes_the_capture() {
         dns_leak_prevention: false,
         include_uid: &[],
         exclude_uid: &[1000..=1999],
+        include_interface: &[],
+        exclude_interface: &[],
     });
     let marks: Vec<_> = d.rules.iter().map(|r| r.selector.fwmark).collect();
     assert_eq!(marks[..3], [Some(0x2022), Some(0x2024), Some(0x2023)]);
@@ -370,6 +378,8 @@ fn the_bypass_rule_follows_the_escape_and_precedes_the_capture() {
         dns_leak_prevention: false,
         include_uid: &[],
         exclude_uid: &[],
+        include_interface: &[],
+        exclude_interface: &[],
     });
     assert_eq!(alone.rules[0].selector.fwmark, Some(0x2024));
     assert_eq!(alone.rules[0].priority, 9000);
@@ -391,6 +401,8 @@ fn the_table_holds_the_capture_range_only() {
         dns_leak_prevention: false,
         include_uid: &[],
         exclude_uid: &[],
+        include_interface: &[],
+        exclude_interface: &[],
     };
     let destinations = |d: &DesiredState| -> Vec<String> {
         d.routes.iter().map(|r| r.destination.to_string()).collect()
@@ -429,6 +441,8 @@ fn strict_route_adds_unreachable_rule() {
         dns_leak_prevention: false,
         include_uid: &[],
         exclude_uid: &[],
+        include_interface: &[],
+        exclude_interface: &[],
     });
     assert!(
         strict
@@ -451,6 +465,8 @@ fn strict_route_adds_unreachable_rule() {
         dns_leak_prevention: false,
         include_uid: &[],
         exclude_uid: &[],
+        include_interface: &[],
+        exclude_interface: &[],
     });
     assert!(
         !lax.rules
@@ -476,6 +492,8 @@ fn dns_leak_prevention_adds_rule() {
         dns_leak_prevention: true,
         include_uid: &[],
         exclude_uid: &[],
+        include_interface: &[],
+        exclude_interface: &[],
     });
     let without = desired_from_config(&RouteParams {
         interface: "t",
@@ -491,6 +509,8 @@ fn dns_leak_prevention_adds_rule() {
         dns_leak_prevention: false,
         include_uid: &[],
         exclude_uid: &[],
+        include_interface: &[],
+        exclude_interface: &[],
     });
     assert!(with.rules.len() > without.rules.len());
 }
@@ -662,6 +682,8 @@ fn uid_desired(
         dns_leak_prevention: false,
         include_uid: inc,
         exclude_uid: exc,
+        include_interface: &[],
+        exclude_interface: &[],
     })
 }
 
@@ -748,4 +770,123 @@ fn uid_rules_round_trip_through_the_plan() {
     simulate_apply(&plan(&desired, &observed), &mut observed);
     let second = plan(&desired, &observed);
     assert!(second.is_empty(), "uid rules are idempotent");
+}
+
+// --- Incoming-interface filtering -----------------------------------
+
+fn iif_desired(
+    include: &[String],
+    exclude: &[String],
+    uids: &[std::ops::RangeInclusive<u32>],
+) -> DesiredState {
+    desired_from_config(&RouteParams {
+        interface: "tun0",
+        addresses: &[],
+        captured: &[],
+        excluded: &[],
+        table_index: 2022,
+        rule_index: 9000,
+        mark: 0,
+        bypass_mark: 0,
+        capture_mark: 0,
+        strict_route: false,
+        dns_leak_prevention: false,
+        include_uid: uids,
+        exclude_uid: &[],
+        include_interface: include,
+        exclude_interface: exclude,
+    })
+}
+
+fn names(list: &[&str]) -> Vec<String> {
+    list.iter().map(|s| s.to_string()).collect()
+}
+
+/// A rule that consults the dedicated table, as (iif, uid, suppress).
+type TableRule = (Option<String>, Option<(u32, u32)>, bool);
+
+fn table_rules(d: &DesiredState) -> Vec<TableRule> {
+    d.rules
+        .iter()
+        .filter(|r| r.action == RuleAction::Lookup(2022))
+        .map(|r| {
+            (
+                r.selector.incoming_interface.clone(),
+                r.selector.uid_range.clone().map(|u| (*u.start(), *u.end())),
+                r.selector.suppress_prefixlen.is_some(),
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn included_interfaces_alone_consult_the_table() {
+    // sing-tun's IncludeInterface: only traffic arriving on a listed
+    // interface reaches the capture ("lo" is this host's own).
+    let d = iif_desired(&names(&["lo", "br-lan"]), &[], &[]);
+    let lo = Some("lo".to_string());
+    let lan = Some("br-lan".to_string());
+    assert_eq!(
+        table_rules(&d),
+        [
+            (lo.clone(), None, false),
+            (lan.clone(), None, false),
+            (lo, None, true),
+            (lan, None, true),
+        ]
+    );
+    // No catch-all left behind for the rest.
+    assert!(
+        d.rules.iter().all(
+            |r| r.action != RuleAction::Lookup(2022) || r.selector.incoming_interface.is_some()
+        )
+    );
+
+    // Combined with included UIDs: one segment per pair.
+    let d = iif_desired(&names(&["lo"]), &[], &[1000..=1999]);
+    assert_eq!(
+        table_rules(&d),
+        [
+            (Some("lo".into()), Some((1000, 1999)), false),
+            (Some("lo".into()), Some((1000, 1999)), true),
+        ]
+    );
+}
+
+#[test]
+fn excluded_interfaces_escape_ahead_of_the_capture() {
+    let d = iif_desired(&[], &names(&["docker0"]), &[]);
+    let escape = d
+        .rules
+        .iter()
+        .find(|r| r.selector.incoming_interface.as_deref() == Some("docker0"))
+        .expect("an escape for docker0");
+    assert_eq!(escape.action, RuleAction::Lookup(254));
+    let first_capture = d
+        .rules
+        .iter()
+        .find(|r| r.action == RuleAction::Lookup(2022))
+        .unwrap();
+    assert!(escape.priority < first_capture.priority);
+    assert_eq!(table_rules(&d), [(None, None, false), (None, None, true)]);
+
+    // An include list wins, as in sing-tun: the exclusion is ignored.
+    let d = iif_desired(&names(&["lo"]), &names(&["docker0"]), &[]);
+    assert!(
+        d.rules
+            .iter()
+            .all(|r| r.selector.incoming_interface.as_deref() != Some("docker0"))
+    );
+}
+
+#[test]
+fn included_uids_no_longer_reach_the_table_through_the_suppress_rule() {
+    // Step 4 used to stand for every UID, so a UID outside the include
+    // list still met the captured prefixes there.
+    let d = iif_desired(&[], &[], &[1000..=1999]);
+    assert!(
+        table_rules(&d)
+            .iter()
+            .all(|(_, uid, _)| *uid == Some((1000, 1999)))
+    );
 }

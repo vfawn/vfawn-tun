@@ -145,6 +145,8 @@ fn desired_state_of(
         dns_leak_prevention: false,
         include_uid: &config.route.include_uid,
         exclude_uid: &config.route.exclude_uid,
+        include_interface: &config.route.include_interface,
+        exclude_interface: &config.route.exclude_interface,
     })
 }
 
@@ -184,6 +186,8 @@ pub(crate) fn install_auto_redirect(
         tun_addresses: addresses,
         captured: &config.route.route_address,
         excluded: &excluded,
+        include_interface: &config.route.include_interface,
+        exclude_interface: &config.route.exclude_interface,
         escape_mark: config.route.mark,
         dns_hijack: config.dns.mode == vfawn_core::DnsMode::Hijack,
         input_mark: redirect.input_mark,

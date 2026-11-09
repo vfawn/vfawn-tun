@@ -78,6 +78,12 @@ pub struct RedirectParams<'a> {
     pub captured: &'a [IpNet],
     /// Destinations the capture already spares; never queued.
     pub excluded: &'a [IpNet],
+    /// Incoming interfaces the capture takes ("lo" for this host's own
+    /// traffic); empty means every one.
+    pub include_interface: &'a [String],
+    /// Incoming interfaces the capture spares; ignored with an include
+    /// list, as sing-tun ignores it.
+    pub exclude_interface: &'a [String],
     /// This process's own socket mark; zero when unused.
     pub escape_mark: u32,
     /// DNS is hijacked in the stack: local port-53 flows are never
@@ -278,8 +284,24 @@ pub fn ruleset(p: &RedirectParams<'_>) -> String {
     // output every non-loopback query, on prerouting the queries from a
     // local source (sing-tun reads that from its local address set; the
     // fib answers the same question here, as for destinations).
-    let excludes = |dns_scope: &str| {
+    let excludes = |dns_scope: &str, prerouting: bool| {
         let mut e = String::new();
+        // The interface filters, prerouting only (an output packet has
+        // no incoming interface; sing-tun drops the whole output chain
+        // instead, below).
+        if prerouting {
+            if !p.include_interface.is_empty() {
+                e.push_str(&format!(
+                    "\t\tiifname != {{ {} }} return\n",
+                    quoted(p.include_interface)
+                ));
+            } else if !p.exclude_interface.is_empty() {
+                e.push_str(&format!(
+                    "\t\tiifname {{ {} }} return\n",
+                    quoted(p.exclude_interface)
+                ));
+            }
+        }
         let (in4, in6) = split_families(p.captured);
         if !in4.is_empty() {
             e.push_str(&format!("\t\tip daddr != {{ {} }} return\n", join(&in4)));
@@ -325,23 +347,31 @@ pub fn ruleset(p: &RedirectParams<'_>) -> String {
     s.push_str(&restore);
     s.push_str(&format!("\t\tiifname {tun} return\n"));
     s.push_str(&judged);
-    s.push_str(&excludes("fib saddr type local"));
+    s.push_str(&excludes("fib saddr type local", true));
     s.push_str(&queued);
 
     // Local traffic. A route chain: a mark changed here re-routes.
-    s.push_str("\tchain output_prematch {\n");
-    s.push_str("\t\ttype route hook output priority -149; policy accept;\n");
-    s.push_str(&restore);
-    if p.escape_mark != 0 {
-        s.push_str(&format!("\t\tmeta mark {:#x} return\n", p.escape_mark));
+    // sing-tun's shouldSkipOutputChain: no output chain at all when the
+    // interface filters leave this host's own traffic ("lo") outside.
+    let local_spared = (!p.include_interface.is_empty()
+        && !p.include_interface.iter().any(|i| i == "lo"))
+        || (p.include_interface.is_empty() && p.exclude_interface.iter().any(|i| i == "lo"));
+    if !local_spared {
+        s.push_str("\tchain output_prematch {\n");
+        s.push_str("\t\ttype route hook output priority -149; policy accept;\n");
+        s.push_str(&restore);
+        if p.escape_mark != 0 {
+            s.push_str(&format!("\t\tmeta mark {:#x} return\n", p.escape_mark));
+        }
+        s.push_str(&judged);
+        s.push_str(&excludes("oifname != \"lo\"", false));
+        // Only what the capture would put into the device is judged:
+        // the capture mark routes into the device, and a flow the
+        // routes spare (an excluded uid, an excluded prefix) must stay
+        // spared.
+        s.push_str(&format!("\t\toifname != {tun} return\n"));
+        s.push_str(&queued);
     }
-    s.push_str(&judged);
-    s.push_str(&excludes("oifname != \"lo\""));
-    // Only what the capture would put into the device is judged: the
-    // capture mark routes into the device, and a flow the routes spare
-    // (an excluded uid, an excluded prefix) must stay spared.
-    s.push_str(&format!("\t\toifname != {tun} return\n"));
-    s.push_str(&queued);
 
     // Bypassed local flows still carry the device's address.
     s.push_str("\tchain postrouting_masquerade {\n");
@@ -673,6 +703,14 @@ fn split_families(prefixes: &[IpNet]) -> (Vec<IpNet>, Vec<IpNet>) {
         .partition(|p| matches!(p, IpNet::V4(_)))
 }
 
+fn quoted(names: &[String]) -> String {
+    names
+        .iter()
+        .map(|n| format!("\"{n}\""))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 fn join(prefixes: &[IpNet]) -> String {
     prefixes
         .iter()
@@ -824,6 +862,8 @@ mod tests {
                 "10.1.0.0/16".parse().unwrap(),
                 "fe80::/10".parse().unwrap(),
             ])),
+            include_interface: &[],
+            exclude_interface: &[],
             escape_mark: 0x2022,
             dns_hijack: true,
             input_mark: 0x2023,
@@ -895,6 +935,46 @@ mod tests {
             !s.contains("meta nfproto ipv6 oifname"),
             "no IPv6 in the capture"
         );
+    }
+
+    #[test]
+    fn interface_filters_follow_sing_tun() {
+        let lan: &'static [String] = Box::leak(Box::new(["br-lan".to_string()]));
+        let with_lo: &'static [String] =
+            Box::leak(Box::new(["lo".to_string(), "br-lan".to_string()]));
+        let lo: &'static [String] = Box::leak(Box::new(["lo".to_string()]));
+
+        // Include without "lo": forwarded traffic filtered, and no
+        // output chain (this host's traffic is not captured).
+        let mut p = params();
+        p.include_interface = lan;
+        let s = ruleset(&p);
+        let pre = &s[s.find("chain prerouting_prematch").unwrap()..];
+        assert!(pre.contains("iifname != { \"br-lan\" } return"));
+        assert!(!s.contains("chain output_prematch"));
+
+        // Include with "lo": both chains.
+        p.include_interface = with_lo;
+        let s = ruleset(&p);
+        assert!(s.contains("iifname != { \"lo\", \"br-lan\" } return"));
+        assert!(s.contains("chain output_prematch"));
+
+        // Exclude: forwarded traffic from it spared; excluding "lo"
+        // drops the output chain.
+        let mut p = params();
+        p.exclude_interface = lan;
+        let s = ruleset(&p);
+        assert!(s.contains("iifname { \"br-lan\" } return"));
+        assert!(s.contains("chain output_prematch"));
+        p.exclude_interface = lo;
+        assert!(!ruleset(&p).contains("chain output_prematch"));
+
+        // Include wins over exclude.
+        p.include_interface = with_lo;
+        p.exclude_interface = lan;
+        let s = ruleset(&p);
+        assert!(!s.contains("iifname { \"br-lan\" } return"));
+        assert!(s.contains("chain output_prematch"));
     }
 
     #[test]

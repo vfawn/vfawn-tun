@@ -340,6 +340,8 @@ mod tests {
             dns_leak_prevention: false,
             include_uid: &[],
             exclude_uid: &[],
+            include_interface: &[],
+            exclude_interface: &[],
         })
     }
 

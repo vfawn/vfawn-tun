@@ -219,6 +219,12 @@ pub struct RouteParams<'a> {
     /// UID ranges to spare even inside the capture. Applied ahead of
     /// the capture rules, toward the main table.
     pub exclude_uid: &'a [std::ops::RangeInclusive<u32>],
+    /// Incoming interfaces to capture ("lo" for this host's own
+    /// traffic). Empty captures every interface.
+    pub include_interface: &'a [String],
+    /// Incoming interfaces to spare; ignored when an include list is
+    /// set, as sing-tun ignores it.
+    pub exclude_interface: &'a [String],
 }
 
 /// Build a desired state from the host configuration; this is the
@@ -236,6 +242,8 @@ pub fn desired_from_config(params: &RouteParams<'_>) -> DesiredState {
         excluded,
         include_uid,
         exclude_uid,
+        include_interface,
+        exclude_interface,
         table_index,
         rule_index,
         mark,
@@ -364,20 +372,34 @@ pub fn desired_from_config(params: &RouteParams<'_>) -> DesiredState {
         priority += 1;
     }
 
-    // Step 2.5: UID escapes ahead of the capture — a spared range
-    // answers the main table no matter what the capture below would
-    // do with its packets.
-    for range in exclude_uid {
+    // Step 2.5: escapes ahead of the capture. A spared UID range, and
+    // a spared incoming interface (sing-tun's ExcludeInterface, which
+    // it honors only when no include list is set), answer the main
+    // table no matter what the capture below would do with them.
+    let spared_interfaces: &[String] = if include_interface.is_empty() {
+        exclude_interface
+    } else {
+        &[]
+    };
+    let escapes = exclude_uid
+        .iter()
+        .map(|range| (None, Some(range.clone())))
+        .chain(
+            spared_interfaces
+                .iter()
+                .map(|name| (Some(name.clone()), None)),
+        );
+    for (incoming_interface, uid_range) in escapes {
         rules.push(PolicyRule {
             priority,
             selector: RuleSelector {
                 destination: None,
                 source: None,
-                incoming_interface: None,
+                incoming_interface,
                 fwmark: None,
                 suppress_prefixlen: None,
                 dport: None,
-                uid_range: Some(range.clone()),
+                uid_range,
             },
             action: RuleAction::Lookup(254),
             tag: tag.clone(),
@@ -385,62 +407,64 @@ pub fn desired_from_config(params: &RouteParams<'_>) -> DesiredState {
         priority += 1;
     }
 
-    // Step 3: captured prefixes go to the dedicated table — every UID
-    // when the filter is off, one rule per UID range when it is on
-    // (the kernel matches one range per rule; segments are the honest
-    // shape, the same one the reference stack installs).
-    if include_uid.is_empty() {
+    // The capture's segments: every incoming interface and UID when the
+    // filters are off, one segment per included interface and UID range
+    // when they are on (the kernel matches one of each per rule). Only
+    // a segment ever consults the dedicated table — steps 3 and 4 alike
+    // — as only included traffic reaches sing-tun's capture rules.
+    // Locally originated traffic arrives on "lo".
+    let interfaces: Vec<Option<String>> = if include_interface.is_empty() {
+        vec![None]
+    } else {
+        include_interface.iter().cloned().map(Some).collect()
+    };
+    let uids: Vec<Option<std::ops::RangeInclusive<u32>>> = if include_uid.is_empty() {
+        vec![None]
+    } else {
+        include_uid.iter().cloned().map(Some).collect()
+    };
+    let segments: Vec<(Option<String>, Option<std::ops::RangeInclusive<u32>>)> = interfaces
+        .iter()
+        .flat_map(|iif| uids.iter().map(move |uid| (iif.clone(), uid.clone())))
+        .collect();
+
+    // Step 3: captured traffic goes to the dedicated table.
+    for (incoming_interface, uid_range) in &segments {
         rules.push(PolicyRule {
             priority,
             selector: RuleSelector {
                 destination: Some("0.0.0.0/0".parse().unwrap()),
                 source: None,
-                incoming_interface: None,
+                incoming_interface: incoming_interface.clone(),
                 fwmark: None,
                 suppress_prefixlen: None,
                 dport: None,
-                uid_range: None,
+                uid_range: uid_range.clone(),
             },
             action: RuleAction::Lookup(table_index),
             tag: tag.clone(),
         });
         priority += 1;
-    } else {
-        for range in include_uid {
-            rules.push(PolicyRule {
-                priority,
-                selector: RuleSelector {
-                    destination: Some("0.0.0.0/0".parse().unwrap()),
-                    source: None,
-                    incoming_interface: None,
-                    fwmark: None,
-                    suppress_prefixlen: None,
-                    dport: None,
-                    uid_range: Some(range.clone()),
-                },
-                action: RuleAction::Lookup(table_index),
-                tag: tag.clone(),
-            });
-            priority += 1;
-        }
     }
 
     // Step 4: suppress the default-route fallback in the main table.
-    rules.push(PolicyRule {
-        priority,
-        selector: RuleSelector {
-            destination: None,
-            source: None,
-            incoming_interface: None,
-            fwmark: None,
-            suppress_prefixlen: Some(0),
-            dport: None,
-            uid_range: None,
-        },
-        action: RuleAction::Lookup(table_index),
-        tag: tag.clone(),
-    });
-    priority += 1;
+    for (incoming_interface, uid_range) in &segments {
+        rules.push(PolicyRule {
+            priority,
+            selector: RuleSelector {
+                destination: None,
+                source: None,
+                incoming_interface: incoming_interface.clone(),
+                fwmark: None,
+                suppress_prefixlen: Some(0),
+                dport: None,
+                uid_range: uid_range.clone(),
+            },
+            action: RuleAction::Lookup(table_index),
+            tag: tag.clone(),
+        });
+        priority += 1;
+    }
 
     // Step 5: DNS leak prevention (port 53 to main table).
     if dns_leak_prevention {

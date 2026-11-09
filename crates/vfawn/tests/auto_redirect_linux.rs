@@ -341,14 +341,23 @@ fn start_config(
     captured: &[IpNet],
     dns: DnsMode,
 ) -> Instance {
+    start_custom(handler, |config| {
+        config.route.route_exclude_address = excluded.to_vec();
+        config.route.route_address = captured.to_vec();
+        config.dns.mode = dns;
+    })
+}
+
+fn start_custom(
+    handler: Arc<dyn SessionHandler>,
+    tweak: impl FnOnce(&mut VfawnConfig),
+) -> Instance {
     let mut config = VfawnConfig::default();
-    config.route.route_address = captured.to_vec();
     config.device.name = Some(TUN.into());
     config.device.inet4_address = vec!["198.18.0.1/15".parse().unwrap()];
-    config.dns.mode = dns;
     config.route.auto_route = true;
     config.route.auto_redirect.enabled = true;
-    config.route.route_exclude_address = excluded.to_vec();
+    tweak(&mut config);
     let mut instance = Instance::new(config, Arc::clone(&handler)).expect("instance");
     instance.start(handler).expect("start");
     std::thread::sleep(Duration::from_millis(300));
@@ -851,7 +860,60 @@ fn body_forward() {
         "the captured flow was judged"
     );
     instance.shutdown().unwrap();
-    println!("forward ok (docker compatibility and capture range included)");
+
+    // Interface filters (sing-tun's Include/ExcludeInterface). "lo" is
+    // this host's own traffic, v56d the LAN.
+    let lan_net: IpNet = LAN.parse().unwrap();
+    let local_echoed = || {
+        let socket = udp_socket(Duration::from_secs(2));
+        assert_eq!(
+            udp_exchange(&socket, 9090, b"ping").expect("local udp"),
+            "ping"
+        );
+    };
+    let local_direct = || {
+        let socket = udp_socket(Duration::from_secs(2));
+        assert_eq!(
+            udp_exchange(&socket, 9090, b"ping").expect("local udp"),
+            format!("server {UPLINK}")
+        );
+    };
+    for (include, exclude) in [(vec!["lo"], vec![]), (vec![], vec!["v56d"])] {
+        // The LAN excluded as a gateway excludes it: replies from the
+        // uplink to a LAN client arrive on another interface, and only
+        // the destination keeps them out of the capture (sing-tun's
+        // rules capture them the same way).
+        let mut instance = start_custom(Arc::new(ByPort), |c| {
+            c.route.include_interface = include.iter().map(|s| s.to_string()).collect();
+            c.route.exclude_interface = exclude.iter().map(|s| s.to_string()).collect();
+            c.route.route_exclude_address = vec![lan_net];
+        });
+        let rules = run(sh("ip rule"));
+        let judged = queue_stats(100).unwrap()[7];
+        lan("outside");
+        assert_eq!(
+            queue_stats(100).unwrap()[7],
+            judged,
+            "the spared LAN was judged"
+        );
+        local_echoed();
+        instance.shutdown().unwrap();
+        println!("include {include:?} exclude {exclude:?}: LAN spared, local captured\n{rules}");
+    }
+    let mut instance = start_custom(Arc::new(ByPort), |c| {
+        c.route.include_interface = vec!["v56d".into()];
+        c.route.route_exclude_address = vec![lan_net];
+    });
+    let table = run(sh(&format!("{NFT} list table inet vfawn_redirect_{TUN}")));
+    assert!(
+        !table.contains("output_prematch"),
+        "no output chain: {table}"
+    );
+    local_direct();
+    lan("captured-udp");
+    instance.shutdown().unwrap();
+    println!("include [v56d]: local spared, LAN captured");
+    println!("forward ok (docker, capture range and interface filters included)");
 }
 
 /// Docker's iptables-nft shape, as far as forwarding is concerned: a
@@ -907,7 +969,14 @@ fn wait_for_docker_rules(count: usize) {
 
 /// The LAN client's side of [`body_forward`].
 fn body_lan() {
-    if env_is("VFAWN_056_LAN", "outside") {
+    if env_is("VFAWN_056_LAN", "captured-udp") {
+        let socket = udp_socket(Duration::from_secs(2));
+        assert_eq!(
+            udp_exchange(&socket, 9090, b"ping").expect("lan captured udp"),
+            "ping"
+        );
+        println!("lan captured ok");
+    } else if env_is("VFAWN_056_LAN", "outside") {
         // Forwarded, untouched: the server sees the LAN client itself.
         let socket = udp_socket(Duration::from_secs(2));
         assert_eq!(
