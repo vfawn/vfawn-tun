@@ -19,6 +19,7 @@ use vfawn_stack_user::native_backend::cost_probe_support::{
 };
 use vfawn_stack_user::shards::{BufferPool, SlotLogic};
 
+#[expect(clippy::too_many_arguments)]
 fn v4_packet(
     src: Ipv4Addr,
     sport: u16,
