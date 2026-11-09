@@ -376,6 +376,44 @@ fn the_bypass_rule_follows_the_escape_and_precedes_the_capture() {
 }
 
 #[test]
+fn the_table_holds_the_capture_range_only() {
+    let params = |captured: &'static [ipnet::IpNet]| RouteParams {
+        interface: "tun0",
+        addresses: &[],
+        captured,
+        excluded: &[],
+        table_index: 2022,
+        rule_index: 9000,
+        mark: 0,
+        bypass_mark: 0,
+        capture_mark: 0,
+        strict_route: false,
+        dns_leak_prevention: false,
+        include_uid: &[],
+        exclude_uid: &[],
+    };
+    let destinations = |d: &DesiredState| -> Vec<String> {
+        d.routes.iter().map(|r| r.destination.to_string()).collect()
+    };
+    // Nothing configured: the default route captures everything.
+    assert_eq!(
+        destinations(&desired_from_config(&params(&[]))),
+        ["0.0.0.0/0"]
+    );
+    // Prefixes configured: those and only those, as sing-tun's
+    // BuildAutoRouteRanges; anything else misses the table and falls
+    // through to the main table.
+    let captured: &'static [ipnet::IpNet] = Box::leak(Box::new([
+        "198.51.100.0/24".parse().unwrap(),
+        "203.0.113.7/24".parse().unwrap(),
+    ]));
+    assert_eq!(
+        destinations(&desired_from_config(&params(captured))),
+        ["198.51.100.0/24", "203.0.113.0/24"]
+    );
+}
+
+#[test]
 fn strict_route_adds_unreachable_rule() {
     let strict = desired_from_config(&RouteParams {
         interface: "t",

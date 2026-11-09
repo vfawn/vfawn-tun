@@ -224,8 +224,8 @@ pub struct RouteParams<'a> {
 /// Build a desired state from the host configuration; this is the
 /// entry point that connects `VfawnConfig` to the route engine.
 ///
-/// The dedicated table gets a default route plus one route per captured
-/// prefix. Policy rules follow the five-step pattern: exclusions bypass,
+/// The dedicated table gets one route per captured prefix, or a default
+/// route when no prefix is configured. Policy rules follow the five-step pattern: exclusions bypass,
 /// strict-route family blocks, captured-prefix lookups, suppress
 /// default-route fallback, and DNS leak prevention.
 pub fn desired_from_config(params: &RouteParams<'_>) -> DesiredState {
@@ -258,14 +258,20 @@ pub fn desired_from_config(params: &RouteParams<'_>) -> DesiredState {
         .collect();
 
     let mut routes = Vec::new();
-    // Default route in the dedicated table.
-    routes.push(RouteEntry {
-        table: table_index,
-        destination: "0.0.0.0/0".parse().unwrap(),
-        gateway: None,
-        interface: Some(interface.to_string()),
-        metric: 0,
-    });
+    // The dedicated table holds the capture range and nothing else, as
+    // sing-tun's `BuildAutoRouteRanges` builds it: the configured
+    // prefixes, or the default route when none is configured. A
+    // destination outside the range misses the table, falls through
+    // the capture rule and reaches the main table.
+    if captured.is_empty() {
+        routes.push(RouteEntry {
+            table: table_index,
+            destination: "0.0.0.0/0".parse().unwrap(),
+            gateway: None,
+            interface: Some(interface.to_string()),
+            metric: 0,
+        });
+    }
     // One route per captured prefix, with the host bits masked away:
     // the model's IpNet tolerates them, kernels do not, and a
     // configuration that names the tunnel by its own address
