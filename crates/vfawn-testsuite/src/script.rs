@@ -9,17 +9,20 @@
 //! parsers in vfawn-wire accept. Sharing them keeps every suite on the
 //! same wire format instead of each growing its own copy.
 
-use std::net::{Ipv4Addr, SocketAddrV4};
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 
 /// A scripted client talking to one server address.
 pub struct Script {
-    client: SocketAddrV4,
-    server: SocketAddrV4,
+    client: SocketAddr,
+    server: SocketAddr,
 }
 
 impl Script {
-    pub fn new(client: SocketAddrV4, server: SocketAddrV4) -> Self {
-        Self { client, server }
+    pub fn new(client: impl Into<SocketAddr>, server: impl Into<SocketAddr>) -> Self {
+        Self {
+            client: client.into(),
+            server: server.into(),
+        }
     }
 
     /// A minimal IPv4+TCP packet with the given flags and payload.
@@ -35,6 +38,27 @@ impl Script {
         options: &[u8],
         payload: &[u8],
     ) -> Vec<u8> {
+        match (self.client, self.server) {
+            (SocketAddr::V4(client), SocketAddr::V4(server)) => {
+                self.tcp_v4_with_options(client, server, seq, ack, flags, options, payload)
+            }
+            (SocketAddr::V6(client), SocketAddr::V6(server)) => {
+                self.tcp_v6_with_options(client, server, seq, ack, flags, options, payload)
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    fn tcp_v4_with_options(
+        &self,
+        client: SocketAddrV4,
+        server: SocketAddrV4,
+        seq: u32,
+        ack: u32,
+        flags: u8,
+        options: &[u8],
+        payload: &[u8],
+    ) -> Vec<u8> {
         let padded = options.len().div_ceil(4) * 4;
         let mut packet = Vec::with_capacity(40 + padded + payload.len());
         packet.extend_from_slice(&[0x45, 0x00]);
@@ -42,10 +66,10 @@ impl Script {
         packet.extend_from_slice(&[0x00, 0x01, 0x00, 0x00]);
         packet.extend_from_slice(&[64, 0x06]);
         packet.extend_from_slice(&[0x00, 0x00]);
-        packet.extend_from_slice(&self.client.ip().octets());
-        packet.extend_from_slice(&self.server.ip().octets());
-        packet.extend_from_slice(&self.client.port().to_be_bytes());
-        packet.extend_from_slice(&self.server.port().to_be_bytes());
+        packet.extend_from_slice(&client.ip().octets());
+        packet.extend_from_slice(&server.ip().octets());
+        packet.extend_from_slice(&client.port().to_be_bytes());
+        packet.extend_from_slice(&server.port().to_be_bytes());
         packet.extend_from_slice(&seq.to_be_bytes());
         packet.extend_from_slice(&ack.to_be_bytes());
         packet.push((((20 + padded) / 4) as u8) << 4);
@@ -60,8 +84,8 @@ impl Script {
         packet[10] = (ipv4_sum >> 8) as u8;
         packet[11] = ipv4_sum as u8;
         let pseudo = pseudo_header(
-            self.client.ip(),
-            self.server.ip(),
+            client.ip(),
+            server.ip(),
             6,
             (20 + padded + payload.len()) as u32,
         );
@@ -73,49 +97,7 @@ impl Script {
     }
 
     pub fn tcp(&self, seq: u32, ack: u32, flags: u8, payload: &[u8]) -> Vec<u8> {
-        let mut packet = Vec::with_capacity(20 + 20 + payload.len());
-
-        // IPv4 header (RFC 791): 20 bytes, protocol 6.
-        packet.extend_from_slice(&[0x45, 0x00]);
-        packet.extend_from_slice(&((20 + 20 + payload.len()) as u16).to_be_bytes());
-        packet.extend_from_slice(&[0x00, 0x01, 0x00, 0x00]); // id, flags
-        packet.extend_from_slice(&[64, 0x06]); // ttl, proto
-        packet.extend_from_slice(&[0x00, 0x00]); // checksum, fixed below
-        packet.extend_from_slice(&self.client.ip().octets());
-        packet.extend_from_slice(&self.server.ip().octets());
-
-        // TCP header (RFC 9293): 20 bytes.
-        packet.extend_from_slice(&self.client.port().to_be_bytes());
-        packet.extend_from_slice(&self.server.port().to_be_bytes());
-        packet.extend_from_slice(&seq.to_be_bytes());
-        packet.extend_from_slice(&ack.to_be_bytes());
-        packet.push(0x50); // data offset 5, no options
-        packet.push(flags);
-        packet.extend_from_slice(&0xffffu16.to_be_bytes()); // window
-        packet.extend_from_slice(&[0x00, 0x00]); // checksum, fixed below
-        packet.extend_from_slice(&[0x00, 0x00]); // urgent
-
-        // The payload joins the packet before any checksum runs: the
-        // transport checksum covers it, and computing it over the bare
-        // header happened to pass only for all-zero payloads, which is
-        // how the bug survived every zero-filled consumer until a stack
-        // that verifies checksums met a nonzero one.
-        packet.extend_from_slice(payload);
-
-        let ipv4_sum = checksum(&packet[..20]);
-        packet[10] = (ipv4_sum >> 8) as u8;
-        packet[11] = ipv4_sum as u8;
-
-        let pseudo = pseudo_header(
-            self.client.ip(),
-            self.server.ip(),
-            6,
-            (20 + payload.len()) as u32,
-        );
-        let segment_sum = checksum_with_carry(pseudo, &packet[20..]);
-        packet[36] = (segment_sum >> 8) as u8;
-        packet[37] = segment_sum as u8;
-        packet
+        self.tcp_with_options(seq, ack, flags, &[], payload)
     }
 
     /// A minimal IPv4+UDP datagram from the client to the server.
@@ -128,12 +110,17 @@ impl Script {
         packet.extend_from_slice(&[0x00, 0x01, 0x00, 0x00]);
         packet.extend_from_slice(&[64, 0x11]); // ttl, proto
         packet.extend_from_slice(&[0x00, 0x00]); // checksum, fixed below
-        packet.extend_from_slice(&self.client.ip().octets());
-        packet.extend_from_slice(&self.server.ip().octets());
+        let (SocketAddr::V4(client), SocketAddr::V4(server)) = (self.client, self.server) else {
+            // The datagram builder speaks v4 today; the corpus's UDP
+            // legs are v4 by construction.
+            return Vec::new();
+        };
+        packet.extend_from_slice(&client.ip().octets());
+        packet.extend_from_slice(&server.ip().octets());
 
         // UDP header (RFC 768): 8 bytes.
-        packet.extend_from_slice(&self.client.port().to_be_bytes());
-        packet.extend_from_slice(&self.server.port().to_be_bytes());
+        packet.extend_from_slice(&client.port().to_be_bytes());
+        packet.extend_from_slice(&server.port().to_be_bytes());
         packet.extend_from_slice(&((8 + payload.len()) as u16).to_be_bytes());
         packet.extend_from_slice(&[0x00, 0x00]); // checksum, fixed below
 
@@ -143,12 +130,7 @@ impl Script {
         packet[10] = (ipv4_sum >> 8) as u8;
         packet[11] = ipv4_sum as u8;
 
-        let pseudo = pseudo_header(
-            self.client.ip(),
-            self.server.ip(),
-            17,
-            (8 + payload.len()) as u32,
-        );
+        let pseudo = pseudo_header(client.ip(), server.ip(), 17, (8 + payload.len()) as u32);
         let datagram_sum = checksum_with_carry(pseudo, &packet[20..]);
         packet[26] = (datagram_sum >> 8) as u8;
         packet[27] = datagram_sum as u8;
@@ -224,5 +206,65 @@ fn pseudo_header(src: &Ipv4Addr, dst: &Ipv4Addr, protocol: u8, length: u32) -> u
     }
     sum += protocol as u32;
     sum += length;
+    sum
+}
+
+impl Script {
+    /// The v6 envelope: forty bytes of header (RFC 8200 — no header
+    /// checksum, the payload-length field, next-header TCP), the same
+    /// TCP segment on top, and the transport checksum the family
+    /// makes mandatory (RFC 8200 §8.1: an upper-layer checksum must
+    /// cover the v6 pseudo-header).
+    fn tcp_v6_with_options(
+        &self,
+        client: std::net::SocketAddrV6,
+        server: std::net::SocketAddrV6,
+        seq: u32,
+        ack: u32,
+        flags: u8,
+        options: &[u8],
+        payload: &[u8],
+    ) -> Vec<u8> {
+        let padded = options.len().div_ceil(4) * 4;
+        let segment_len = 20 + padded + payload.len();
+        let mut packet = Vec::with_capacity(40 + segment_len);
+        packet.extend_from_slice(&[0x60, 0x00, 0x00, 0x00]);
+        packet.extend_from_slice(&(segment_len as u16).to_be_bytes());
+        packet.extend_from_slice(&[0x06, 0x40]); // next header TCP, hop 64
+        packet.extend_from_slice(&client.ip().octets());
+        packet.extend_from_slice(&server.ip().octets());
+        packet.extend_from_slice(&client.port().to_be_bytes());
+        packet.extend_from_slice(&server.port().to_be_bytes());
+        packet.extend_from_slice(&seq.to_be_bytes());
+        packet.extend_from_slice(&ack.to_be_bytes());
+        packet.push((((20 + padded) / 4) as u8) << 4);
+        packet.push(flags);
+        packet.extend_from_slice(&0xffffu16.to_be_bytes());
+        packet.extend_from_slice(&[0x00, 0x00]);
+        packet.extend_from_slice(&[0x00, 0x00]);
+        packet.extend_from_slice(options);
+        packet.extend(std::iter::repeat_n(1, padded - options.len()));
+        packet.extend_from_slice(payload);
+        let pseudo = pseudo_header_v6(*client.ip(), *server.ip(), segment_len as u32);
+        let segment_sum = checksum_with_carry(pseudo, &packet[40..]);
+        packet[40 + 16] = (segment_sum >> 8) as u8;
+        packet[40 + 17] = segment_sum as u8;
+        packet
+    }
+}
+
+/// The v6 pseudo-header's one's-complement sum: source, destination,
+/// the segment length as thirty-two bits, zeros, and the next header
+/// (RFC 8200 §8.1).
+fn pseudo_header_v6(src: std::net::Ipv6Addr, dst: std::net::Ipv6Addr, segment_len: u32) -> u32 {
+    let mut sum: u32 = 0;
+    for part in src.octets().as_chunks::<2>().0 {
+        sum = sum.wrapping_add(u32::from(u16::from_be_bytes(*part)));
+    }
+    for part in dst.octets().as_chunks::<2>().0 {
+        sum = sum.wrapping_add(u32::from(u16::from_be_bytes(*part)));
+    }
+    sum = sum.wrapping_add(segment_len);
+    sum = sum.wrapping_add(6); // next header: TCP
     sum
 }

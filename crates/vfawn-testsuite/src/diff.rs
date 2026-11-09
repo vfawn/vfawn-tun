@@ -98,18 +98,22 @@ pub enum Step {
 pub struct Scenario {
     pub name: String,
     /// The client (remote, packet sender) side.
-    pub client: SocketAddrV4,
+    pub client: std::net::SocketAddr,
     /// The stack under test listens here.
-    pub server: SocketAddrV4,
+    pub server: std::net::SocketAddr,
     pub steps: Vec<Step>,
 }
 
 impl Scenario {
-    pub fn new(name: &str, client: SocketAddrV4, server: SocketAddrV4) -> Self {
+    pub fn new(
+        name: &str,
+        client: impl Into<std::net::SocketAddr>,
+        server: impl Into<std::net::SocketAddr>,
+    ) -> Self {
         Self {
             name: name.to_string(),
-            client,
-            server,
+            client: client.into(),
+            server: server.into(),
             steps: Vec::new(),
         }
     }
@@ -292,6 +296,32 @@ pub fn corpus_client(variant: u8) -> SocketAddrV4 {
 
 pub fn corpus_server(_variant: u8) -> SocketAddrV4 {
     SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 200), 80)
+}
+
+/// The documentation range's v6 wing (RFC 3849: 2001:db8::/32): the
+/// corpus's v6 conversations live here, one client per variant, one
+/// server for them all — the same shape the v4 twins use.
+pub fn corpus_client_v6(variant: u8) -> std::net::SocketAddr {
+    std::net::SocketAddr::new(
+        std::net::IpAddr::V6(std::net::Ipv6Addr::new(
+            0x2001,
+            0xdb8,
+            0,
+            0,
+            0,
+            0,
+            0,
+            1 + u16::from(variant % 8),
+        )),
+        40000 + (variant as u16) * 13,
+    )
+}
+
+pub fn corpus_server_v6() -> std::net::SocketAddr {
+    std::net::SocketAddr::new(
+        std::net::IpAddr::V6(std::net::Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0xc8)),
+        80,
+    )
 }
 
 /// Run a batch of scenarios and panic with the first failure's report;

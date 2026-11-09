@@ -20,7 +20,7 @@ use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
 use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
 use smoltcp::socket::tcp::{Socket as TcpSocket, SocketBuffer};
 use smoltcp::time::Instant;
-use smoltcp::wire::{HardwareAddress, IpAddress, IpCidr};
+use smoltcp::wire::{HardwareAddress, IpAddress, IpCidr, Ipv6Address};
 
 use crate::diff::{Scenario, SegmentRecord, StackDriver, Step};
 
@@ -206,13 +206,30 @@ impl StackDriver for SmoltcpDriver {
         let config = Config::new(HardwareAddress::Ip);
         let mut iface = Interface::new(config, &mut device, Instant::from_millis(0));
         iface.update_ip_addrs(|addrs| {
-            let octets = scenario.server.ip().octets();
-            addrs
-                .push(IpCidr::new(
-                    IpAddress::v4(octets[0], octets[1], octets[2], octets[3]),
-                    24,
-                ))
-                .ok();
+            let cidr = match scenario.server.ip() {
+                std::net::IpAddr::V4(addr) => {
+                    let o = addr.octets();
+                    IpCidr::new(IpAddress::v4(o[0], o[1], o[2], o[3]), 24)
+                }
+                std::net::IpAddr::V6(addr) => {
+                    let o = addr.octets();
+                    let seg = |i: usize| u16::from_be_bytes([o[i], o[i + 1]]);
+                    IpCidr::new(
+                        IpAddress::from(Ipv6Address::new(
+                            seg(0),
+                            seg(2),
+                            seg(4),
+                            seg(6),
+                            seg(8),
+                            seg(10),
+                            seg(12),
+                            seg(14),
+                        )),
+                        64,
+                    )
+                }
+            };
+            addrs.push(cidr).ok();
         });
         let rx = SocketBuffer::new(vec![0; 128 * 1024]);
         let tx = SocketBuffer::new(vec![0; 128 * 1024]);
@@ -283,10 +300,19 @@ impl SmoltcpDriver {
 
 /// Wire truth extraction: only what a peer could observe.
 fn parse_record(frame: &[u8], at_ms: u64) -> Option<SegmentRecord> {
-    let (ip, payload) = vfawn_wire::ipv4::Ipv4Header::parse(frame).ok()?;
-    if ip.protocol != vfawn_wire::protocol::IpProtocol::Tcp {
-        return None;
-    }
+    let payload = if frame.first().is_some_and(|b| b >> 4 == 4) {
+        let (ip, rest) = vfawn_wire::ipv4::Ipv4Header::parse(frame).ok()?;
+        if ip.protocol != vfawn_wire::protocol::IpProtocol::Tcp {
+            return None;
+        }
+        rest
+    } else {
+        let (ip, rest) = vfawn_wire::ipv6::Ipv6Header::parse(frame).ok()?;
+        if ip.next_header != vfawn_wire::protocol::IpProtocol::Tcp {
+            return None;
+        }
+        rest
+    };
     let (tcp, seg_payload) = vfawn_wire::tcp::TcpHeader::parse(payload).ok()?;
     Some(SegmentRecord {
         at_ms,

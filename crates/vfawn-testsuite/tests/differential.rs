@@ -30,10 +30,28 @@ struct Builder {
     script: Script,
 }
 
+/// The corpus's address pair for a variant: the low half speaks v4,
+/// the high half (variants from 128) the same conversation shape on
+/// the documentation range's v6 wing.
+fn corpus_pair(variant: u8) -> (std::net::SocketAddr, std::net::SocketAddr) {
+    if variant >= 128 {
+        (
+            vfawn_testsuite::diff::corpus_client_v6(variant),
+            vfawn_testsuite::diff::corpus_server_v6(),
+        )
+    } else {
+        (
+            std::net::SocketAddr::from(corpus_client(variant)),
+            std::net::SocketAddr::from(corpus_server(variant)),
+        )
+    }
+}
+
 impl Builder {
     fn new(variant: u8) -> Self {
+        let (client, server) = corpus_pair(variant);
         Self {
-            script: Script::new(corpus_client(variant), corpus_server(variant)),
+            script: Script::new(client, server),
         }
     }
 
@@ -67,9 +85,34 @@ impl Builder {
     }
 }
 
-/// Re-fix the TCP checksum after an in-place header edit.
+/// Re-fix the TCP checksum after an in-place header edit, under
+/// either family's pseudo-header.
 fn recompute_tcp_checksum(packet: &mut [u8]) {
     use std::net::IpAddr;
+    if packet[0] >> 4 == 6 {
+        let (ip, _) = vfawn_wire::ipv6::Ipv6Header::parse(packet).expect("parse after edit");
+        let tcp_len = packet.len() - 40;
+        packet[40 + 16] = 0;
+        packet[40 + 17] = 0;
+        let src = IpAddr::V6(ip.src);
+        let dst = IpAddr::V6(ip.dst);
+        let pseudo = vfawn_wire::checksum::pseudo_header_v6(
+            match src {
+                IpAddr::V6(a) => a,
+                _ => unreachable!(),
+            },
+            match dst {
+                IpAddr::V6(a) => a,
+                _ => unreachable!(),
+            },
+            vfawn_wire::protocol::IpProtocol::Tcp,
+            tcp_len as u32,
+        );
+        let sum = pseudo + vfawn_wire::checksum::sum_words(&packet[40..]);
+        let fixed = !vfawn_wire::checksum::fold(sum);
+        packet[40 + 16..40 + 18].copy_from_slice(&fixed.to_be_bytes());
+        return;
+    }
     let (ip, _) = vfawn_wire::ipv4::Ipv4Header::parse(packet).expect("parse after edit");
     // Zero the field, recompute over pseudo header plus segment.
     packet[20 + 16] = 0;
@@ -119,7 +162,7 @@ fn probe_oracle_isn() -> u32 {
 }
 
 fn handshake_scenario(name: &str, variant: u8, syn_retransmits: u32) -> Scenario {
-    let mut scenario = Scenario::new(name, corpus_client(variant), corpus_server(variant));
+    let mut scenario = Scenario::new(name, corpus_pair(variant).0, corpus_pair(variant).1);
     let builder = Builder::new(variant);
     scenario.inject(0, builder.syn(5000));
     for _ in 0..syn_retransmits {
@@ -138,7 +181,7 @@ fn transfer_scenario(
     reorder: bool,
     teardown: Teardown,
 ) -> Scenario {
-    let mut scenario = Scenario::new(name, corpus_client(variant), corpus_server(variant));
+    let mut scenario = Scenario::new(name, corpus_pair(variant).0, corpus_pair(variant).1);
     let builder = Builder::new(variant);
 
     // Handshake.
@@ -206,7 +249,7 @@ enum Teardown {
 fn wait_scenario(name: &str, variant: u8, segments: usize, segment_len: usize) -> Scenario {
     // A transfer whose tail is lost, then long waits: retransmission
     // timers must fire in both drivers at comparable points.
-    let mut scenario = Scenario::new(name, corpus_client(variant), corpus_server(variant));
+    let mut scenario = Scenario::new(name, corpus_pair(variant).0, corpus_pair(variant).1);
     let builder = Builder::new(variant);
     scenario.inject(0, builder.syn(5000));
     let mut client_seq = 5001;
@@ -241,7 +284,7 @@ fn wait_scenario(name: &str, variant: u8, segments: usize, segment_len: usize) -
 }
 
 fn window_scenario(name: &str, variant: u8, freeze: bool) -> Scenario {
-    let mut scenario = Scenario::new(name, corpus_client(variant), corpus_server(variant));
+    let mut scenario = Scenario::new(name, corpus_pair(variant).0, corpus_pair(variant).1);
     let builder = Builder::new(variant);
     scenario.inject(0, builder.syn(5000));
     let mut client_seq = 5001;
@@ -263,7 +306,7 @@ fn window_scenario(name: &str, variant: u8, freeze: bool) -> Scenario {
 
 /// Duplicate delivery of an already-acked segment plus repeated ACKs.
 fn dup_scenario(name: &str, variant: u8, dups: usize) -> Scenario {
-    let mut scenario = Scenario::new(name, corpus_client(variant), corpus_server(variant));
+    let mut scenario = Scenario::new(name, corpus_pair(variant).0, corpus_pair(variant).1);
     let builder = Builder::new(variant);
     scenario.inject(0, builder.syn(5000));
     let client_seq = 5001;
@@ -380,6 +423,81 @@ fn corpus() -> Vec<Scenario> {
             }
         }
         let _ = index;
+    }
+
+    // The v6 wing: the same conversation shapes on the documentation
+    // range's v6 addresses (variants from 128) — the family axis is
+    // the envelope and the pseudo-header, and every behavior the v4
+    // corpus pins must hold identically under the forty-byte header.
+    let v6_sizes = [(2usize, 100usize), (4, 512), (8, 1400)];
+    for (segments, segment_len) in v6_sizes {
+        for variant in 128u8..132 {
+            all.push(handshake_scenario(
+                &format!("v6-syn-only-{segments}x{segment_len}-v{variant}"),
+                variant,
+                0,
+            ));
+            all.push(transfer_scenario(
+                &format!("v6-bulk-{segments}x{segment_len}-v{variant}"),
+                variant,
+                segments,
+                segment_len,
+                &[],
+                false,
+                Teardown::None,
+            ));
+            all.push(transfer_scenario(
+                &format!("v6-bulk-fin-{segments}x{segment_len}-v{variant}"),
+                variant,
+                segments,
+                segment_len,
+                &[],
+                false,
+                Teardown::Fin,
+            ));
+            all.push(transfer_scenario(
+                &format!("v6-loss-mid-{segments}x{segment_len}-v{variant}"),
+                variant,
+                segments.max(2),
+                segment_len,
+                &[1],
+                false,
+                Teardown::None,
+            ));
+            all.push(transfer_scenario(
+                &format!("v6-reorder-{segments}x{segment_len}-v{variant}"),
+                variant,
+                segments.max(2),
+                segment_len,
+                &[],
+                true,
+                Teardown::None,
+            ));
+        }
+    }
+    for variant in 128u8..134 {
+        all.push(handshake_scenario(
+            &format!("v6-syn-retransmit-v{variant}"),
+            variant,
+            2,
+        ));
+        all.push(wait_scenario(
+            &format!("v6-rto-recover-v{variant}"),
+            variant,
+            4,
+            512,
+        ));
+        all.push(window_scenario(
+            &format!("v6-window-flow-v{variant}"),
+            variant,
+            false,
+        ));
+        all.push(window_scenario(
+            &format!("v6-window-zero-v{variant}"),
+            variant,
+            true,
+        ));
+        all.push(dup_scenario(&format!("v6-dup-2-v{variant}"), variant, 2));
     }
 
     for variant in 0u8..6 {

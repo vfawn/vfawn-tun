@@ -13,7 +13,7 @@
 
 use std::collections::VecDeque;
 
-use vfawn_stack_user::native_tcp::{Inbound, NativeTcpConnection, Reaction, emit_v4};
+use vfawn_stack_user::native_tcp::{Inbound, NativeTcpConnection, Reaction, emit_tcp};
 use vfawn_wire::ipv4::Ipv4Header;
 use vfawn_wire::protocol::IpProtocol;
 use vfawn_wire::tcp::TcpHeader;
@@ -50,8 +50,8 @@ pub struct NativeTcpDriver {
     data_sent_at: Option<u64>,
     data_retries: u32,
     /// The scenario's endpoints, for emitting wire bytes.
-    server: std::net::SocketAddrV4,
-    client: std::net::SocketAddrV4,
+    server: std::net::SocketAddr,
+    client: std::net::SocketAddr,
     /// Application bytes acknowledged but not yet sent back.
     echo_backlog: VecDeque<Vec<u8>>,
     now_ms: u64,
@@ -71,8 +71,14 @@ impl NativeTcpDriver {
             flight_base: 0,
             data_sent_at: None,
             data_retries: 0,
-            server: std::net::SocketAddrV4::new(std::net::Ipv4Addr::UNSPECIFIED, 0),
-            client: std::net::SocketAddrV4::new(std::net::Ipv4Addr::UNSPECIFIED, 0),
+            server: std::net::SocketAddr::from(std::net::SocketAddrV4::new(
+                std::net::Ipv4Addr::UNSPECIFIED,
+                0,
+            )),
+            client: std::net::SocketAddr::from(std::net::SocketAddrV4::new(
+                std::net::Ipv4Addr::UNSPECIFIED,
+                0,
+            )),
             echo_backlog: VecDeque::new(),
             now_ms: 0,
         }
@@ -148,7 +154,7 @@ impl NativeTcpDriver {
         }
         self.synack_retries += 1;
         self.synack_at = Some(self.now_ms);
-        let frame = emit_v4(self.server, self.client, &reaction, &[], &[]);
+        let frame = emit_tcp(self.server, self.client, &reaction, &[], &[]);
         self.record_of(&frame).into_iter().collect()
     }
 
@@ -192,7 +198,7 @@ impl NativeTcpDriver {
                 held: false,
                 gap_filled: false,
             };
-            let frame = emit_v4(
+            let frame = emit_tcp(
                 self.server,
                 self.client,
                 &reaction,
@@ -222,12 +228,23 @@ impl NativeTcpDriver {
     /// Parse one packet, hand its TCP part to the connection, queue the
     /// echo of anything delivered.
     fn consume(&mut self, packet: &[u8]) -> Reaction {
-        let Ok((ip, payload)) = Ipv4Header::parse(packet) else {
-            return Reaction::silent();
+        let payload = if packet.first().is_some_and(|b| b >> 4 == 4) {
+            let Ok((ip, rest)) = Ipv4Header::parse(packet) else {
+                return Reaction::silent();
+            };
+            if ip.protocol != IpProtocol::Tcp {
+                return Reaction::silent();
+            }
+            rest
+        } else {
+            let Ok((ip, rest)) = vfawn_wire::ipv6::Ipv6Header::parse(packet) else {
+                return Reaction::silent();
+            };
+            if ip.next_header != IpProtocol::Tcp {
+                return Reaction::silent();
+            }
+            rest
         };
-        if ip.protocol != IpProtocol::Tcp {
-            return Reaction::silent();
-        }
         let Ok((header, _rest)) = TcpHeader::parse(payload) else {
             return Reaction::silent();
         };
@@ -278,7 +295,7 @@ impl NativeTcpDriver {
         // stall the gap fill, so it never folds.
         let immediate = (send.held || send.gap_filled) && bare_ack_only;
         if send.flags != 0 && (immediate || !(echo_pending && bare_ack_only)) {
-            let frame = emit_v4(self.server, self.client, &send, &[], &[]);
+            let frame = emit_tcp(self.server, self.client, &send, &[], &[]);
             if let Some(record) = self.record_of(&frame) {
                 records.push(record);
             }
@@ -310,7 +327,7 @@ impl NativeTcpDriver {
                     held: false,
                     gap_filled: false,
                 };
-                let frame = emit_v4(self.server, self.client, &send, &[], data);
+                let frame = emit_tcp(self.server, self.client, &send, &[], data);
                 if let Some(record) = self.record_of(&frame) {
                     records.push(record);
                 }
@@ -332,10 +349,19 @@ impl NativeTcpDriver {
     }
 
     fn record_of(&self, frame: &[u8]) -> Option<SegmentRecord> {
-        let (ip, payload) = Ipv4Header::parse(frame).ok()?;
-        if ip.protocol != IpProtocol::Tcp {
-            return None;
-        }
+        let payload = if frame.first().is_some_and(|b| b >> 4 == 4) {
+            let (ip, rest) = Ipv4Header::parse(frame).ok()?;
+            if ip.protocol != IpProtocol::Tcp {
+                return None;
+            }
+            rest
+        } else {
+            let (ip, rest) = vfawn_wire::ipv6::Ipv6Header::parse(frame).ok()?;
+            if ip.next_header != IpProtocol::Tcp {
+                return None;
+            }
+            rest
+        };
         let (tcp, seg_payload) = TcpHeader::parse(payload).ok()?;
         Some(SegmentRecord {
             at_ms: self.now_ms,
