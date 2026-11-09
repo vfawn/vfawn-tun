@@ -125,7 +125,14 @@ pub struct TcpSlot {
     refused: bool,
     /// Unacknowledged sent bytes, contiguous from `flight_base`
     /// (RFC 9293 §3.3.1's send buffer): what a retransmission owes.
+    /// The head cursor marks where live data begins: an acknowledgment
+    /// advances the cursor instead of draining the front — the drain
+    /// once memmoved the whole remaining window on every partial
+    /// acknowledgment, a tax the ACK clock paid on every segment. The
+    /// compaction (one drain when live data extends behind a cursor)
+    /// amortizes to a copy per window.
     flight: Vec<u8>,
+    flight_head: usize,
     flight_base: u32,
     data_sent_at: Option<Instant>,
     data_retries: u32,
@@ -251,6 +258,12 @@ impl TcpSlot {
         }
     }
 
+    /// The bytes of the flight still owed an acknowledgment: the
+    /// storage behind the cursor is dead until compaction claims it.
+    fn live_flight(&self) -> usize {
+        self.flight.len() - self.flight_head
+    }
+
     /// Move host-written backlog bytes into segments, never letting
     /// what is unacknowledged exceed the congestion window (RFC 5681
     /// §3.1: cwnd bounds SND.NXT minus SND.UNA).
@@ -347,10 +360,16 @@ impl TcpSlot {
                     &write[offset..offset + take],
                 );
                 out.push_back(frame);
-                if self.flight.is_empty() {
+                if self.live_flight() == 0 {
                     self.flight_base = self.connection.send_nxt();
                     self.data_sent_at = Some(Instant::now());
                     self.data_retries = 0;
+                }
+                // Compaction: the cursor's dead prefix leaves once,
+                // before the window's new bytes land behind it.
+                if self.flight_head > 0 {
+                    self.flight.drain(..self.flight_head);
+                    self.flight_head = 0;
                 }
                 self.flight.extend_from_slice(&write[offset..offset + take]);
                 self.connection.send_advance(take as u32);
@@ -386,7 +405,7 @@ impl TcpSlot {
                 self.connection
                     .send_nxt()
                     .wrapping_sub(self.connection.send_una()),
-                self.flight.len(),
+                self.live_flight(),
                 self.data_retries,
                 self.persist_at.is_some(),
                 self.fin_at.is_some(),
@@ -406,7 +425,7 @@ impl TcpSlot {
             .send_nxt()
             .wrapping_sub(self.connection.send_una());
         if lane.bytes > 0
-            && self.flight.is_empty()
+            && self.live_flight() == 0
             && inflight == 0
             && self.cc.window().min(self.connection.peer_window()) == 0
             && self.persist_at.is_none()
@@ -460,6 +479,7 @@ impl TcpSlot {
         out.push_back(BytesMut::from(&frame[..]));
         self.connection.abandon();
         self.flight.clear();
+        self.flight_head = 0;
         self.data_sent_at = None;
         self.fin_at = None;
         self.persist_at = None;
@@ -681,17 +701,18 @@ impl SlotLogic for TcpSlot {
         // (SND.UNA), never by the raw ACK field: an acknowledgment
         // beyond what was sent moves nothing (RFC 9293 §3.3.6).
         let una = self.connection.send_una();
-        if !self.flight.is_empty() {
-            let end = self.flight_base.wrapping_add(self.flight.len() as u32);
+        if self.live_flight() > 0 {
+            let live = self.live_flight();
+            let end = self.flight_base.wrapping_add(live as u32);
             let fully_acked = una == end || una.wrapping_sub(end) < u32::MAX / 2;
             if fully_acked {
                 self.flight.clear();
+                self.flight_head = 0;
                 self.data_sent_at = None;
                 self.data_retries = 0;
             } else if una.wrapping_sub(self.flight_base) < u32::MAX / 2 {
-                let drop_bytes =
-                    (una.wrapping_sub(self.flight_base) as usize).min(self.flight.len());
-                self.flight.drain(..drop_bytes);
+                let drop_bytes = (una.wrapping_sub(self.flight_base) as usize).min(live);
+                self.flight_head += drop_bytes;
                 self.flight_base = una;
                 // An acknowledgment that advanced proves the path is
                 // carrying: the remaining flight gets a fresh timeout
@@ -917,8 +938,12 @@ impl SlotLogic for TcpSlot {
                             let frame =
                                 emit_tcp(self.server, self.client, &reaction, &[], &[probe]);
                             out.push_back(BytesMut::from(&frame[..]));
-                            if self.flight.is_empty() {
+                            if self.live_flight() == 0 {
                                 self.flight_base = self.connection.send_nxt();
+                            }
+                            if self.flight_head > 0 {
+                                self.flight.drain(..self.flight_head);
+                                self.flight_head = 0;
                             }
                             self.flight.push(probe);
                             self.connection.send_advance(1);
@@ -961,10 +986,12 @@ impl SlotLogic for TcpSlot {
                     .window()
                     .min(self.connection.peer_window())
                     .saturating_sub(1) as usize;
+                let live = self.live_flight();
+                let head = self.flight_head;
                 let mut offset = 0usize;
-                while offset < self.flight.len() && offset < budget {
-                    let take = (self.flight.len() - offset).min(mss).min(budget - offset);
-                    let more_after = offset + take < self.flight.len();
+                while offset < live && offset < budget {
+                    let take = (live - offset).min(mss).min(budget - offset);
+                    let more_after = offset + take < live;
                     let reaction = Reaction {
                         seq: self.flight_base.wrapping_add(offset as u32),
                         ack: self.connection.recv_nxt(),
@@ -979,7 +1006,7 @@ impl SlotLogic for TcpSlot {
                         self.client,
                         &reaction,
                         &[],
-                        &self.flight[offset..offset + take],
+                        &self.flight[head + offset..head + offset + take],
                     );
                     out.push_back(BytesMut::from(&frame[..]));
                     offset += take;
@@ -1028,7 +1055,7 @@ impl SlotLogic for TcpSlot {
         if matches!(self.connection.state(), TcpState::Established)
             && self.keepalive_at.is_none()
             && self.connection.send_una() == self.connection.send_nxt()
-            && self.flight.is_empty()
+            && self.live_flight() == 0
             && self.write_lane.lock().expect("write lane").bytes == 0
         {
             // The arm happens only after the full idle window of
@@ -1401,6 +1428,7 @@ impl StackBackend for NativeBackend {
                     judged: false,
                     refused: false,
                     flight: Vec::new(),
+                    flight_head: 0,
                     flight_base: 0,
                     data_sent_at: None,
                     data_retries: 0,
@@ -1648,6 +1676,7 @@ pub mod cost_probe_support {
             judged: true,
             refused: false,
             flight: Vec::new(),
+            flight_head: 0,
             flight_base: 0,
             data_sent_at: None,
             data_retries: 0,
@@ -1731,6 +1760,7 @@ mod tests {
             judged: false,
             refused: false,
             flight: Vec::new(),
+            flight_head: 0,
             flight_base: 0,
             data_sent_at: None,
             data_retries: 0,
