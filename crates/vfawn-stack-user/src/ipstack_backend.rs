@@ -20,7 +20,7 @@
 
 use std::io;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use async_trait::async_trait;
 
@@ -33,6 +33,7 @@ use vfawn_core::{
 };
 
 use crate::ipstack_bridge;
+use crate::syn_gate::SynGate;
 
 /// Configuration for the transitional ipstack backend.
 #[derive(Clone)]
@@ -53,6 +54,14 @@ pub struct IpstackBackend {
     /// The device's directed broadcast, dropped by the bridge with the
     /// other non-unicast destinations.
     pub broadcast: Option<std::net::Ipv4Addr>,
+    /// The host's runtime, when the host has one to lend. Sessions then
+    /// run beside the host's own tasks — the handler can share pools,
+    /// timers and connections with the rest of the host without
+    /// crossing runtimes — and the backend builds no runtime of its own.
+    /// `None` keeps the backend self-contained on a private runtime.
+    /// Must be multi-threaded: ipstack tears streams down through
+    /// `block_in_place`, which the current-thread flavor rejects.
+    pub runtime: Option<tokio::runtime::Handle>,
 }
 
 impl Default for IpstackBackend {
@@ -68,6 +77,7 @@ impl Default for IpstackBackend {
             udp_timeout_secs: 300,
             tcp_timeout_secs: 60,
             broadcast: None,
+            runtime: None,
         }
     }
 }
@@ -78,141 +88,208 @@ impl StackBackend for IpstackBackend {
         device: Box<dyn PacketDevice>,
         handler: Arc<dyn SessionHandler>,
     ) -> io::Result<StackHandle> {
-        let handle = StackHandle::new();
+        if let Some(runtime) = &self.runtime
+            && runtime.runtime_flavor() != tokio::runtime::RuntimeFlavor::MultiThread
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "the host runtime must be multi-threaded: ipstack tears streams down with block_in_place",
+            ));
+        }
+        // Tracked: a drain ends when the last session does, and on a
+        // borrowed runtime nothing but the drain's aborts ends the tasks.
+        let handle = StackHandle::tracked();
         let write_device = device.duplicate()?;
         // A third handle whose only job is closing the device when the
-        // runtime stops: the bridge halves live inside their threads,
+        // accept loop stops: the bridge halves live inside their threads,
         // and the TUN interface only disappears once every fd is gone,
         // which a restart that recreates it by name depends on.
         let closer = device.duplicate()?;
-        let sweep_closer = device.duplicate()?;
+        let gate = Arc::new(SynGate::new(Arc::clone(&handler)));
         let bridge = ipstack_bridge::start(
             device,
             write_device,
             Some(Arc::clone(&self.dns)),
             self.broadcast,
+            Some(Arc::clone(&gate)),
             handle.clone(),
         );
-        let bridge_stopper = bridge.stop_flag();
 
-        // The builder returns &mut Self; the final take gives ownership
-        // back for the move into the runtime thread.
         let config = {
             let mut builder = IpStackConfig::default();
             builder.mtu = self.mss + 40;
             builder.udp_timeout(std::time::Duration::from_secs(self.udp_timeout_secs));
             builder
         };
-
-        let stop = handle.clone();
-        let udp_nat = Arc::clone(&self.udp_nat);
-        std::thread::Builder::new()
-            .name("ipstack-runtime".into())
-            .spawn(move || {
-                // A panic in the runtime (a misbehaving handler, a stack
-                // bug) must not take the process down; the stop flag still
-                // works from outside, so shutdown remains reachable.
-                // The runtime moves into a slot so the teardown path can
-                // hand it to a bystander thread even after a panic.
-                let runtime_slot: std::sync::Mutex<Option<tokio::runtime::Runtime>> =
-                    std::sync::Mutex::new(None);
-                let runtime_slot = std::sync::Arc::new(runtime_slot);
-                let slot_for_body = std::sync::Arc::clone(&runtime_slot);
-                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-                    // Multi-thread, not current-thread: ipstack stream
-                    // teardown calls `block_in_place` on drop, which the
-                    // current-thread flavor rejects outright. Worker
-                    // count follows the machine: sessions are tasks and
-                    // two workers left a many-core box mostly idle.
-                    let workers = std::thread::available_parallelism()
-                        .map(|n| n.get())
-                        .unwrap_or(2);
-                    let rt = tokio::runtime::Builder::new_multi_thread()
-                        .worker_threads(workers)
-                        .enable_all()
-                        .build()
-                        .expect("ipstack runtime");
-                    // The runtime lives in the slot so the teardown path
-                    // can hand it to a bystander thread; the guard holds
-                    // it here for the duration of the block_on.
-                    let mut guard = slot_for_body.lock().unwrap();
-                    *guard = Some(rt);
-                    guard.as_ref().unwrap().block_on(async move {
-                        // Idle NAT mappings must not wait for the next
-                        // datagram to be reclaimed; a one-second sweep
-                        // keeps close reports flowing on quiet tables.
-                        let sweep_table = Arc::clone(&udp_nat);
-                        let sweep_stop = stop.clone();
-                        tokio::spawn(async move {
-                            use std::sync::atomic::Ordering;
-                            let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
-                            loop {
-                                tick.tick().await;
-                                if sweep_stop.is_stopped() {
-                                    // The accept loop only notices the stop
-                                    // between streams, and with no traffic
-                                    // that is never; closing the device is
-                                    // what actually unwinds it, which also
-                                    // frees the interface for a restart.
-                                    bridge_stopper.store(true, Ordering::Release);
-                                    let _ = sweep_closer.shutdown();
-                                    break;
-                                }
-                                sweep_table.sweep(std::time::Instant::now());
-                            }
-                        });
-
-                        let mut stack = IpStack::new(config, bridge.io);
-                        loop {
-                            // ipstack's accept has no stop side; waiting
-                            // for it to notice a closed device is what
-                            // kept whole process runs holding their fds.
-                            // The watcher races it and cancels the wait.
-                            tokio::select! {
-                                _ = stop_watcher(&stop) => break,
-                                accepted = stack.accept() => match accepted {
-                                    Ok(stream) => {
-                                        // One task per stream: a flow
-                                        // that wedges in dispatch must
-                                        // cost itself, not the accept
-                                        // loop and every flow behind it.
-                                        let handler = Arc::clone(&handler);
-                                        let udp_nat = Arc::clone(&udp_nat);
-                                        tokio::spawn(async move {
-                                            dispatch(stream, &handler, &udp_nat).await
-                                        });
-                                    }
-                                    Err(_) => break,
-                                },
-                            }
-                        }
-                    });
-                    // Wake the bridge threads out of their device reads
-                    // so the fds close and the interface can be recreated.
-                    let _ = closer.shutdown();
-                }));
-
-                if let Err(panic) = outcome {
-                    eprintln!(
-                        "ipstack runtime contained a panic: {}",
-                        panic
-                            .downcast_ref::<&str>()
-                            .copied()
-                            .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
-                            .unwrap_or("unknown")
-                    );
-                }
-
-                // Dropping a multi-thread runtime from a thread inside
-                // it waits for the runtime's own workers and never
-                // finishes; retiring it on a bystander thread lets this
-                // thread and every bridge thread exit for real.
-                if let Some(rt) = runtime_slot.lock().unwrap().take() {
-                    std::thread::spawn(move || drop(rt));
-                }
-            })?;
-
+        let serve = Serve {
+            config,
+            bridge,
+            closer,
+            gate,
+            handler,
+            udp_nat: Arc::clone(&self.udp_nat),
+            handle: handle.clone(),
+        };
+        match self.runtime {
+            Some(runtime) => {
+                // The accept loop ends on the stop flag; the host's
+                // runtime outlives it and owns nothing else of ours.
+                drop(runtime.spawn(serve.run()));
+            }
+            None => spawn_private_runtime(serve)?,
+        }
         Ok(handle)
+    }
+}
+
+/// Everything the accept loop owns.
+struct Serve {
+    config: IpStackConfig,
+    bridge: ipstack_bridge::Bridge,
+    closer: Box<dyn PacketDevice>,
+    gate: Arc<SynGate>,
+    handler: Arc<dyn SessionHandler>,
+    udp_nat: Arc<UdpNat>,
+    handle: StackHandle,
+}
+
+impl Serve {
+    /// Accept until stopped, one registered task per stream, then close
+    /// the device so the bridge threads and the interface go with it.
+    async fn run(self) {
+        let Serve {
+            config,
+            bridge,
+            closer,
+            gate,
+            handler,
+            udp_nat,
+            handle,
+        } = self;
+        // Idle NAT mappings must not wait for the next datagram to be
+        // reclaimed; a one-second sweep keeps close reports flowing on
+        // quiet tables.
+        let sweep = tokio::spawn(sweep_loop(Arc::clone(&udp_nat), handle.clone()));
+        let bridge_stop = bridge.stop_flag();
+        let mut stack = IpStack::new(config, bridge.io);
+        loop {
+            // ipstack's accept has no stop side; waiting for it to
+            // notice a closed device is what kept whole process runs
+            // holding their fds. The watcher races it and cancels the
+            // wait.
+            tokio::select! {
+                _ = stop_watcher(&handle) => break,
+                accepted = stack.accept() => match accepted {
+                    Ok(stream) => spawn_session(&handle, stream, &handler, &gate, &udp_nat),
+                    Err(_) => break,
+                },
+            }
+        }
+        sweep.abort();
+        // Wake the bridge threads out of their device reads so the fds
+        // close and the interface can be recreated.
+        bridge_stop.store(true, std::sync::atomic::Ordering::Release);
+        let _ = closer.shutdown();
+    }
+}
+
+/// One task per stream: a flow that wedges in dispatch must cost itself,
+/// not the accept loop and every flow behind it. Each task registers
+/// with the handle so a drain can wait for it, or abort it.
+fn spawn_session(
+    handle: &StackHandle,
+    stream: IpStackStream,
+    handler: &Arc<dyn SessionHandler>,
+    gate: &Arc<SynGate>,
+    udp_nat: &Arc<UdpNat>,
+) {
+    let task: Arc<OnceLock<tokio::task::AbortHandle>> = Arc::default();
+    let guard = handle.enter({
+        let task = Arc::clone(&task);
+        move || {
+            if let Some(task) = task.get() {
+                task.abort();
+            }
+        }
+    });
+    let handler = Arc::clone(handler);
+    let gate = Arc::clone(gate);
+    let udp_nat = Arc::clone(udp_nat);
+    let join = tokio::spawn(async move {
+        let _session = guard;
+        dispatch(stream, &handler, &gate, &udp_nat).await;
+    });
+    let _ = task.set(join.abort_handle());
+}
+
+/// The self-contained mode: a private multi-thread runtime on its own
+/// thread, with panic containment around the whole accept loop.
+fn spawn_private_runtime(serve: Serve) -> io::Result<()> {
+    std::thread::Builder::new()
+        .name("ipstack-runtime".into())
+        .spawn(move || {
+            // A panic in the runtime (a misbehaving handler, a stack
+            // bug) must not take the process down; the stop flag still
+            // works from outside, so shutdown remains reachable.
+            // The runtime moves into a slot so the teardown path can
+            // hand it to a bystander thread even after a panic.
+            let runtime_slot: Arc<Mutex<Option<tokio::runtime::Runtime>>> =
+                Arc::new(Mutex::new(None));
+            let slot_for_body = Arc::clone(&runtime_slot);
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                // Multi-thread, not current-thread: ipstack stream
+                // teardown calls `block_in_place` on drop, which the
+                // current-thread flavor rejects outright. Worker
+                // count follows the machine: sessions are tasks and
+                // two workers left a many-core box mostly idle.
+                let workers = std::thread::available_parallelism()
+                    .map(|n| n.get())
+                    .unwrap_or(2);
+                let rt = tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(workers)
+                    .enable_all()
+                    .build()
+                    .expect("ipstack runtime");
+                // The runtime lives in the slot so the teardown path
+                // can hand it to a bystander thread; the guard holds
+                // it here for the duration of the block_on.
+                let mut guard = slot_for_body.lock().unwrap();
+                *guard = Some(rt);
+                guard.as_ref().unwrap().block_on(serve.run());
+            }));
+
+            if let Err(panic) = outcome {
+                eprintln!(
+                    "ipstack runtime contained a panic: {}",
+                    panic
+                        .downcast_ref::<&str>()
+                        .copied()
+                        .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
+                        .unwrap_or("unknown")
+                );
+            }
+
+            // Dropping a multi-thread runtime from a thread inside
+            // it waits for the runtime's own workers and never
+            // finishes; retiring it on a bystander thread lets this
+            // thread and every bridge thread exit for real.
+            let retired = runtime_slot
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+            if let Some(rt) = retired {
+                std::thread::spawn(move || drop(rt));
+            }
+        })?;
+    Ok(())
+}
+
+/// Expire idle NAT mappings once a second until stopped.
+async fn sweep_loop(table: Arc<UdpNat>, handle: StackHandle) {
+    let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
+    while !handle.is_stopped() {
+        tick.tick().await;
+        table.sweep(std::time::Instant::now());
     }
 }
 
@@ -242,7 +319,12 @@ fn judged(handler: &Arc<dyn SessionHandler>, flow: &FlowInfo) -> Option<Verdict>
 }
 
 /// Route one accepted stream to the appropriate handler callback.
-async fn dispatch(stream: IpStackStream, handler: &Arc<dyn SessionHandler>, udp_nat: &Arc<UdpNat>) {
+async fn dispatch(
+    stream: IpStackStream,
+    handler: &Arc<dyn SessionHandler>,
+    gate: &SynGate,
+    udp_nat: &Arc<UdpNat>,
+) {
     match stream {
         IpStackStream::Tcp(tcp) => {
             let local = tcp.local_addr();
@@ -252,9 +334,13 @@ async fn dispatch(stream: IpStackStream, handler: &Arc<dyn SessionHandler>, udp_
                 source: local,
                 destination: peer,
             };
-            // A SYN carries no payload; the handler sees an empty first
-            // packet, which matches the contract.
-            let Some(verdict) = judged(handler, &flow) else {
+            // The gate judged the SYN on the device side and refused
+            // flows never reach ipstack; a flow it did not hold (a full
+            // table) is judged here. A SYN carries no payload either way.
+            let Some(verdict) = gate
+                .take(flow.source, flow.destination)
+                .or_else(|| judged(handler, &flow))
+            else {
                 return;
             };
             let action = vfawn_core::verdict::execute(verdict, &flow);
@@ -266,18 +352,14 @@ async fn dispatch(stream: IpStackStream, handler: &Arc<dyn SessionHandler>, udp_
                     handler.on_tcp(session).await;
                 }
                 vfawn_core::VerdictAction::Drop | vfawn_core::VerdictAction::Reset => {
-                    // Refused flows close politely. Dropping the stream
-                    // where it stands made ipstack's teardown block its
-                    // own accept loop, wedging every later flow with it;
-                    // a shutdown drains through its state machine.
-                    use tokio::io::AsyncWriteExt;
+                    // Only a verdict the gate missed lands here; the
+                    // handshake is ipstack's by now, so the flow closes
+                    // politely. Dropping the stream where it stands made
+                    // ipstack's teardown block its own accept loop,
+                    // wedging every later flow with it; a shutdown
+                    // drains through its state machine.
                     let mut tcp = tcp;
                     let _ = tcp.shutdown().await;
-                    // The real RST is the in-house backend's to
-                    // send (it holds the SYN's raw bytes); the
-                    // transitional backend has consumed them inside
-                    // ipstack, so a refused flow here closes politely
-                    // and the client times out against silence.
                 }
                 vfawn_core::VerdictAction::RedirectTo(_) => {
                     // Destination rewriting is not possible inside the

@@ -38,6 +38,8 @@ pub mod udp_slot;
 pub mod ipstack_backend;
 #[cfg(feature = "backend-ipstack")]
 pub mod ipstack_bridge;
+#[cfg(feature = "backend-ipstack")]
+pub mod syn_gate;
 
 #[cfg(feature = "backend-native")]
 #[cfg(feature = "backend-native")]

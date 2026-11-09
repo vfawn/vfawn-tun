@@ -42,7 +42,8 @@ pub struct StatsSnapshot {
 }
 
 /// How long `shutdown` waits for in-flight sessions to complete before
-/// tearing down anyway. Embedded hosts care about shutdown latency.
+/// aborting the rest. A drain that empties sooner returns sooner;
+/// embedded hosts care about shutdown latency.
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// A handle onto the running instance.
@@ -69,6 +70,8 @@ pub struct Instance {
     /// The instance's own session accounting, attached to every flow
     /// the wrapper handler accepts.
     tracker: Arc<crate::stats::InstanceTracker>,
+    /// The host runtime sessions run on, when the host lends one.
+    runtime: Option<tokio::runtime::Handle>,
 }
 
 impl Instance {
@@ -93,7 +96,20 @@ impl Instance {
             orchestration: None,
             firewall_rule: None,
             tracker: Arc::new(crate::stats::InstanceTracker::new()),
+            runtime: None,
         })
+    }
+
+    /// Run sessions on the host's runtime instead of a private one.
+    ///
+    /// Takes effect at the next [`Instance::start`]. The handler's
+    /// `on_tcp`/`on_udp` then run as tasks on `runtime`, beside the
+    /// host's own, and the instance builds no runtime of its own. The
+    /// runtime must be multi-threaded and must outlive the instance's
+    /// [`Instance::shutdown`]. Only the ipstack backend can borrow a
+    /// runtime; a start that resolves to the native stack refuses.
+    pub fn set_runtime(&mut self, runtime: tokio::runtime::Handle) {
+        self.runtime = Some(runtime);
     }
 
     /// Begin terminating traffic.
@@ -150,6 +166,13 @@ impl Instance {
             kernel_path_available: cfg!(any(target_os = "linux", target_os = "macos")),
         };
         let choice = self.config.stack.policy.resolve(&facts);
+        #[cfg(feature = "backend-native")]
+        if choice == vfawn_core::AutoChoice::Userspace && self.runtime.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "the native stack runs its own runtimes; a host runtime needs the ipstack backend",
+            ));
+        }
         let backend: Box<dyn vfawn_core::StackBackend> = match choice {
             vfawn_core::AutoChoice::Userspace => self.native_backend(),
             vfawn_core::AutoChoice::Kernel => self.ipstack_backend(),
@@ -163,7 +186,7 @@ impl Instance {
         {
             vfawn_core::Platform::Linux
         }
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
         {
             vfawn_core::Platform::Darwin
         }
@@ -178,6 +201,7 @@ impl Instance {
         #[cfg(not(any(
             target_os = "linux",
             target_os = "macos",
+            target_os = "ios",
             target_os = "windows",
             target_os = "android"
         )))]
@@ -224,6 +248,7 @@ impl Instance {
             udp_timeout_secs: self.config.stack.udp_timeout.as_secs(),
             tcp_timeout_secs: 60,
             broadcast: self.broadcast(),
+            runtime: self.runtime.clone(),
         })
     }
 
@@ -304,10 +329,16 @@ impl Instance {
     /// Drain sessions and close the device.
     ///
     /// The order is: stop the stack (which stops accepting new sessions),
-    /// give in-flight handlers a bounded window to finish, then drop the
-    /// device. Calling shutdown on an already-stopped instance is a no-op.
-    /// The route self-heal loop stops before the stack does; the routes
-    /// themselves come down after the drain, on every platform.
+    /// wait for in-flight handlers to finish — at most [`DRAIN_TIMEOUT`],
+    /// returning as soon as the last one does — abort the stragglers,
+    /// then tear down the firewall and routes. Calling shutdown on an
+    /// already-stopped instance is a no-op. The route self-heal loop
+    /// stops before the stack does; the routes themselves come down
+    /// after the drain, on every platform.
+    ///
+    /// Blocks the calling thread for the drain. A host that lent its
+    /// runtime should call this from `spawn_blocking` or a thread of its
+    /// own, never from a task the sessions might need a worker for.
     pub fn shutdown(&mut self) -> io::Result<()> {
         let Some(handle) = &self.handle else {
             return Ok(());
@@ -320,10 +351,9 @@ impl Instance {
             orchestration.quiesce();
         }
         handle.stop();
-        // Give in-flight sessions a bounded window. The transitional
-        // backend has no explicit drain API; a bounded wait is the
-        // pragmatic answer until the in-house stack lands with one.
-        std::thread::sleep(DRAIN_TIMEOUT);
+        if let vfawn_core::Drain::Aborted(count) = handle.drain(DRAIN_TIMEOUT) {
+            eprintln!("vfawn: shutdown aborted {count} sessions still live after the drain window");
+        }
         self.handle = None;
         // The firewall rule follows the same doctrine as the routes
         // below: it must not outlive an orderly shutdown.

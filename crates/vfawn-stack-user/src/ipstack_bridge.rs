@@ -28,6 +28,8 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::mpsc;
 use vfawn_core::{DnsHijack, PacketDevice};
 
+use crate::syn_gate::{GateOutcome, SynGate};
+
 /// The async device that ipstack sees, plus the flag that ends the
 /// bridge threads underneath it.
 ///
@@ -113,6 +115,7 @@ pub fn start(
     write_device: Box<dyn PacketDevice>,
     dns: Option<Arc<DnsHijack>>,
     broadcast: Option<std::net::Ipv4Addr>,
+    gate: Option<Arc<SynGate>>,
     stack: vfawn_core::StackHandle,
 ) -> Bridge {
     let (rx_tx, rx_rx) = mpsc::channel::<BytesMut>(128);
@@ -124,6 +127,10 @@ pub fn start(
     // intended backpressure.
     let reader_dns = dns.clone();
     let reader_stop = Arc::clone(&stop);
+    // The gate's answers (resets for refused SYNs) leave through the
+    // writer like every frame ipstack emits, so the DNS rewrite undoes
+    // itself on them too.
+    let answers = tx_tx.clone();
     std::thread::Builder::new()
         .name("ipstack-device-reader".into())
         .spawn(move || {
@@ -157,6 +164,14 @@ pub fn start(
                             }
                             if let Some(engine) = reader_dns.as_ref() {
                                 engine.hijack(buf);
+                            }
+                            match gate.as_ref().map(|gate| gate.inspect(buf)) {
+                                None | Some(GateOutcome::Pass) => {}
+                                Some(GateOutcome::Swallow) => continue,
+                                Some(GateOutcome::Answer(frame)) => {
+                                    let _ = answers.send(BytesMut::from(&frame[..]));
+                                    continue;
+                                }
                             }
                             if rx_tx.is_closed()
                                 || rx_tx.blocking_send(std::mem::take(buf)).is_err()

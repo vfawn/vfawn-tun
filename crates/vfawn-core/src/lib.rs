@@ -38,7 +38,7 @@ pub use session::{
     Action, CloseReason, FlowInfo, FlowTrackerHook, IcmpPacket, Network, SessionHandler,
     TcpSession, TcpTransport, UdpSession, UdpTransport, Verdict,
 };
-pub use stack::{StackBackend, StackHandle};
+pub use stack::{Drain, SessionGuard, StackBackend, StackHandle};
 pub use stack_policy::{AutoChoice, AutoFacts, Platform};
 pub use udp_nat::{UdpFlowOutcome, UdpNat};
 pub use verdict::{CountingTracker, VerdictAction, execute};

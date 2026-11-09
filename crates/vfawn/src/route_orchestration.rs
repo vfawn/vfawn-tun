@@ -36,6 +36,7 @@ pub struct RouteOrchestration {
     reconciler: Arc<Reconciler>,
     desired: Arc<RwLock<DesiredState>>,
     auto: Option<AutoReconciler>,
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     monitor: Option<NetworkMonitor>,
 }
 
@@ -43,6 +44,29 @@ impl RouteOrchestration {
     /// Build the desired state from the config, apply it, and start
     /// watching the network.
     pub fn install(
+        config: &VfawnConfig,
+        interface: &str,
+        addresses: &[ipnet::IpNet],
+    ) -> Result<Self, std::io::Error> {
+        // Mobile capture is the VPN framework's: the VpnService or the
+        // packet-tunnel provider installs the routes before the host
+        // ever hands the descriptor over, and no API here could.
+        #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+        {
+            let _ = (config, interface, addresses);
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "auto_route belongs to the host's VPN framework on this platform",
+            ))
+        }
+        #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+        {
+            Self::install_desktop(config, interface, addresses)
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    fn install_desktop(
         config: &VfawnConfig,
         interface: &str,
         addresses: &[ipnet::IpNet],
@@ -97,7 +121,10 @@ impl RouteOrchestration {
     /// its interface callback first, `tun_linux.go:429-431`).
     pub fn quiesce(&mut self) {
         self.auto = None;
-        self.monitor = None;
+        #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+        {
+            self.monitor = None;
+        }
     }
 
     /// Plan the kernel back to empty. The order matters: the

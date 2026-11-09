@@ -13,7 +13,13 @@
 //! This crate carries no packet semantics of its own; anything that has
 //! to understand a header belongs in `vfawn-wire` or the stacks.
 
-#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+#[cfg(any(
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "windows",
+    target_os = "android",
+    target_os = "ios"
+))]
 mod read_queue;
 
 #[cfg(target_os = "linux")]
@@ -31,7 +37,24 @@ mod windows;
 #[cfg(target_os = "windows")]
 pub use windows::TunDevice;
 
-#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+#[cfg(any(target_os = "android", target_os = "ios"))]
+mod mobile;
+#[cfg(any(target_os = "android", target_os = "ios"))]
+pub use mobile::TunDevice;
+
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "windows",
+    target_os = "android",
+    target_os = "ios"
+)))]
 mod pending;
-#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "windows",
+    target_os = "android",
+    target_os = "ios"
+)))]
 pub use pending::TunDevice;

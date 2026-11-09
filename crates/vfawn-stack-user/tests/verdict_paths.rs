@@ -10,10 +10,9 @@
 //! callback itself are pinned here: a panicking host loses its flow but
 //! not the data plane, and a slow callback delays exactly its own flow.
 //!
-//! Wire-level output sequences per verdict (RST on the wire, rewritten
-//! destination) are the in-house stack's to produce; here the refusing
-//! verdicts assert on the session layer, which is all the transitional
-//! backend promises.
+//! Here the refusing verdicts assert on the session layer; the reset a
+//! Reject puts on the wire is pinned in `host_runtime.rs`, and the
+//! rewritten destination of a Redirect remains the in-house stack's.
 
 #![cfg(feature = "backend-ipstack")]
 

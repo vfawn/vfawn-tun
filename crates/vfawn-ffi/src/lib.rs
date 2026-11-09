@@ -213,6 +213,9 @@ fn with_body<T>(
 // --- The reentrancy guard ----------------------------------------------
 
 thread_local! {
+    // Already const: Android's thread-local expansion trips the lint on
+    // an initializer it cannot see through.
+    #[allow(clippy::missing_const_for_thread_local)]
     static INSIDE_CALLBACK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
@@ -327,7 +330,7 @@ fn write_error(buf: *mut c_char, len: usize, message: &str) {
     // fit above keeps the copy and the NUL inside them.
     #[expect(unsafe_code)]
     unsafe {
-        std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf as *mut u8, fit);
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf.cast::<u8>(), fit);
         *buf.add(fit) = 0;
     }
 }
