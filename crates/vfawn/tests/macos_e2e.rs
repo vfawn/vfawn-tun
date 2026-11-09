@@ -28,6 +28,9 @@ const ADAPTER: &str = "utun9";
 /// route table about.
 const CAPTURED: &str = "198.18.0.0/15";
 const ASK_ABOUT: &str = "198.18.0.50";
+/// An address outside the captured prefix: it must keep answering
+/// through whatever the host routed it through before.
+const OUTSIDE: &str = "1.1.1.1";
 
 #[test]
 #[ignore]
@@ -35,6 +38,7 @@ fn takeover_stats_and_clean_teardown() {
     // Root: the route table edits need it.
     assert_root();
 
+    let outside_before = route_names(OUTSIDE);
     let handler = Arc::new(EchoHandler::new());
     let mut config = VfawnConfig::default();
     config.device.name = Some(ADAPTER.to_string());
@@ -58,6 +62,31 @@ fn takeover_stats_and_clean_teardown() {
         std::thread::sleep(Duration::from_millis(100));
     }
     assert!(owned, "the captured prefix answers through {ADAPTER}");
+
+    // A bounded capture is only that prefix (sing-tun's
+    // BuildAutoRouteRanges): no default route through the adapter, so
+    // everything else keeps its route.
+    assert_ne!(
+        route_names(OUTSIDE).as_deref(),
+        Some(ADAPTER),
+        "{OUTSIDE} must not answer through {ADAPTER}"
+    );
+    assert_eq!(
+        route_names(OUTSIDE),
+        outside_before,
+        "{OUTSIDE} kept its route"
+    );
+    let defaults = Command::new("netstat")
+        .args(["-rn", "-f", "inet"])
+        .output()
+        .expect("netstat");
+    let defaults = String::from_utf8_lossy(&defaults.stdout);
+    assert!(
+        !defaults
+            .lines()
+            .any(|l| l.starts_with("default") && l.contains(ADAPTER)),
+        "no default route through {ADAPTER}:\n{defaults}"
+    );
 
     // The counters answer while the capture stands.
     assert_eq!(instance.stats().sessions_total, 0, "no sessions yet");

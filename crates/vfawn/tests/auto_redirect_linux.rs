@@ -142,6 +142,7 @@ fn auto_redirect_end_to_end() {
         Ok("forward") => return body_forward(),
         Ok("lan") => return body_lan(),
         Ok("dns") => return body_dns(),
+        Ok("openwrt") => return body_openwrt(),
         _ => {}
     }
 
@@ -184,6 +185,15 @@ fn auto_redirect_end_to_end() {
     // A LAN routed through the instance.
     lan_topology();
     body("forward", &[]);
+    // OpenWrt's firewall4, played by a stand-in on the body's PATH.
+    std::fs::create_dir_all(FW4_DIR).unwrap();
+    std::fs::write(format!("{FW4_DIR}/fw4"), FW4_STAND_IN).unwrap();
+    run(sh(&format!(
+        "chmod +x {FW4_DIR}/fw4 && mkdir -p /etc/nftables.d"
+    )));
+    let path = format!("{FW4_DIR}:{}", std::env::var("PATH").unwrap_or_default());
+    body("openwrt", &[("PATH", &path)]);
+    let _ = std::fs::remove_dir_all(FW4_DIR);
 
     // kill -9: the table outlives the process; the sweep removes it.
     let mut held = spawn_body("hold", &[]);
@@ -236,6 +246,34 @@ fn serve(port: u16) {
 /// Re-run this test binary as a body inside `ns`. The `ip` binary is
 /// named by path: a body may run with a `PATH` that hides `nft`, and
 /// both live in the same directory.
+const FW4_DIR: &str = "/tmp/vfawn056-fw4";
+
+/// firewall4's reload, as far as these rules are concerned: rebuild
+/// `inet fw4`, every /etc/nftables.d include first, then its own input
+/// and forward chains, dropping by policy behind their established
+/// flows. (Real fw4 accepts sing-tun's include the same way: checked by
+/// hand on the openwrt-24.10 rootfs, our rules landing at the head of
+/// both chains, the policy staying drop.)
+const FW4_STAND_IN: &str = r#"#!/bin/sh
+[ "$1" = reload ] || exit 1
+nft -f - <<EOF
+table inet fw4
+delete table inet fw4
+table inet fw4 {
+	include "/etc/nftables.d/*.nft"
+	chain input {
+		type filter hook input priority filter; policy drop;
+		iif "lo" accept
+		ct state established,related accept
+	}
+	chain forward {
+		type filter hook forward priority filter; policy drop;
+		ct state established,related accept
+	}
+}
+EOF
+"#;
+
 /// A real UDP server: every datagram answered with the peer address.
 fn serve_udp(port: u16) {
     let socket = UdpSocket::bind((SERVER, port)).expect("bind udp server");
@@ -362,6 +400,22 @@ fn start_custom(
     instance.start(handler).expect("start");
     std::thread::sleep(Duration::from_millis(300));
     instance
+}
+
+/// Wait until nothing is crossing the device: connections a previous
+/// scenario accepted may still be closing through it, and their last
+/// packets must not be counted against the next.
+fn settle() {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut last = tun_tx();
+    while Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(300));
+        let now = tun_tx();
+        if now == last {
+            return;
+        }
+        last = now;
+    }
 }
 
 fn tun_tx() -> u64 {
@@ -560,6 +614,7 @@ fn ping(target: &str) -> bool {
 /// never reach the server. ICMP echo: bypassed to one host, captured
 /// (and dropped by the handler) toward the other.
 fn udp_and_icmp() {
+    settle();
     let socket = udp_socket(Duration::from_secs(2));
     let before = tun_tx();
     for _ in 0..20 {
@@ -650,6 +705,7 @@ fn body_dns() {
 /// waits for, and gets, that verdict — while another flow is judged
 /// and connected in the meantime.
 fn judging_never_blocks() {
+    settle();
     let before = tun_tx();
     let slow = std::thread::spawn(|| {
         let socket = udp_socket(Duration::from_secs(4));
@@ -965,6 +1021,50 @@ fn wait_for_docker_rules(count: usize) {
         );
         std::thread::sleep(Duration::from_millis(50));
     }
+}
+
+/// OpenWrt (sing-tun's configureOpenWRTFirewall4): with fw4 running,
+/// the capture's include goes in at start — fw4's forward path, which
+/// drops by policy, then carries LAN flows into the device through our
+/// rules — and comes out at shutdown.
+fn body_openwrt() {
+    let include = format!("/etc/nftables.d/0-vfawn_redirect_{TUN}-auto-redirect.nft");
+    run(sh("fw4 reload"));
+    assert!(!run(sh(&format!("{NFT} list table inet fw4"))).contains("Accept traffic from tun"));
+
+    let mut instance = start_custom(Arc::new(ByPort), |c| {
+        c.route.route_exclude_address = vec![LAN.parse().unwrap()];
+    });
+    assert!(std::path::Path::new(&include).exists(), "the include is in");
+    let child = spawn_in(
+        LAN_NS,
+        "auto_redirect_end_to_end",
+        "lan",
+        &[("VFAWN_056_LAN", "rest")],
+    );
+    finish(child, "rest");
+    let forward = run(sh(&format!("{NFT} list chain inet fw4 forward")));
+    let counted = forward
+        .lines()
+        .filter(|l| l.contains("Accept traffic from tun") && !l.contains("packets 0 "))
+        .count();
+    assert_eq!(counted, 2, "both forward rules carried the flow: {forward}");
+    assert!(
+        forward.contains("policy drop"),
+        "fw4's policy kept: {forward}"
+    );
+
+    instance.shutdown().unwrap();
+    assert!(
+        !std::path::Path::new(&include).exists(),
+        "the include is out"
+    );
+    assert!(
+        !run(sh(&format!("{NFT} list table inet fw4"))).contains("Accept traffic from tun"),
+        "fw4 reloaded without our rules"
+    );
+    run(sh(&format!("{NFT} delete table inet fw4")));
+    println!("openwrt ok");
 }
 
 /// The LAN client's side of [`body_forward`].

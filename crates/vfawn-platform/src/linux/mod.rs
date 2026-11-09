@@ -11,6 +11,7 @@ pub mod docker_firewall;
 pub mod monitor;
 pub mod netlink;
 pub mod nftables;
+pub mod openwrt_firewall;
 pub mod orphan;
 
 pub use anti_loop::protect;

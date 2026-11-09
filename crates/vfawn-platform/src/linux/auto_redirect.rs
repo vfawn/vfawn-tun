@@ -413,6 +413,8 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 /// The installed bypass: the nft table, the queue reader, the judges.
 pub struct AutoRedirect {
     table: String,
+    /// Whether the firewall4 include went in, so removal takes it out.
+    fw4: bool,
     queue: u16,
     /// sing-tun starts its Docker firewall monitor with the table.
     docker: Option<crate::linux::docker_firewall::DockerFirewall>,
@@ -445,6 +447,7 @@ impl AutoRedirect {
 
         let mut installed = Self {
             table: table_name(p.interface),
+            fw4: false,
             queue: p.queue,
             docker: None,
             stop: Arc::clone(&stop),
@@ -476,6 +479,18 @@ impl AutoRedirect {
             installed.remove();
             return Err(e);
         }
+        // sing-tun's setupNFTables configures firewall4 with the table,
+        // and a failure there fails the setup.
+        if let Err(e) =
+            crate::linux::openwrt_firewall::configure(&installed.table, p.interface, false)
+        {
+            installed.remove();
+            return Err(io::Error::new(
+                e.kind(),
+                format!("configure openwrt firewall4: {e}"),
+            ));
+        }
+        installed.fw4 = true;
         let (ipv4, ipv6) = families(p.tun_addresses);
         installed.docker = Some(crate::linux::docker_firewall::DockerFirewall::start(
             crate::linux::docker_firewall::DockerCompat::new(
@@ -495,7 +510,11 @@ impl AutoRedirect {
             "table inet {t} {{}}\ndelete table inet {t}\n",
             t = self.table
         ));
-        // sing-tun's cleanupNFTables: the Docker rules go with the table.
+        // sing-tun's cleanupNFTables: the firewall4 include and the
+        // Docker rules go with the table.
+        if std::mem::take(&mut self.fw4) {
+            let _ = crate::linux::openwrt_firewall::configure(&self.table, "", true);
+        }
         drop(self.docker.take());
         self.stop.store(true, Ordering::Release);
         // The reader drops the job channel on its way out, which is
