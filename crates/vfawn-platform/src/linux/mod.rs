@@ -13,7 +13,7 @@ pub mod nftables;
 pub mod orphan;
 
 pub use anti_loop::protect;
-pub use auto_redirect::{AutoRedirect, RedirectParams};
+pub use auto_redirect::{AutoRedirect, Marks, RedirectParams};
 pub use monitor::NetworkMonitor;
 pub use netlink::NetlinkBackend;
 pub use nftables::NftablesBackend;

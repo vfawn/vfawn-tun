@@ -208,6 +208,9 @@ pub struct RouteParams<'a> {
     /// The mark netfilter puts on a connection `judge_flow` bypassed;
     /// zero disables the bypass rule.
     pub bypass_mark: u32,
+    /// The mark netfilter puts on a judged flow that stays captured;
+    /// zero disables its rule.
+    pub capture_mark: u32,
     pub strict_route: bool,
     pub dns_leak_prevention: bool,
     /// UID ranges to capture (Linux FRA_UID_RANGE): the per-app
@@ -237,6 +240,7 @@ pub fn desired_from_config(params: &RouteParams<'_>) -> DesiredState {
         rule_index,
         mark,
         bypass_mark,
+        capture_mark,
         strict_route,
         dns_leak_prevention,
         ..
@@ -288,10 +292,12 @@ pub fn desired_from_config(params: &RouteParams<'_>) -> DesiredState {
     // capture rule sees it, and the mark survives default-interface
     // changes a socket binding cannot.
     //
-    // Step 0.5: the per-flow bypass. A connection netfilter marked
-    // after `judge_flow` said Bypass answers to the main table the
-    // same way, so it never reaches the device.
-    for mark in [mark, bypass_mark] {
+    // Step 0.5: the per-flow pre-match marks, in sing-tun's mark-mode
+    // order (`tun_linux.go`): a connection netfilter marked after
+    // `judge_flow` said Bypass answers to the main table the same way,
+    // so it never reaches the device; a judged flow that stays
+    // captured answers to the capture table.
+    for (mark, table) in [(mark, 254), (bypass_mark, 254), (capture_mark, table_index)] {
         if mark != 0 {
             rules.push(PolicyRule {
                 priority,
@@ -304,7 +310,7 @@ pub fn desired_from_config(params: &RouteParams<'_>) -> DesiredState {
                     dport: None,
                     uid_range: None,
                 },
-                action: RuleAction::Lookup(254),
+                action: RuleAction::Lookup(table),
                 tag: tag.clone(),
             });
             priority += 1;

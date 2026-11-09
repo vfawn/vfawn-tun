@@ -1,21 +1,28 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // SPDX-FileCopyrightText: Copyright (c) 2026 VFawn contributors
 
-//! Per-flow kernel bypass (056 P1) against a real kernel.
+//! Per-flow kernel bypass (056 P1/P2) against a real kernel.
 //!
-//! The parent owns the "internet": real TCP servers on 10.201.0.2 in
-//! the root namespace. The body runs inside a fresh namespace whose
-//! only uplink is a veth to that address, with a full [`Instance`]
-//! (`auto_route` plus `auto_redirect`) and a handler that judges by
-//! destination port:
+//! The parent owns the "internet": real TCP and UDP servers on
+//! 10.201.0.2 and a ping target on 10.201.0.3, in the root namespace.
+//! The body runs inside a fresh namespace whose only uplink is a veth
+//! to that network, with a full [`Instance`] (`auto_route` plus
+//! `auto_redirect`) and a handler that judges by destination port, for
+//! TCP and UDP alike:
 //!
 //! * 8080 Bypass — reaches the real server, never touches the device,
 //!   arrives from the uplink's address (masquerade), every packet of
-//!   it (not just the SYN);
+//!   it (not just the first);
+//! * 8081 Bypass after a 1.5 s judgement — every datagram sent while
+//!   the judgement runs gets the verdict, and other flows are judged
+//!   meanwhile (sing-tun's non-blocking judging);
 //! * 9090 Accept — captured, echoed by the handler, the server never
 //!   sees it;
-//! * 7070 Reject — refused by a kernel reset;
-//! * 6060 Drop — times out.
+//! * 7070 Reject — refused (a kernel reset for TCP);
+//! * 6060 Drop — nothing comes back.
+//!
+//! ICMP echo to 10.201.0.3 is bypassed, to 10.201.0.2 captured (and
+//! dropped by the handler).
 //!
 //! Then: strict reverse-path filtering with `src_valid_mark`; the
 //! fallback when the queue is taken or `nft` is missing (the instance
@@ -34,7 +41,7 @@
 
 use ipnet::IpNet;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -53,6 +60,7 @@ const NFT: &str = "/usr/sbin/nft";
 const TUN: &str = "vfawn56";
 const SERVER: &str = "10.201.0.2";
 const UPLINK: &str = "10.201.0.1";
+const PING_BYPASS: &str = "10.201.0.3";
 const BULK: usize = 32 << 20;
 
 fn run(mut cmd: Command) -> String {
@@ -91,7 +99,8 @@ fn topology() {
     run(in_ns("sysctl -q -w net.ipv6.conf.default.disable_ipv6=1"));
     run(sh(&format!(
         "ip link add v56a type veth peer name v56b && ip link set v56a netns {NS} && \
-         ip addr add {SERVER}/24 dev v56b && ip link set v56b up"
+         ip addr add {SERVER}/24 dev v56b && ip addr add {PING_BYPASS}/24 dev v56b && \
+         ip link set v56b up"
     )));
     run(in_ns(&format!(
         "sh -c 'ip link set lo up && ip addr add {UPLINK}/24 dev v56a && \
@@ -138,6 +147,9 @@ fn auto_redirect_end_to_end() {
     topology();
     for port in [8080, 9090, 7070, 6060] {
         serve(port);
+    }
+    for port in [8080, 8081, 9090, 7070, 6060] {
+        serve_udp(port);
     }
 
     // Loose reverse-path filtering first, then strict with the mark
@@ -222,6 +234,17 @@ fn serve(port: u16) {
 /// Re-run this test binary as a body inside `ns`. The `ip` binary is
 /// named by path: a body may run with a `PATH` that hides `nft`, and
 /// both live in the same directory.
+/// A real UDP server: every datagram answered with the peer address.
+fn serve_udp(port: u16) {
+    let socket = UdpSocket::bind((SERVER, port)).expect("bind udp server");
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 2048];
+        while let Ok((_, peer)) = socket.recv_from(&mut buf) {
+            let _ = socket.send_to(format!("server {}", peer.ip()).as_bytes(), peer);
+        }
+    });
+}
+
 fn spawn_in(ns: &str, test: &str, mode: &str, env: &[(&str, &str)]) -> Child {
     let exe = std::env::current_exe().unwrap();
     let mut cmd = Command::new(IP);
@@ -257,8 +280,19 @@ struct ByPort;
 #[async_trait::async_trait]
 impl SessionHandler for ByPort {
     fn judge_flow(&self, flow: &FlowInfo, _first: &[u8]) -> Verdict {
+        if flow.network == vfawn_core::Network::Icmp {
+            return if flow.destination.ip().to_string() == PING_BYPASS {
+                Verdict::Bypass
+            } else {
+                Verdict::Accept
+            };
+        }
         match flow.destination.port() {
             8080 => Verdict::Bypass,
+            8081 => {
+                std::thread::sleep(Duration::from_millis(1500));
+                Verdict::Bypass
+            }
             7070 => Verdict::Reject,
             6060 => Verdict::Drop,
             _ => Verdict::Accept,
@@ -275,7 +309,12 @@ impl SessionHandler for ByPort {
         let _ = session.shutdown_write().await;
     }
 
-    async fn on_udp(&self, _session: UdpSession) {}
+    async fn on_udp(&self, mut session: UdpSession) {
+        let mut buf = [0u8; 2048];
+        while let Ok((n, remote)) = session.recv(&mut buf).await {
+            let _ = session.send(&buf[..n], &remote).await;
+        }
+    }
 
     async fn on_icmp(&self, _packet: IcmpPacket) -> Action {
         Action::Drop
@@ -398,6 +437,8 @@ fn body_probe() {
         assert_eq!(dropped.kind(), std::io::ErrorKind::TimedOut);
 
         storm();
+        udp_and_icmp();
+        judging_never_blocks();
     }
 
     // Orderly shutdown: the table and the bypass rule are gone.
@@ -453,6 +494,129 @@ fn storm() {
         THREADS * EACH
     );
     assert_eq!((ours[5], ours[6]), (0, 0), "the queue dropped nothing");
+}
+
+/// One datagram to the server's `port`, the first answer (if any).
+fn udp_exchange(socket: &UdpSocket, port: u16, payload: &[u8]) -> std::io::Result<String> {
+    socket.send_to(payload, (SERVER, port))?;
+    let mut buf = [0u8; 2048];
+    let (n, _) = socket.recv_from(&mut buf)?;
+    Ok(String::from_utf8_lossy(&buf[..n]).into_owned())
+}
+
+fn udp_socket(timeout: Duration) -> UdpSocket {
+    let socket = UdpSocket::bind("0.0.0.0:0").unwrap();
+    socket.set_read_timeout(Some(timeout)).unwrap();
+    socket
+}
+
+fn ping(target: &str) -> bool {
+    Command::new("ping")
+        .args(["-c", "3", "-i", "0.2", "-W", "1", target])
+        .stdout(Stdio::null())
+        .status()
+        .unwrap()
+        .success()
+}
+
+/// The datagram verdicts (056 P2). A bypassed UDP flow reaches the
+/// real server masqueraded, every datagram of it outside the device;
+/// an accepted one is the handler's (captured, its later datagrams
+/// riding the capture mark rather than the queue); drop and reject
+/// never reach the server. ICMP echo: bypassed to one host, captured
+/// (and dropped by the handler) toward the other.
+fn udp_and_icmp() {
+    let socket = udp_socket(Duration::from_secs(2));
+    let before = tun_tx();
+    for _ in 0..20 {
+        assert_eq!(
+            udp_exchange(&socket, 8080, b"hello").expect("udp bypass"),
+            format!("server {UPLINK}")
+        );
+    }
+    assert_eq!(
+        tun_tx() - before,
+        0,
+        "bypassed datagrams crossed the device"
+    );
+
+    let socket = udp_socket(Duration::from_secs(2));
+    let before_queue = queue_stats(100).expect("queue bound")[7];
+    for _ in 0..20 {
+        assert_eq!(
+            udp_exchange(&socket, 9090, b"ping").expect("udp accept"),
+            "ping"
+        );
+    }
+    // One judgement for the flow: the capture mark keeps the rest out
+    // of the queue.
+    let judged = queue_stats(100).unwrap()[7] - before_queue;
+    assert_eq!(
+        judged, 1,
+        "datagrams of one accepted flow queued {judged} times"
+    );
+
+    let socket = udp_socket(Duration::from_secs(1));
+    assert!(
+        udp_exchange(&socket, 6060, b"x").is_err(),
+        "udp drop answered"
+    );
+    let socket = udp_socket(Duration::from_secs(1));
+    // Refused in the stack: either no answer or an ICMP error, never
+    // the server's.
+    if let Ok(answer) = udp_exchange(&socket, 7070, b"x") {
+        assert!(
+            !answer.starts_with("server"),
+            "udp reject reached the server"
+        );
+    }
+
+    let before = tun_tx();
+    assert!(ping(PING_BYPASS), "bypassed ping");
+    assert_eq!(tun_tx() - before, 0, "bypassed echo crossed the device");
+    assert!(!ping(SERVER), "captured ping is the handler's to drop");
+    println!("udp and icmp ok");
+}
+
+/// sing-tun judges without blocking packet processing: a 1.5 s
+/// judgement holds only its own flow — every datagram sent meanwhile
+/// waits for, and gets, that verdict — while another flow is judged
+/// and connected in the meantime.
+fn judging_never_blocks() {
+    let before = tun_tx();
+    let slow = std::thread::spawn(|| {
+        let socket = udp_socket(Duration::from_secs(4));
+        let start = Instant::now();
+        for _ in 0..5 {
+            socket.send_to(b"slow", (SERVER, 8081)).unwrap();
+        }
+        let mut answers = 0;
+        let mut buf = [0u8; 64];
+        while answers < 5 && socket.recv_from(&mut buf).is_ok() {
+            answers += 1;
+        }
+        (answers, start.elapsed())
+    });
+    std::thread::sleep(Duration::from_millis(200));
+    let start = Instant::now();
+    let stream = connect(8080, Duration::from_secs(3)).expect("connect during a slow judgement");
+    assert_eq!(banner(&stream), format!("server {UPLINK}"));
+    let fast = start.elapsed();
+    let (answers, slow_elapsed) = slow.join().unwrap();
+    println!(
+        "slow flow: {answers}/5 datagrams answered after {slow_elapsed:?}; \
+         another flow connected in {fast:?} meanwhile"
+    );
+    assert_eq!(
+        answers, 5,
+        "every datagram of the judged flow got its verdict"
+    );
+    assert!(slow_elapsed >= Duration::from_millis(1400));
+    assert!(
+        fast < Duration::from_millis(700),
+        "a slow judgement blocked the queue"
+    );
+    assert_eq!(tun_tx() - before, 0);
 }
 
 /// This namespace's line for queue `num` in

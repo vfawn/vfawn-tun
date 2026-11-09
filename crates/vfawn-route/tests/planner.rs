@@ -16,6 +16,7 @@ fn test_desired() -> DesiredState {
         rule_index: 9000,
         mark: 0,
         bypass_mark: 0,
+        capture_mark: 0,
         strict_route: true,
         dns_leak_prevention: true,
         include_uid: &[],
@@ -282,6 +283,7 @@ fn the_escape_rule_precedes_every_capture_rule() {
         rule_index: 9000,
         mark: 0x2022,
         bypass_mark: 0,
+        capture_mark: 0,
         strict_route: false,
         dns_leak_prevention: false,
         include_uid: &[],
@@ -304,6 +306,7 @@ fn the_escape_rule_precedes_every_capture_rule() {
         rule_index: 9000,
         mark: 0,
         bypass_mark: 0,
+        capture_mark: 0,
         strict_route: false,
         dns_leak_prevention: false,
         include_uid: &[],
@@ -323,22 +326,26 @@ fn the_bypass_rule_follows_the_escape_and_precedes_the_capture() {
         rule_index: 9000,
         mark: 0x2022,
         bypass_mark: 0x2024,
+        capture_mark: 0x2023,
         strict_route: true,
         dns_leak_prevention: false,
         include_uid: &[],
         exclude_uid: &[1000..=1999],
     });
     let marks: Vec<_> = d.rules.iter().map(|r| r.selector.fwmark).collect();
-    assert_eq!(marks[..2], [Some(0x2022), Some(0x2024)]);
+    assert_eq!(marks[..3], [Some(0x2022), Some(0x2024), Some(0x2023)]);
     let bypass = &d.rules[1];
     assert_eq!(bypass.priority, 9001);
     assert_eq!(bypass.action, RuleAction::Lookup(254));
+    // A judged flow that stays captured answers to the capture table.
+    assert_eq!(d.rules[2].priority, 9002);
+    assert_eq!(d.rules[2].action, RuleAction::Lookup(2022));
     // Strict route's family block and the capture both come later: a
     // bypassed flow must never be routed into the device.
     let capture = d
         .rules
         .iter()
-        .find(|r| r.action == RuleAction::Lookup(2022))
+        .find(|r| r.action == RuleAction::Lookup(2022) && r.selector.fwmark.is_none())
         .expect("a capture rule");
     assert!(capture.priority > bypass.priority);
     assert!(
@@ -358,6 +365,7 @@ fn the_bypass_rule_follows_the_escape_and_precedes_the_capture() {
         rule_index: 9000,
         mark: 0,
         bypass_mark: 0x2024,
+        capture_mark: 0,
         strict_route: false,
         dns_leak_prevention: false,
         include_uid: &[],
@@ -378,6 +386,7 @@ fn strict_route_adds_unreachable_rule() {
         rule_index: 9000,
         mark: 0,
         bypass_mark: 0,
+        capture_mark: 0,
         strict_route: true,
         dns_leak_prevention: false,
         include_uid: &[],
@@ -399,6 +408,7 @@ fn strict_route_adds_unreachable_rule() {
         rule_index: 9000,
         mark: 0,
         bypass_mark: 0,
+        capture_mark: 0,
         strict_route: false,
         dns_leak_prevention: false,
         include_uid: &[],
@@ -423,6 +433,7 @@ fn dns_leak_prevention_adds_rule() {
         rule_index: 9000,
         mark: 0,
         bypass_mark: 0,
+        capture_mark: 0,
         strict_route: false,
         dns_leak_prevention: true,
         include_uid: &[],
@@ -437,6 +448,7 @@ fn dns_leak_prevention_adds_rule() {
         rule_index: 9000,
         mark: 0,
         bypass_mark: 0,
+        capture_mark: 0,
         strict_route: false,
         dns_leak_prevention: false,
         include_uid: &[],
@@ -607,6 +619,7 @@ fn uid_desired(
         rule_index: 9000,
         mark: 0,
         bypass_mark: 0,
+        capture_mark: 0,
         strict_route: false,
         dns_leak_prevention: false,
         include_uid: inc,

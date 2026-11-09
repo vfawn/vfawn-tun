@@ -143,11 +143,13 @@ pub struct RouteConfig {
     pub auto_redirect: AutoRedirectConfig,
 }
 
-/// Per-flow kernel bypass: netfilter hands each new TCP connection's
-/// SYN to `judge_flow` before the packet reaches the device, and a
-/// `Bypass` verdict marks the whole connection past the capture — it
-/// never touches the device or the stack. Every other verdict leaves
-/// the flow on the captured path, where the stack judges it again.
+/// Per-flow kernel bypass, after sing-tun's auto-redirect pre-match:
+/// netfilter hands each new flow's first packet (a TCP connection's
+/// pure SYN, a UDP flow's first datagram, an ICMP echo request) to
+/// `judge_flow` before the packet reaches the device, and a `Bypass`
+/// verdict marks the whole flow past the capture — it never touches
+/// the device or the stack. Every other verdict leaves the flow on the
+/// captured path, where the stack judges it again.
 ///
 /// Off by default. When the kernel lacks the queue modules or the
 /// process lacks the privilege, the instance logs the reason and runs
@@ -156,6 +158,10 @@ pub struct RouteConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct AutoRedirectConfig {
     pub enabled: bool,
+    /// The mark a captured datagram flow carries once judged, so its
+    /// later packets are not queued again; a policy rule sends it to
+    /// the capture table.
+    pub input_mark: u32,
     /// The mark a bypassed connection carries; a policy rule sends it
     /// to the main table. Must differ from `route.mark`.
     pub output_mark: u32,
@@ -169,6 +175,7 @@ impl Default for AutoRedirectConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            input_mark: 0x2023,
             output_mark: 0x2024,
             reset_mark: 0x2025,
             queue: 100,
@@ -520,10 +527,12 @@ impl VfawnConfig {
             }
             // Zero is "no mark" to the kernel, and two roles sharing
             // one mark would route one as the other.
-            let distinct = ar.output_mark != ar.reset_mark
-                && ar.output_mark != r.mark
-                && ar.reset_mark != r.mark;
-            if ar.output_mark == 0 || ar.reset_mark == 0 || !distinct {
+            let marks = [ar.input_mark, ar.output_mark, ar.reset_mark, r.mark];
+            let distinct = marks
+                .iter()
+                .enumerate()
+                .all(|(i, m)| !marks[i + 1..].contains(m));
+            if marks[..3].contains(&0) || !distinct {
                 return Err(ConfigError::OutOfRange {
                     what: "auto_redirect marks",
                 });
@@ -652,9 +661,13 @@ mod tests {
         clash.route.auto_redirect.output_mark = clash.route.mark;
         assert!(clash.validate().is_err());
 
-        let mut zero = cfg;
+        let mut zero = cfg.clone();
         zero.route.auto_redirect.reset_mark = 0;
         assert!(zero.validate().is_err());
+
+        let mut shared = cfg;
+        shared.route.auto_redirect.input_mark = shared.route.auto_redirect.output_mark;
+        assert!(shared.validate().is_err());
     }
 
     #[test]

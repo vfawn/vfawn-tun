@@ -335,6 +335,7 @@ mod tests {
             rule_index: 9000,
             mark: 0,
             bypass_mark: 0,
+            capture_mark: 0,
             strict_route: false,
             dns_leak_prevention: false,
             include_uid: &[],

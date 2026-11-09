@@ -139,7 +139,8 @@ fn desired_state_of(
         table_index: config.route.table_index,
         rule_index: config.route.rule_index,
         mark: config.route.mark,
-        bypass_mark: bypass_mark_of(config),
+        bypass_mark: redirect_marks_of(config).0,
+        capture_mark: redirect_marks_of(config).1,
         strict_route: config.route.strict_route,
         dns_leak_prevention: false,
         include_uid: &config.route.include_uid,
@@ -147,14 +148,15 @@ fn desired_state_of(
     })
 }
 
-/// The bypass mark the policy rules honor: the configured one when the
-/// per-flow bypass is on, zero (no rule) otherwise.
-pub(crate) fn bypass_mark_of(config: &VfawnConfig) -> u32 {
+/// The pre-match marks the policy rules honor, `(bypass, capture)`:
+/// the configured ones when the per-flow bypass is on, zero (no rule)
+/// otherwise.
+pub(crate) fn redirect_marks_of(config: &VfawnConfig) -> (u32, u32) {
     let redirect = &config.route.auto_redirect;
     if redirect.enabled {
-        redirect.output_mark
+        (redirect.output_mark, redirect.input_mark)
     } else {
-        0
+        (0, 0)
     }
 }
 
@@ -182,6 +184,7 @@ pub(crate) fn install_auto_redirect(
         tun_addresses: addresses,
         excluded: &excluded,
         escape_mark: config.route.mark,
+        input_mark: redirect.input_mark,
         output_mark: redirect.output_mark,
         reset_mark: redirect.reset_mark,
         queue: redirect.queue,
