@@ -199,3 +199,87 @@ fn steady_state_moves_packets_without_allocating() {
         "one steady-state packet cost {marginal} allocations in every round (idle baseline {baseline}, with traffic {with_packet}); the young skeleton budget is 4, the 037 goal is 0"
     );
 }
+
+/// A slot that reports itself finished the moment its timer fires but,
+/// like the UDP slot the Windows soak caught, keeps wanting a timer
+/// that is already due.
+struct FinishesOnTimer {
+    fires: std::sync::Arc<AtomicU64>,
+    fired: bool,
+}
+
+impl vfawn_stack_user::shards::SlotLogic for FinishesOnTimer {
+    fn on_packet(
+        &mut self,
+        _packet: &[u8],
+        _out: &mut std::collections::VecDeque<bytes::BytesMut>,
+        _pool: &vfawn_stack_user::shards::BufferPool,
+        _mtu: usize,
+    ) {
+    }
+
+    fn timer_wanted(&self) -> Option<Duration> {
+        Some(Duration::ZERO)
+    }
+
+    fn on_timer(
+        &mut self,
+        _out: &mut std::collections::VecDeque<bytes::BytesMut>,
+        _pool: &vfawn_stack_user::shards::BufferPool,
+    ) {
+        self.fires.fetch_add(1, Ordering::Relaxed);
+        self.fired = true;
+    }
+
+    fn finished(&self) -> bool {
+        self.fired
+    }
+}
+
+#[test]
+fn a_finished_slot_is_forgotten_and_its_flow_starts_fresh() {
+    let created = std::sync::Arc::new(AtomicU64::new(0));
+    let fires = std::sync::Arc::new(AtomicU64::new(0));
+    let device = MockDevice::new(DeviceCaps::MINIMAL);
+    let factory = {
+        let created = std::sync::Arc::clone(&created);
+        let fires = std::sync::Arc::clone(&fires);
+        std::sync::Arc::new(move |_: &vfawn_wire::flow::FlowKey| {
+            created.fetch_add(1, Ordering::Relaxed);
+            Box::new(FinishesOnTimer {
+                fires: std::sync::Arc::clone(&fires),
+                fired: false,
+            }) as Box<dyn vfawn_stack_user::shards::SlotLogic>
+        })
+    };
+    let shards = Shards::start(
+        device.duplicate().unwrap(),
+        device.duplicate().unwrap(),
+        ShardConfig {
+            shards: 1,
+            mtu: 1500,
+            ..ShardConfig::default()
+        },
+        factory,
+        std::sync::Arc::new(vfawn_stack_user::shards::BufferPool::new()),
+    );
+    let script = Script::new(CLIENT, SERVER);
+
+    device.push(&[&script.udp(b"first")]);
+    std::thread::sleep(Duration::from_millis(200));
+    // One fire, then the slot is gone: a slot still in the table would
+    // re-arm its due timer on every loop iteration.
+    assert_eq!(fires.load(Ordering::Relaxed), 1, "the timer fired once");
+    assert_eq!(created.load(Ordering::Relaxed), 1);
+
+    device.push(&[&script.udp(b"again")]);
+    std::thread::sleep(Duration::from_millis(200));
+    shards.stop();
+    drop(shards);
+    assert_eq!(
+        created.load(Ordering::Relaxed),
+        2,
+        "the flow started a fresh slot"
+    );
+    assert_eq!(fires.load(Ordering::Relaxed), 2);
+}

@@ -64,6 +64,9 @@ pub struct UdpSlot {
     client_addr: SocketAddr,
     server_addr: SocketAddr,
     last_active: Instant,
+    /// The idle clock ran out and the session was told: the slot owes
+    /// nothing further and the loop forgets it.
+    expired: bool,
 }
 
 /// The session's event channel payload.
@@ -110,6 +113,7 @@ impl UdpSlot {
             client_addr: SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0),
             server_addr: SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0),
             last_active: Instant::now(),
+            expired: false,
         }
     }
 
@@ -265,6 +269,9 @@ impl SlotLogic for UdpSlot {
     }
 
     fn timer_wanted(&self) -> Option<Duration> {
+        if self.expired {
+            return None;
+        }
         Some((self.last_active + IDLE_TIMEOUT).saturating_duration_since(Instant::now()))
     }
 
@@ -273,6 +280,7 @@ impl SlotLogic for UdpSlot {
             if let Some(to_host) = &self.to_host {
                 let _ = to_host.send(HostEvent::Closed);
             }
+            self.expired = true;
             return;
         }
         // The idle sweep also drains the lane: the host's last reply
@@ -282,6 +290,10 @@ impl SlotLogic for UdpSlot {
 
     fn on_idle(&mut self, out: &mut VecDeque<BytesMut>) {
         self.drain_lane(out);
+    }
+
+    fn finished(&self) -> bool {
+        self.expired
     }
 }
 
@@ -376,6 +388,39 @@ mod tests {
         .expect("frame");
         assert_eq!(frame.len(), 20 + 8 + 7);
         assert_eq!(u16::from_be_bytes([frame[20 + 4], frame[20 + 5]]), 8 + 7);
+    }
+
+    struct Noop;
+
+    #[async_trait::async_trait]
+    impl SessionHandler for Noop {
+        fn judge_flow(&self, _flow: &FlowInfo, _first: &[u8]) -> Verdict {
+            Verdict::Accept
+        }
+        async fn on_tcp(&self, _session: vfawn_core::TcpSession) {}
+        async fn on_udp(&self, _session: vfawn_core::UdpSession) {}
+        async fn on_icmp(&self, _packet: vfawn_core::IcmpPacket) -> vfawn_core::Action {
+            vfawn_core::Action::Drop
+        }
+    }
+
+    #[test]
+    fn an_expired_slot_stops_wanting_its_timer() {
+        let (sessions, _handoffs) = std::sync::mpsc::sync_channel(1);
+        let mut slot = UdpSlot::new(Arc::new(Noop), sessions, Arc::new(ShardBell::new()));
+        let Some(long_ago) = Instant::now().checked_sub(IDLE_TIMEOUT) else {
+            return; // a monotonic clock younger than the timeout
+        };
+        slot.last_active = long_ago;
+        assert_eq!(slot.timer_wanted(), Some(Duration::ZERO));
+        assert!(!slot.finished());
+
+        slot.on_timer(&mut VecDeque::new(), &BufferPool::new());
+
+        // A zero-duration re-arm here is the shard spin the Windows
+        // soak caught: the loop fired this timer once per iteration.
+        assert_eq!(slot.timer_wanted(), None);
+        assert!(slot.finished());
     }
 
     #[test]

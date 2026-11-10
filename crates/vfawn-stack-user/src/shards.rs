@@ -328,6 +328,14 @@ pub trait SlotLogic: Send {
     /// since the last packet have no packet to ride on; this is their
     /// turn.
     fn on_idle(&mut self, _out: &mut VecDeque<BytesMut>) {}
+
+    /// The flow is over and owes nothing further: the loop forgets the
+    /// slot after its timer fires, and the flow's next packet starts a
+    /// fresh one (sing-tun drops an expired UDP flow from its
+    /// directory the same way, `stack_go_udp.go` `GoPacketConn.Close`).
+    fn finished(&self) -> bool {
+        false
+    }
 }
 
 /// One scheduled wake-up for a slot.
@@ -892,6 +900,9 @@ fn shard_loop(
             if let Some(slot) = connections.get_mut(&timer.flow) {
                 slot.logic.on_timer(&mut pending, &pool);
                 did_work = true;
+                if slot.logic.finished() {
+                    connections.remove(&timer.flow);
+                }
             }
         }
 
