@@ -66,4 +66,13 @@ pub trait StackBackend: Send {
         device: Box<dyn PacketDevice>,
         handler: Arc<dyn SessionHandler>,
     ) -> io::Result<StackHandle>;
+
+    /// Whether this backend terminates flows on host sockets, as the
+    /// system stack's listeners do, and so needs the host firewall to
+    /// let inbound connections reach the process. sing-tun takes its
+    /// Windows inbound rule for that stack alone (`stack_system.go:145`);
+    /// a stack that reads the device itself never accepts on a socket.
+    fn accepts_on_host_sockets(&self) -> bool {
+        false
+    }
 }

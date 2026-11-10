@@ -130,14 +130,16 @@ pub struct RouteConfig {
     /// process's dials escape the very routes it installs. Zero
     /// disables the marking and its rule.
     pub mark: u32,
-    /// How the Windows firewall treats this process while a capture is
-    /// up. Auto adds (and later removes) an inbound-allow rule for the
-    /// running executable through the system's own firewall COM API —
-    /// without it a default-deny firewall swallows the very packets
-    /// the TUN hands the process. Documented prints the equivalent
-    /// netsh commands instead of touching the system, for hosts whose
-    /// policy forbids programmatic rule edits. Disabled touches
-    /// nothing. Inert on the other platforms.
+    /// How the Windows firewall treats this process while a stack that
+    /// accepts on host sockets runs (the system stack's listeners, as
+    /// sing-tun's fixWindowsFirewall serves). Auto adds (and later
+    /// removes) an inbound-allow rule for the running executable
+    /// through the system's own firewall COM API. Documented prints the
+    /// equivalent netsh commands instead of touching the system, for
+    /// hosts whose policy forbids programmatic rule edits. Disabled
+    /// touches nothing. Inert on the other platforms, and for the
+    /// stacks that read the device themselves, which never accept
+    /// inbound on a socket.
     pub windows_firewall: WindowsFirewallMode,
     /// Per-flow kernel bypass (Linux, needs `auto_route`).
     pub auto_redirect: AutoRedirectConfig,

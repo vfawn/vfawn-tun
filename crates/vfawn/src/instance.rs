@@ -280,10 +280,11 @@ impl Instance {
                     Arc::clone(&handler),
                 );
             }
-            // The Windows firewall posture rides the same gate: a
-            // capture that swallows the host's network is also the
-            // moment a default-deny firewall starts swallowing this
-            // process's own packets. Other platforms no-op.
+        }
+        // The Windows firewall rule lets inbound connections reach a
+        // stack that accepts them on host sockets; a stack reading the
+        // device never does, so it takes none. Other platforms no-op.
+        if backend.accepts_on_host_sockets() {
             self.firewall_rule = vfawn_platform::firewall_gate(self.config.route.windows_firewall)?;
         }
 
