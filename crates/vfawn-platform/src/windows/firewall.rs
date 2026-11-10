@@ -12,7 +12,7 @@
 use std::io;
 
 use vfawn_core::WindowsFirewallMode;
-use windows::Win32::Foundation::RPC_E_CHANGED_MODE;
+use windows::Win32::Foundation::{RPC_E_CHANGED_MODE, VARIANT_TRUE};
 use windows::Win32::NetworkManagement::WindowsFirewall::{
     INetFwPolicy2, INetFwRule, INetFwRules, NET_FW_ACTION_ALLOW, NET_FW_IP_PROTOCOL_TCP,
     NET_FW_PROFILE2_ALL, NET_FW_RULE_DIR_IN, NetFwPolicy2 as ClsidPolicy, NetFwRule as ClsidRule,
@@ -122,15 +122,21 @@ fn with_policy<T>(work: impl FnOnce(&INetFwRules) -> io::Result<T>) -> io::Resul
 }
 
 /// Add the inbound-allow rule for this executable, idempotently: a
-/// rule already standing under the name is the destination state.
+/// rule already standing under the name is the destination state once
+/// it is enabled. Builds before this fix wrote VARIANT_BOOL(1), which
+/// the firewall stores as disabled (VARIANT_TRUE is -1), so a rule
+/// they left behind is switched on rather than trusted as it stands.
 fn add(name: &str) -> io::Result<()> {
     with_policy(|rules| {
         let name_bstr: windows::core::BSTR = name.into();
         // SAFETY: a lookup by name on a live collection.
         #[expect(unsafe_code)]
-        let standing = unsafe { rules.Item(&name_bstr) }.is_ok();
-        if standing {
-            return Ok(());
+        let standing = unsafe { rules.Item(&name_bstr) };
+        if let Ok(standing) = standing {
+            // SAFETY: a property write on the rule the lookup returned.
+            #[expect(unsafe_code)]
+            let enabled = unsafe { standing.SetEnabled(VARIANT_TRUE) };
+            return enabled.map_err(|e| io::Error::other(format!("firewall rule enable: {e}")));
         }
         // SAFETY: rule object creation in this apartment.
         #[expect(unsafe_code)]
@@ -156,7 +162,7 @@ fn add(name: &str) -> io::Result<()> {
                 .and_then(|()| rule.SetDirection(NET_FW_RULE_DIR_IN))
                 .and_then(|()| rule.SetAction(NET_FW_ACTION_ALLOW))
                 .and_then(|()| rule.SetProfiles(NET_FW_PROFILE2_ALL.0))
-                .and_then(|()| rule.SetEnabled(windows::Win32::Foundation::VARIANT_BOOL(1)))
+                .and_then(|()| rule.SetEnabled(VARIANT_TRUE))
                 .map_err(|e| io::Error::other(format!("firewall rule fields: {e}")))?;
             rules
                 .Add(&rule)

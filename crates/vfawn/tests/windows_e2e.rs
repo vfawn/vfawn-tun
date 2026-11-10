@@ -152,10 +152,28 @@ fn firewall_rule_round_trip_and_documented_mode() {
     use std::process::Command;
 
     let name = vfawn_platform::windows::firewall_rule_name();
+    // The rule's Enabled flag as the firewall itself reports it; the
+    // enum renders the same on every display language, where netsh's
+    // "Enabled:" line is localized.
+    let enabled = || {
+        let shown = Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-Command",
+                &format!(
+                    "(Get-NetFirewallRule -DisplayName '{}').Enabled",
+                    name.replace('\'', "''")
+                ),
+            ])
+            .output()
+            .expect("powershell");
+        String::from_utf8_lossy(&shown.stdout).trim().to_owned()
+    };
 
     // Add (idempotent), verify through netsh, remove, verify gone.
     let added = firewall_apply(WindowsFirewallMode::Auto).expect("apply");
     assert_eq!(added.as_deref(), Some(name.as_str()), "the rule's name");
+    assert_eq!(enabled(), "True", "the rule is in effect, not just present");
     // A second apply is a no-op, not an error.
     firewall_apply(WindowsFirewallMode::Auto).expect("idempotent apply");
 
@@ -208,4 +226,16 @@ fn firewall_rule_round_trip_and_documented_mode() {
         String::from_utf8_lossy(&status.stderr)
     );
     firewall_remove().expect("remove the printed rule");
+
+    // A disabled rule left under the name (what builds before the
+    // VARIANT_TRUE fix wrote) is switched on, not trusted as it stands.
+    let disabled = Command::new("cmd")
+        .args(["/C", &command.replace("enable=yes", "enable=no")])
+        .output()
+        .expect("add a disabled rule");
+    assert!(disabled.status.success(), "the disabled rule was added");
+    assert_eq!(enabled(), "False");
+    firewall_apply(WindowsFirewallMode::Auto).expect("apply over a disabled rule");
+    assert_eq!(enabled(), "True", "the standing rule was enabled");
+    firewall_remove().expect("remove the re-enabled rule");
 }
