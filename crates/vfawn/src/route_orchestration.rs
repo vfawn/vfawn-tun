@@ -90,12 +90,21 @@ impl RouteOrchestration {
         self.reconciler.apply(&desired)
     }
 
+    /// Stop the self-heal loop and leave the installed state alone.
+    /// A shutdown calls this before the device goes away: a loop
+    /// still watching would answer the vanished interface by
+    /// re-installing routes onto it (sing-tun's `Close` unregisters
+    /// its interface callback first, `tun_linux.go:429-431`).
+    pub fn quiesce(&mut self) {
+        self.auto = None;
+        self.monitor = None;
+    }
+
     /// Plan the kernel back to empty. The order matters: the
     /// self-heal loop stops first, or it would race this teardown by
     /// re-installing what this removes.
     pub fn remove(&mut self) -> Result<(), vfawn_route::ReconcileError> {
-        self.auto = None;
-        self.monitor = None;
+        self.quiesce();
         // Empty by the same table and rule indices the capture used, so
         // the removal plan recognizes everything the install created.
         let (table_index, rule_index, interface_name) = {

@@ -291,12 +291,20 @@ impl Instance {
     ///
     /// The order is: stop the stack (which stops accepting new sessions),
     /// give in-flight handlers a bounded window to finish, then drop the
-    /// device. Calling shutdown on an already-stopped instance is a no-op;
-    /// route teardown runs after both, once the route engine is wired in.
+    /// device. Calling shutdown on an already-stopped instance is a no-op.
+    /// The route self-heal loop stops before the stack does; the routes
+    /// themselves come down after the drain, on every platform.
     pub fn shutdown(&mut self) -> io::Result<()> {
         let Some(handle) = &self.handle else {
             return Ok(());
         };
+        // The self-heal loop stops before the stack does: the backend
+        // closes the device on its own threads once it sees the stop,
+        // and a loop still watching would chase the vanished interface
+        // with routes during the drain below.
+        if let Some(orchestration) = self.orchestration.as_mut() {
+            orchestration.quiesce();
+        }
         handle.stop();
         // Give in-flight sessions a bounded window. The transitional
         // backend has no explicit drain API; a bounded wait is the
@@ -313,7 +321,6 @@ impl Instance {
         // first: they mark traffic toward routes about to disappear.
         #[cfg(target_os = "linux")]
         drop(self.auto_redirect.take());
-        #[cfg(target_os = "linux")]
         if let Some(mut orchestration) = self.orchestration.take() {
             orchestration
                 .remove()
