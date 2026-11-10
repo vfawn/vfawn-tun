@@ -294,6 +294,9 @@ pub struct Slot {
     /// per-segment path. The fast path attaches here when it lands.
     pub bypass: bool,
     pub logic: Box<dyn SlotLogic>,
+    /// Which incarnation of the flow this is: a timer armed for an
+    /// earlier slot on the same four-tuple must not fire into this one.
+    pub epoch: u64,
 }
 
 /// The slot constructor a backend supplies: one call per new flow.
@@ -336,6 +339,14 @@ pub trait SlotLogic: Send {
     fn finished(&self) -> bool {
         false
     }
+
+    /// Whether `packet` starts a new flow on this slot's four-tuple
+    /// while the slot still lingers: a SYN reopening a connection in
+    /// TIME-WAIT (gVisor `rcv.go` `handleTimeWaitSegment`). The loop
+    /// gives the packet a fresh slot.
+    fn replaced_by(&self, _packet: &[u8]) -> bool {
+        false
+    }
 }
 
 /// One scheduled wake-up for a slot.
@@ -343,6 +354,8 @@ pub trait SlotLogic: Send {
 pub struct Timer {
     pub deadline: Instant,
     pub flow: FlowKey,
+    /// The slot incarnation that armed it ([`Slot::epoch`]).
+    pub epoch: u64,
 }
 
 impl PartialOrd for Timer {
@@ -861,9 +874,10 @@ fn shard_loop(
 ) {
     let mut connections: HashMap<FlowKey, Slot> = HashMap::new();
     let mut timers: BinaryHeap<Timer> = BinaryHeap::new();
-    // One pending timer per flow at most; a slot re-arms by wanting a
-    // timer again after the fire.
-    let mut scheduled: std::collections::HashSet<FlowKey> = std::collections::HashSet::new();
+    // One pending timer per slot incarnation at most; a slot re-arms
+    // by wanting a timer again after the fire.
+    let mut scheduled: std::collections::HashSet<(FlowKey, u64)> = std::collections::HashSet::new();
+    let mut next_epoch: u64 = 0;
     let mut next_scan = Instant::now();
     // The idle sweep's own clock: a quiet flow's host writes (the
     // tail of a teardown, an answer that outran its packet) have no
@@ -888,10 +902,26 @@ fn shard_loop(
                 let Some(flow) = flow_key(packet) else {
                     continue;
                 };
-                let slot = connections.entry(flow).or_insert_with_key(|flow| Slot {
-                    bypass: false,
-                    logic: logic(flow),
+                let slot = connections.entry(flow).or_insert_with_key(|flow| {
+                    next_epoch += 1;
+                    Slot {
+                        bypass: false,
+                        logic: logic(flow),
+                        epoch: next_epoch,
+                    }
                 });
+                // A slot that is over, or that a new flow on its
+                // four-tuple supersedes, gives the packet a fresh one:
+                // the closed connection's remains never swallow the
+                // next connection's SYN.
+                if slot.logic.finished() || slot.logic.replaced_by(packet) {
+                    next_epoch += 1;
+                    *slot = Slot {
+                        bypass: false,
+                        logic: logic(&flow),
+                        epoch: next_epoch,
+                    };
+                }
                 if slot.bypass {
                     // The fast-path hook: packets of a bypassed session
                     // queue for the splice lane instead of the
@@ -913,11 +943,12 @@ fn shard_loop(
             next_scan = now + Duration::from_millis(1);
             for (flow, slot) in connections.iter() {
                 if let Some(delay) = slot.logic.timer_wanted()
-                    && scheduled.insert(*flow)
+                    && scheduled.insert((*flow, slot.epoch))
                 {
                     timers.push(Timer {
                         deadline: now + delay,
                         flow: *flow,
+                        epoch: slot.epoch,
                     });
                 }
             }
@@ -929,8 +960,10 @@ fn shard_loop(
                 break;
             }
             let timer = timers.pop().expect("peeked entry exists");
-            scheduled.remove(&timer.flow);
-            if let Some(slot) = connections.get_mut(&timer.flow) {
+            scheduled.remove(&(timer.flow, timer.epoch));
+            if let Some(slot) = connections.get_mut(&timer.flow)
+                && slot.epoch == timer.epoch
+            {
                 slot.logic.on_timer(&mut pending, &pool);
                 did_work = true;
                 if slot.logic.finished() {
@@ -1047,14 +1080,17 @@ mod tests {
         heap.push(Timer {
             deadline: now + Duration::from_millis(300),
             flow,
+            epoch: 0,
         });
         heap.push(Timer {
             deadline: now + Duration::from_millis(50),
             flow,
+            epoch: 0,
         });
         heap.push(Timer {
             deadline: now + Duration::from_millis(200),
             flow,
+            epoch: 0,
         });
         let mut order: Vec<u64> = heap
             .drain()

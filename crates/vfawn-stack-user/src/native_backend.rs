@@ -72,6 +72,36 @@ fn v4_ends(flow: &FlowKey) -> Option<(std::net::SocketAddr, std::net::SocketAddr
     ))
 }
 
+/// The TCP header and whole segment bytes of a packet. The family
+/// decides where the segment starts; the machine downstream is
+/// family-blind (sequence space and flags).
+fn tcp_segment(packet: &[u8]) -> Option<(TcpHeader, &[u8])> {
+    let segment = match packet.first().map(|byte| byte >> 4) {
+        Some(4) => {
+            let (ip, payload) = Ipv4Header::parse(packet).ok()?;
+            if ip.protocol != IpProtocol::Tcp {
+                return None;
+            }
+            payload
+        }
+        Some(6) => {
+            let (ip, rest) = vfawn_wire::ipv6::Ipv6Header::parse(packet).ok()?;
+            let transport = vfawn_wire::ipv6::V6Payload::walk(ip.next_header, rest).ok()?;
+            if transport.protocol != IpProtocol::Tcp {
+                return None;
+            }
+            transport.bytes
+        }
+        _ => return None,
+    };
+    let (header, _payload) = TcpHeader::parse(segment).ok()?;
+    Some((header, segment))
+}
+
+/// The active closer's quiet period: gVisor's default
+/// (`protocol.go` `DefaultTCPTimeWaitTimeout`), which sing-tun keeps.
+const TIME_WAIT: Duration = Duration::from_secs(60);
+
 /// The host's outbound queue for one flow, bounded in bytes: a host
 /// that writes faster than the wire carries (a relay pumping from a
 /// memory-speed socket) must feel backpressure, or the queue becomes
@@ -157,6 +187,9 @@ pub struct TcpSlot {
     keepalive_at: Option<Instant>,
     /// Probes sent without an answer since the last activity.
     keepalive_probes: u32,
+    /// When TIME-WAIT began, or last restarted on a retransmitted FIN
+    /// (gVisor's `resetTimeWait`); the slot leaves [`TIME_WAIT`] later.
+    time_wait_at: Option<Instant>,
     /// The flow's dispatch key, for the splice lane's lookup.
     flow_key: vfawn_wire::flow::FlowKey,
     /// The tracker the host's verdict attached, handed to the session
@@ -514,35 +547,21 @@ impl SlotLogic for TcpSlot {
         _pool: &BufferPool,
         _mtu: usize,
     ) {
-        // The family decides where the segment starts; the machine
-        // downstream is family-blind (sequence space and flags).
-        let payload = match packet.first().map(|byte| byte >> 4) {
-            Some(4) => {
-                let Ok((ip, payload)) = Ipv4Header::parse(packet) else {
-                    return;
-                };
-                if ip.protocol != IpProtocol::Tcp {
-                    return;
-                }
-                payload
-            }
-            Some(6) => {
-                let Ok((ip, rest)) = vfawn_wire::ipv6::Ipv6Header::parse(packet) else {
-                    return;
-                };
-                let Ok(transport) = vfawn_wire::ipv6::V6Payload::walk(ip.next_header, rest) else {
-                    return;
-                };
-                if transport.protocol != IpProtocol::Tcp {
-                    return;
-                }
-                transport.bytes
-            }
-            _ => return,
-        };
-        let Ok((header, _segment_payload)) = TcpHeader::parse(payload) else {
+        let Some((header, payload)) = tcp_segment(packet) else {
             return;
         };
+        // A first segment that is no SYN asks for nothing: the remains
+        // of a connection this stack already forgot. gVisor's forwarder
+        // takes only SYNs (`forwarder.go` `HandlePacket`), so the host
+        // never judges it and the slot leaves at once.
+        if !self.judged
+            && self.connection.state() == TcpState::Listen
+            && header.flags.bits() & ctl::SYN == 0
+        {
+            self.judged = true;
+            self.refused = true;
+            return;
+        }
         if !self.judged {
             self.judge(packet, out);
         }
@@ -568,7 +587,15 @@ impl SlotLogic for TcpSlot {
         #[cfg(target_os = "linux")]
         let entry = {
             let lane = crate::splice_lane::SpliceLane::global();
-            let entry = lane.entry_for(&self.flow_key);
+            // A relay registers its entry after the handshake; one
+            // seen before it belongs to an earlier connection on this
+            // four-tuple, whose cursors are not ours.
+            let entry = lane.entry_for(&self.flow_key).filter(|_| {
+                !matches!(
+                    self.connection.state(),
+                    TcpState::Listen | TcpState::SynReceived
+                )
+            });
             // The catch-up does not wait for the entry's activation,
             // only for its arming: an entry deactivated under outbound
             // pressure with a machine behind the shared cursor is
@@ -668,6 +695,14 @@ impl SlotLogic for TcpSlot {
 
         let una_before = self.connection.send_una();
         let reaction = self.connection.on_segment(&inbound);
+        // TIME-WAIT's clock starts on entry and restarts whenever a
+        // retransmitted FIN draws our last ACK again (gVisor
+        // `handleTimeWaitSegments`' `extendTimeWait`).
+        if self.connection.state() == TcpState::TimeWait
+            && (self.time_wait_at.is_none() || reaction.flags != 0)
+        {
+            self.time_wait_at = Some(Instant::now());
+        }
 
         // Congestion reporting rides every inbound acknowledgment: the
         // reaction can be silent when an ACK only moved SND.UNA, but
@@ -770,7 +805,7 @@ impl SlotLogic for TcpSlot {
         // lane stays open, so the write drain continues in
         // CLOSE-WAIT. Full closure keeps the same event.
         match self.connection.state() {
-            TcpState::CloseWait | TcpState::Closed => {
+            TcpState::CloseWait | TcpState::TimeWait | TcpState::Closed => {
                 if let Some(to_host) = &self.to_host {
                     let _ = to_host.send(HostEvent::Closed);
                 }
@@ -802,8 +837,15 @@ impl SlotLogic for TcpSlot {
     }
 
     fn timer_wanted(&self) -> Option<Duration> {
+        // A slot with nothing left asks for the loop's attention now:
+        // the fire is where the loop forgets it.
+        if self.refused || self.connection.state() == TcpState::Closed {
+            return Some(Duration::ZERO);
+        }
         match self.connection.state() {
-            TcpState::SynReceived if self.synack_retries < SYNACK_RETRY_MAX => {
+            // One more wait after the last retransmission: its expiry
+            // is the handshake's failure (gVisor `handshakeFailed`).
+            TcpState::SynReceived if self.synack_retries <= SYNACK_RETRY_MAX => {
                 self.synack_at.map(|at| {
                     (at + rto_backoff(self.synack_retries))
                         .saturating_duration_since(Instant::now())
@@ -843,12 +885,43 @@ impl SlotLogic for TcpSlot {
                         .saturating_duration_since(Instant::now())
                 })
             }
+            TcpState::TimeWait => self
+                .time_wait_at
+                .map(|at| (at + TIME_WAIT).saturating_duration_since(Instant::now())),
             _ => None,
         }
     }
 
+    fn finished(&self) -> bool {
+        // gVisor unregisters an endpoint once it closes (`connect.go`
+        // `cleanupLocked`) and after TIME-WAIT; a refused or stray
+        // flow never had one.
+        self.refused
+            || match self.connection.state() {
+                TcpState::Closed => true,
+                TcpState::TimeWait => self
+                    .time_wait_at
+                    .is_some_and(|at| at.elapsed() >= TIME_WAIT),
+                _ => false,
+            }
+    }
+
+    fn replaced_by(&self, packet: &[u8]) -> bool {
+        // Every packet asks; only TIME-WAIT pays the parse.
+        self.connection.state() == TcpState::TimeWait
+            && tcp_segment(packet).is_some_and(|(header, segment)| {
+                self.connection
+                    .reopens_on(&Inbound::parse(&header, segment))
+            })
+    }
+
     fn on_timer(&mut self, out: &mut VecDeque<BytesMut>, _pool: &BufferPool) {
         match self.connection.state() {
+            TcpState::SynReceived if self.synack_retries >= SYNACK_RETRY_MAX => {
+                // The handshake never completed: no session exists,
+                // the slot simply closes.
+                self.connection.abandon();
+            }
             TcpState::SynReceived => {
                 // The handshake's answer again (RFC 9293 §3.4): the
                 // same sequence, a longer wait if it fires again.
@@ -1445,6 +1518,7 @@ impl StackBackend for NativeBackend {
                     diag_queued: 0,
                     keepalive_at: None,
                     keepalive_probes: 0,
+                    time_wait_at: None,
                     tracker: None,
                     frame_pool: Arc::clone(&frame_pool),
                 })
@@ -1702,6 +1776,7 @@ pub mod cost_probe_support {
             diag_queued: 0,
             keepalive_at: None,
             keepalive_probes: 0,
+            time_wait_at: None,
             tracker: None,
         }
     }
@@ -1786,6 +1861,7 @@ mod tests {
             diag_queued: 0,
             keepalive_at: None,
             keepalive_probes: 0,
+            time_wait_at: None,
             tracker: None,
         };
         // Drive the slot to ESTABLISHED with a handshake like the

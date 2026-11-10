@@ -55,6 +55,10 @@ pub enum TcpState {
     CloseWait,
     /// Our FIN is out, the peer's FIN is in, the last ACK is sent.
     LastAck,
+    /// We closed first and both FINs are acknowledged: the active
+    /// closer's quiet period (RFC 9293 §3.6), where a lost final ACK
+    /// is answered again and a new SYN may reopen the four-tuple.
+    TimeWait,
     /// A RST was sent or received; the connection is over
     /// (RFC 9293 §3.6.2: reset generation and processing).
     Closed,
@@ -360,10 +364,54 @@ impl ServerConnection {
         match self.state {
             TcpState::Listen => self.on_listen(inbound),
             TcpState::SynReceived => self.on_syn_received(inbound),
-            TcpState::Established | TcpState::CloseWait => self.on_established(inbound),
+            TcpState::Established | TcpState::CloseWait => {
+                let reaction = self.on_established(inbound);
+                self.settle_active_close();
+                reaction
+            }
             TcpState::LastAck => self.on_last_ack(inbound),
+            TcpState::TimeWait => self.on_time_wait(inbound),
             TcpState::Closed => Reaction::silent(),
         }
+    }
+
+    /// The active closer's exit (RFC 9293 §3.5): our FIN went first,
+    /// and once the peer's FIN is in and ours is acknowledged, in
+    /// either order, the connection waits out TIME-WAIT. FIN-WAIT and
+    /// CLOSING fold into the states that already carry the cursors.
+    fn settle_active_close(&mut self) {
+        if matches!(self.state, TcpState::Established | TcpState::CloseWait)
+            && self.fin_sent
+            && self.fin_received
+            && self.send.una == self.send.nxt
+        {
+            self.state = TcpState::TimeWait;
+        }
+    }
+
+    /// TIME-WAIT, as gVisor runs it (`rcv.go` `handleTimeWaitSegment`):
+    /// a reset is ignored (RFC 1337's fix 1), a retransmitted FIN means
+    /// our last ACK was lost and draws it again, everything else is
+    /// silence. A new SYN never reaches here; [`Self::reopens_on`]
+    /// hands it to a fresh connection.
+    fn on_time_wait(&mut self, inbound: &Inbound) -> Reaction {
+        if inbound.has(ctl::RST) || !inbound.has(ctl::ACK) {
+            return Reaction::silent();
+        }
+        if inbound.has(ctl::FIN) && inbound.seq.wrapping_add(1) == self.recv.nxt {
+            return Reaction::segment(self.send.nxt, self.recv.nxt, ctl::ACK, self.recv.window);
+        }
+        Reaction::silent()
+    }
+
+    /// Whether `inbound` opens a new connection on this four-tuple: a
+    /// SYN above everything the old one received, in TIME-WAIT (RFC
+    /// 1122 4.2.2.13; gVisor `rcv.go` `handleTimeWaitSegment`).
+    pub fn reopens_on(&self, inbound: &Inbound) -> bool {
+        self.state == TcpState::TimeWait
+            && inbound.has(ctl::SYN)
+            && !inbound.has(ctl::ACK)
+            && inbound.seq.wrapping_sub(self.recv.nxt).wrapping_sub(1) < u32::MAX / 2
     }
 
     /// LISTEN: a SYN opens the handshake (RFC 9293 §3.4: the listener
@@ -1328,5 +1376,87 @@ mod tests {
         // Newest first, edges relative to RCV.NXT (5001).
         assert_eq!(blocks[0], (100, 104));
         assert_eq!(blocks[1], (5, 9));
+    }
+
+    fn segment(seq: u32, ack: u32, flags: u8) -> Inbound<'static> {
+        Inbound {
+            seq,
+            ack,
+            flags,
+            window: 65535,
+            options: Default::default(),
+            payload: &[],
+        }
+    }
+
+    /// Our FIN out at 1001 (SND.NXT 1002 after it), the peer at 5001.
+    fn fin_sent() -> ServerConnection {
+        let mut connection = established();
+        assert_ne!(connection.fin_reaction().flags, 0);
+        connection.mark_fin_sent();
+        connection.send_advance(1);
+        connection
+    }
+
+    #[test]
+    fn the_active_closer_waits_out_time_wait_in_either_order() {
+        // The peer acknowledges our FIN, then sends its own.
+        let mut connection = fin_sent();
+        let _ = connection.on_segment(&segment(5001, 1002, ctl::ACK));
+        assert_eq!(connection.state(), TcpState::Established);
+        let reply = connection.on_segment(&segment(5001, 1002, ctl::FIN | ctl::ACK));
+        assert_eq!(reply.flags, ctl::ACK, "the peer's FIN is acknowledged");
+        assert_eq!(connection.state(), TcpState::TimeWait);
+
+        // Simultaneous close: the peer's FIN crosses ours, its ACK last.
+        let mut connection = fin_sent();
+        let _ = connection.on_segment(&segment(5001, 1001, ctl::FIN | ctl::ACK));
+        assert_eq!(connection.state(), TcpState::CloseWait);
+        let _ = connection.on_segment(&segment(5002, 1002, ctl::ACK));
+        assert_eq!(connection.state(), TcpState::TimeWait);
+    }
+
+    #[test]
+    fn time_wait_answers_a_lost_ack_and_ignores_resets() {
+        let mut connection = fin_sent();
+        let _ = connection.on_segment(&segment(5001, 1002, ctl::FIN | ctl::ACK));
+        assert_eq!(connection.state(), TcpState::TimeWait);
+
+        let again = connection.on_segment(&segment(5001, 1002, ctl::FIN | ctl::ACK));
+        assert_eq!(
+            again.flags,
+            ctl::ACK,
+            "a retransmitted FIN draws the ACK again"
+        );
+        assert_eq!(again.ack, 5002);
+
+        let reset = connection.on_segment(&segment(5002, 1002, ctl::RST));
+        assert_eq!(reset.flags, 0);
+        assert_eq!(
+            connection.state(),
+            TcpState::TimeWait,
+            "RFC 1337: no assassination"
+        );
+    }
+
+    #[test]
+    fn only_a_newer_syn_reopens_time_wait() {
+        let mut connection = fin_sent();
+        let _ = connection.on_segment(&segment(5001, 1002, ctl::FIN | ctl::ACK));
+        // RCV.NXT is 5002 now.
+        assert!(connection.reopens_on(&segment(9000, 0, ctl::SYN)));
+        assert!(
+            !connection.reopens_on(&segment(5002, 0, ctl::SYN)),
+            "not above RCV.NXT"
+        );
+        assert!(
+            !connection.reopens_on(&segment(100, 0, ctl::SYN)),
+            "an old duplicate"
+        );
+        assert!(!connection.reopens_on(&segment(9000, 0, ctl::SYN | ctl::ACK)));
+        assert!(
+            !established().reopens_on(&segment(9000, 0, ctl::SYN)),
+            "only TIME-WAIT yields its four-tuple"
+        );
     }
 }
