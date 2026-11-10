@@ -4,6 +4,12 @@
 //! Planner tests: the three properties (idempotency, completeness,
 //! invertibility) plus specific scenarios.
 
+// A slice of inclusive UID ranges is this crate's contract, not a
+// mis-collected Vec: the planner's include/exclude lists carry
+// RangeInclusive<u32> by design, and one-range test fixtures are the
+// honest minimum.
+#![allow(clippy::single_range_in_vec_init)]
+
 use vfawn_route::*;
 
 fn test_desired() -> DesiredState {
