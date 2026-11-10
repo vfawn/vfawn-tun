@@ -12,7 +12,7 @@ workspace = true
 [features]
 # Termination engine compiled into this crate. Exactly the same contract
 # either way; dependencies attach when each engine lands.
-backend-ipstack = ["dep:ipstack", "dep:tokio", "dep:bytes", "dep:async-trait"]
+backend-ipstack = ["dep:ipstack", "dep:tokio", "dep:bytes", "dep:async-trait", "dep:vfawn-wire"]
 backend-native = ["dep:bytes", "dep:vfawn-wire", "dep:tokio", "dep:async-trait", "dep:libc"]
 
 [dependencies]

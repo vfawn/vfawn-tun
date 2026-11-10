@@ -14,7 +14,53 @@ use crate::ipv6::{Ipv6Header, V6Payload};
 use crate::protocol::IpProtocol;
 use crate::tcp::TcpHeader;
 use crate::udp::UdpHeader;
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+/// Whether the stacks terminate a packet at all: its destination must
+/// be global unicast and not the device's own directed broadcast.
+/// Multicast, broadcast, link-local, loopback and unspecified
+/// destinations are the network's housekeeping (mDNS, SSDP, LLMNR,
+/// DHCP); a stack that accepted them would hand them to a relay that
+/// re-sends them, and the route that brought them here brings them
+/// straight back. This is sing-tun's `dropNonUnicast`
+/// (`stack_go_engine.go:782`, applied ahead of reassembly at :657),
+/// with Go's `netip.Addr.IsGlobalUnicast` as the test.
+///
+/// A packet too short to name a destination passes: the parsers
+/// downstream refuse it with their own reasons.
+pub fn is_unicast_destination(packet: &[u8], broadcast: Option<Ipv4Addr>) -> bool {
+    match packet.first().map(|byte| byte >> 4) {
+        Some(4) if packet.len() >= 20 => {
+            let destination = Ipv4Addr::new(packet[16], packet[17], packet[18], packet[19]);
+            Some(destination) != broadcast && is_global_unicast_v4(destination)
+        }
+        Some(6) if packet.len() >= 40 => {
+            let mut octets = [0u8; 16];
+            octets.copy_from_slice(&packet[24..40]);
+            is_global_unicast_v6(Ipv6Addr::from(octets))
+        }
+        _ => true,
+    }
+}
+
+fn is_global_unicast_v4(address: Ipv4Addr) -> bool {
+    !(address.is_unspecified()
+        || address.is_broadcast()
+        || address.is_loopback()
+        || address.is_multicast()
+        || address.is_link_local())
+}
+
+fn is_global_unicast_v6(address: Ipv6Addr) -> bool {
+    // Go unmaps a v4-mapped address before judging it.
+    if let Some(mapped) = address.to_ipv4_mapped() {
+        return is_global_unicast_v4(mapped);
+    }
+    !(address.is_unspecified()
+        || address.is_loopback()
+        || address.is_multicast()
+        || (address.segments()[0] & 0xffc0) == 0xfe80)
+}
 
 /// The five-tuple of a TCP or UDP flow.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -139,4 +185,71 @@ fn transport_key(src: IpAddr, dst: IpAddr, protocol: IpProtocol, bytes: &[u8]) -
         src_port,
         dst_port,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn v4_to(destination: [u8; 4]) -> Vec<u8> {
+        let mut packet = vec![0u8; 28];
+        packet[0] = 0x45;
+        packet[16..20].copy_from_slice(&destination);
+        packet
+    }
+
+    fn v6_to(destination: Ipv6Addr) -> Vec<u8> {
+        let mut packet = vec![0u8; 48];
+        packet[0] = 0x60;
+        packet[24..40].copy_from_slice(&destination.octets());
+        packet
+    }
+
+    #[test]
+    fn the_network_housekeeping_is_not_terminated() {
+        let broadcast = Some(Ipv4Addr::new(198, 19, 255, 255));
+        for destination in [
+            [224, 0, 0, 251],     // mDNS, the Windows soak's storm
+            [239, 255, 255, 250], // SSDP
+            [255, 255, 255, 255], // limited broadcast
+            [198, 19, 255, 255],  // the device's directed broadcast
+            [169, 254, 1, 1],     // link-local
+            [127, 0, 0, 1],
+            [0, 0, 0, 0],
+        ] {
+            assert!(
+                !is_unicast_destination(&v4_to(destination), broadcast),
+                "{destination:?} passed"
+            );
+        }
+        for destination in ["ff02::fb", "fe80::1", "::1", "::", "::ffff:224.0.0.251"] {
+            let address: Ipv6Addr = destination.parse().unwrap();
+            assert!(
+                !is_unicast_destination(&v6_to(address), broadcast),
+                "{destination} passed"
+            );
+        }
+    }
+
+    #[test]
+    fn unicast_is_terminated_private_ranges_included() {
+        let broadcast = Some(Ipv4Addr::new(198, 19, 255, 255));
+        // Go's IsGlobalUnicast keeps private and ULA addresses.
+        for destination in [
+            [1, 1, 1, 1],
+            [10, 0, 0, 1],
+            [192, 168, 1, 1],
+            [198, 18, 0, 2],
+        ] {
+            assert!(is_unicast_destination(&v4_to(destination), broadcast));
+        }
+        for destination in ["2606:4700::1", "fd00::1", "::ffff:1.1.1.1"] {
+            let address: Ipv6Addr = destination.parse().unwrap();
+            assert!(is_unicast_destination(&v6_to(address), broadcast));
+        }
+        // Without a known broadcast the directed one is not special.
+        assert!(is_unicast_destination(&v4_to([198, 19, 255, 255]), None));
+        // Too short to name a destination: the parsers decide.
+        assert!(is_unicast_destination(&[0x45, 0, 0], broadcast));
+    }
 }

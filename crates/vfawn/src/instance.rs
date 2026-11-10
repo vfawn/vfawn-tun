@@ -190,6 +190,7 @@ impl Instance {
     fn native_backend(&self) -> Box<dyn vfawn_core::StackBackend> {
         Box::new(vfawn_stack_user::NativeBackend {
             congestion: self.config.stack.congestion,
+            broadcast: self.broadcast(),
             ..vfawn_stack_user::NativeBackend::default()
         })
     }
@@ -222,7 +223,19 @@ impl Instance {
             )),
             udp_timeout_secs: self.config.stack.udp_timeout.as_secs(),
             tcp_timeout_secs: 60,
+            broadcast: self.broadcast(),
         })
+    }
+
+    /// The device's directed broadcast, from its first IPv4 prefix as
+    /// sing-tun's `BroadcastAddr` (stack.go:79) takes it.
+    #[cfg(any(feature = "backend-ipstack", feature = "backend-native"))]
+    fn broadcast(&self) -> Option<std::net::Ipv4Addr> {
+        self.config
+            .device
+            .inet4_address
+            .first()
+            .map(ipnet::Ipv4Net::broadcast)
     }
 
     #[cfg(not(feature = "backend-ipstack"))]

@@ -112,6 +112,7 @@ pub fn start(
     mut read_device: Box<dyn PacketDevice>,
     write_device: Box<dyn PacketDevice>,
     dns: Option<Arc<DnsHijack>>,
+    broadcast: Option<std::net::Ipv4Addr>,
 ) -> Bridge {
     let (rx_tx, rx_rx) = mpsc::channel::<BytesMut>(128);
     let (tx_tx, tx_rx) = mpsc::unbounded_channel::<BytesMut>();
@@ -148,6 +149,11 @@ pub fn start(
                         // hottest path in the process. The device refills
                         // taken buffers on the next read.
                         for buf in bufs.iter_mut().take(count) {
+                            // The network's housekeeping never becomes
+                            // a flow (sing-tun's dropNonUnicast).
+                            if !vfawn_wire::flow::is_unicast_destination(buf, broadcast) {
+                                continue;
+                            }
                             if let Some(engine) = reader_dns.as_ref() {
                                 engine.hijack(buf);
                             }

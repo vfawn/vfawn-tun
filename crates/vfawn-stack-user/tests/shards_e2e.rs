@@ -283,3 +283,49 @@ fn a_finished_slot_is_forgotten_and_its_flow_starts_fresh() {
     );
     assert_eq!(fires.load(Ordering::Relaxed), 2);
 }
+
+#[test]
+fn the_network_housekeeping_never_reaches_a_slot() {
+    let created = std::sync::Arc::new(AtomicU64::new(0));
+    let device = MockDevice::new(DeviceCaps::MINIMAL);
+    let factory = {
+        let created = std::sync::Arc::clone(&created);
+        std::sync::Arc::new(move |_: &vfawn_wire::flow::FlowKey| {
+            created.fetch_add(1, Ordering::Relaxed);
+            Box::new(UdpEcho) as Box<dyn vfawn_stack_user::shards::SlotLogic>
+        })
+    };
+    let shards = Shards::start(
+        device.duplicate().unwrap(),
+        device.duplicate().unwrap(),
+        ShardConfig {
+            shards: 1,
+            mtu: 1500,
+            broadcast: Some(Ipv4Addr::new(10, 0, 0, 255)),
+            ..ShardConfig::default()
+        },
+        factory,
+        std::sync::Arc::new(vfawn_stack_user::shards::BufferPool::new()),
+    );
+
+    // The Windows soak's storm: the relay's own mDNS, captured back.
+    for destination in [
+        SocketAddrV4::new(Ipv4Addr::new(224, 0, 0, 251), 5353),
+        SocketAddrV4::new(Ipv4Addr::new(255, 255, 255, 255), 67),
+        SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 255), 137),
+    ] {
+        device.push(&[&Script::new(CLIENT, destination).udp(b"housekeeping")]);
+    }
+    device.push(&[&Script::new(CLIENT, SERVER).udp(b"unicast")]);
+
+    let written = wait_for_written(&device, 1);
+    std::thread::sleep(Duration::from_millis(100));
+    shards.stop();
+    drop(shards);
+    assert_eq!(
+        created.load(Ordering::Relaxed),
+        1,
+        "only the unicast flow got a slot"
+    );
+    assert_eq!(written.len(), 1, "only the unicast datagram was answered");
+}

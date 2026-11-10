@@ -416,6 +416,10 @@ pub struct ShardConfig {
     /// the clock-bound duties: the idle sweep's cadence and the stop
     /// check between knocks.
     pub park_cap: Duration,
+    /// The device's directed broadcast, dropped with the rest of the
+    /// non-unicast traffic before any flow sees it (see
+    /// [`vfawn_wire::flow::is_unicast_destination`]).
+    pub broadcast: Option<std::net::Ipv4Addr>,
 }
 
 impl Default for ShardConfig {
@@ -427,6 +431,7 @@ impl Default for ShardConfig {
             mtu: 1500,
             inbox_batches: 64,
             park_cap: Duration::from_millis(50),
+            broadcast: None,
         }
     }
 }
@@ -545,6 +550,7 @@ impl Shards {
         let stop_all_for_producer = Arc::clone(&stop_all);
         let producer_pool = Arc::clone(&pool);
         let producer_mtu = config.mtu;
+        let producer_broadcast = config.broadcast;
         let producer_shared: Vec<ShardShared> = shared.clone();
         let mut staging: Vec<Vec<Option<BytesMut>>> =
             (0..shard_count).map(|_| Vec::new()).collect();
@@ -569,6 +575,16 @@ impl Shards {
                             Ok(count) => {
                                 reassembler.sweep(Instant::now());
                                 for buf in bufs.iter_mut().take(count) {
+                                    // Ahead of reassembly, as sing-tun
+                                    // drops it: no flow, no slot, no
+                                    // session for the network's
+                                    // housekeeping.
+                                    if !vfawn_wire::flow::is_unicast_destination(
+                                        buf,
+                                        producer_broadcast,
+                                    ) {
+                                        continue;
+                                    }
                                     let packet = match reassembler.feed(buf, Instant::now()) {
                                         crate::fragment::Outcome::Pass => std::mem::take(buf),
                                         crate::fragment::Outcome::Held => {

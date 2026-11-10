@@ -1236,6 +1236,9 @@ pub struct NativeBackend {
     /// minus its headers is the honest value; the RFC default is the
     /// fallback until SYN options are parsed (RFC 9293 §3.7.1).
     pub mss: u16,
+    /// The device's directed broadcast (its first IPv4 prefix's), which
+    /// the producer drops with the other non-unicast destinations.
+    pub broadcast: Option<std::net::Ipv4Addr>,
 }
 
 impl Default for NativeBackend {
@@ -1249,6 +1252,7 @@ impl Default for NativeBackend {
             syn_cookies: true,
             backlog: 128,
             mss: DEFAULT_MSS,
+            broadcast: None,
         }
     }
 }
@@ -1462,6 +1466,7 @@ impl StackBackend for NativeBackend {
             ShardConfig {
                 shards: shard_count,
                 mtu: 1500,
+                broadcast: self.broadcast,
                 ..ShardConfig::default()
             },
             logic_factory,

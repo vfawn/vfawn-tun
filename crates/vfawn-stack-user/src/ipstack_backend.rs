@@ -50,6 +50,9 @@ pub struct IpstackBackend {
     pub udp_timeout_secs: u64,
     /// TCP connection timeout, in seconds.
     pub tcp_timeout_secs: u64,
+    /// The device's directed broadcast, dropped by the bridge with the
+    /// other non-unicast destinations.
+    pub broadcast: Option<std::net::Ipv4Addr>,
 }
 
 impl Default for IpstackBackend {
@@ -64,6 +67,7 @@ impl Default for IpstackBackend {
             dns: Arc::new(DnsHijack::new(None, None)),
             udp_timeout_secs: 300,
             tcp_timeout_secs: 60,
+            broadcast: None,
         }
     }
 }
@@ -82,7 +86,12 @@ impl StackBackend for IpstackBackend {
         // which a restart that recreates it by name depends on.
         let closer = device.duplicate()?;
         let sweep_closer = device.duplicate()?;
-        let bridge = ipstack_bridge::start(device, write_device, Some(Arc::clone(&self.dns)));
+        let bridge = ipstack_bridge::start(
+            device,
+            write_device,
+            Some(Arc::clone(&self.dns)),
+            self.broadcast,
+        );
         let bridge_stopper = bridge.stop_flag();
 
         // The builder returns &mut Self; the final take gives ownership
