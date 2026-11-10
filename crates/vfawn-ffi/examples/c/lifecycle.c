@@ -87,6 +87,11 @@ int main(void) {
     check(vfawn_instance_stats(instance, NULL) == VFAWN_OK,
           "stats answer with a null out-pointer");
 
+    /* The host's restart cue: a stack whose device went away answers
+     * VFAWN_ERR_DEVICE_LOST here, with the reason in err. */
+    check(vfawn_instance_health(instance, err, sizeof err) == VFAWN_OK,
+          "health reports the stack up");
+
     if (started == VFAWN_OK) {
         check(vfawn_instance_apply_config(instance, config, err, sizeof err) ==
                   VFAWN_ERR_NOT_RUNNING,

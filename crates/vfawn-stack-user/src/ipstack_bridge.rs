@@ -113,6 +113,7 @@ pub fn start(
     write_device: Box<dyn PacketDevice>,
     dns: Option<Arc<DnsHijack>>,
     broadcast: Option<std::net::Ipv4Addr>,
+    stack: vfawn_core::StackHandle,
 ) -> Bridge {
     let (rx_tx, rx_rx) = mpsc::channel::<BytesMut>(128);
     let (tx_tx, tx_rx) = mpsc::unbounded_channel::<BytesMut>();
@@ -164,7 +165,15 @@ pub fn start(
                             }
                         }
                     }
-                    Err(_) => return,
+                    // The device died under the bridge: the stack stops
+                    // with the reason, and the runtime's stop watch
+                    // takes the rest down.
+                    Err(error) => {
+                        if !reader_stop.load(Ordering::Acquire) && stack.fail(error.to_string()) {
+                            eprintln!("vfawn: device lost, stack stopped: {error}");
+                        }
+                        return;
+                    }
                 }
             }
         })

@@ -5,8 +5,34 @@
 //! echo everything back.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 use vfawn::echo::VerboseEchoHandler;
 use vfawn::{Instance, VfawnConfig};
+
+/// Raised by `main` on Ctrl-C, before it unparks the worker.
+static STOP_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+/// Ask a running `up` to shut down; the caller unparks its thread.
+pub fn request_stop() {
+    STOP_REQUESTED.store(true, Ordering::Release);
+}
+
+/// Park until the caller asks to stop (`Ok`) or the stack stops on its
+/// own (`Err` with the reason). A lost device is not rebuilt, as
+/// sing-tun's stack does not rebuild it: the process exits with an
+/// error and whatever supervises it decides on a restart.
+fn wait_for_stop(failure: impl Fn() -> Option<String>) -> Result<(), String> {
+    loop {
+        if let Some(reason) = failure() {
+            return Err(reason);
+        }
+        if STOP_REQUESTED.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        std::thread::park_timeout(Duration::from_millis(200));
+    }
+}
 
 /// Bring up a TUN device and echo every session to stdout.
 ///
@@ -93,15 +119,13 @@ fn run_ipstack(
 
     println!("ready; sessions will appear below; Ctrl-C to stop");
 
-    // Block until the caller tells us to stop. The signal handling lives
-    // in `main`, which calls `stop` on this thread's control channel.
-    // For now, park this thread; main sends the wake.
-    std::thread::park();
+    // Block until `main` relays Ctrl-C or the stack stops on its own.
+    let outcome = wait_for_stop(|| instance.failure());
 
     println!("shutting down ...");
     instance.shutdown()?;
     println!("device closed");
-    Ok(())
+    outcome.map_err(|reason| format!("device lost: {reason}").into())
 }
 
 /// The in-house stack bench seat: same device, same capture
@@ -148,10 +172,10 @@ fn run_native(
             .map(ipnet::Ipv4Net::broadcast),
         ..vfawn_stack_user::NativeBackend::default()
     });
-    let _handle = vfawn_core::StackBackend::spawn(backend, Box::new(device), handler)?;
+    let handle = vfawn_core::StackBackend::spawn(backend, Box::new(device), handler)?;
 
     println!("ready; sessions will appear below; Ctrl-C to stop");
-    std::thread::park();
+    let outcome = wait_for_stop(|| handle.failure());
 
     println!("shutting down ...");
     // The backend's threads live for the process; the capture rules
@@ -160,5 +184,5 @@ fn run_native(
         let _ = orchestration.remove();
     }
     println!("device closed");
-    Ok(())
+    outcome.map_err(|reason| format!("device lost: {reason}").into())
 }

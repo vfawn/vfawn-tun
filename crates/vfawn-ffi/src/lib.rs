@@ -42,6 +42,10 @@ pub const VFAWN_ERR_BUFFER_TOO_SMALL: c_int = 6;
 pub const VFAWN_ERR_NEEDS_RESTART: c_int = 7;
 pub const VFAWN_ERR_PANIC: c_int = 8;
 pub const VFAWN_ERR_REENTRANT: c_int = 9;
+/// The running stack stopped on its own: its device went away (an
+/// adapter disabled or removed outside this process). The instance
+/// does not rebuild itself; shut it down and start a new one.
+pub const VFAWN_ERR_DEVICE_LOST: c_int = 10;
 
 // --- Verdict codes the judge callback answers -------------------------
 
@@ -607,6 +611,43 @@ pub unsafe extern "C" fn vfawn_instance_stats(
                 }
             }
             Ok(())
+        })
+        .map(|()| VFAWN_OK)
+        .unwrap_or_else(|code| code)
+    }))
+    .unwrap_or(VFAWN_ERR_PANIC)
+}
+
+/// Whether the running stack is still up. [`VFAWN_OK`] while it runs
+/// (or before it was started); [`VFAWN_ERR_DEVICE_LOST`] once it stopped
+/// on its own, with the reason in `err`. Polling this is how a host
+/// learns to restart: as sing-tun's stack does, this one stops on a
+/// lost device rather than rebuilding it.
+///
+/// # Safety
+///
+/// `err` must be writable for `err_len` bytes when non-null.
+#[expect(unsafe_code)]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn vfawn_instance_health(
+    handle: vfawn_instance_t,
+    err: *mut c_char,
+    err_len: usize,
+) -> c_int {
+    boundary(AssertUnwindSafe(|| {
+        with_body(handle, |body| {
+            let instance = match body.instance.lock() {
+                Ok(instance) => instance,
+                Err(_) => return Err(VFAWN_ERR_PANIC),
+            };
+            match instance.failure() {
+                None => Ok(()),
+                Some(reason) => {
+                    write_error(err, err_len, &reason);
+                    remember_error(body, &reason);
+                    Err(VFAWN_ERR_DEVICE_LOST)
+                }
+            }
         })
         .map(|()| VFAWN_OK)
         .unwrap_or_else(|code| code)

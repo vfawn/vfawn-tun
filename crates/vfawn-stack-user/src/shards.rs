@@ -474,6 +474,9 @@ pub struct Shards {
     pool: Arc<BufferPool>,
     /// Count of packets each shard processed, for affinity tests.
     pub processed: Vec<Arc<AtomicU64>>,
+    /// Why the producer left without being asked: the device's read
+    /// failed. The pipeline is over once this is set.
+    device_failure: Arc<std::sync::OnceLock<String>>,
     threads: Vec<std::thread::JoinHandle<()>>,
 }
 
@@ -551,6 +554,8 @@ impl Shards {
         let producer_pool = Arc::clone(&pool);
         let producer_mtu = config.mtu;
         let producer_broadcast = config.broadcast;
+        let device_failure: Arc<std::sync::OnceLock<String>> = Arc::new(std::sync::OnceLock::new());
+        let producer_failure = Arc::clone(&device_failure);
         let producer_shared: Vec<ShardShared> = shared.clone();
         let mut staging: Vec<Vec<Option<BytesMut>>> =
             (0..shard_count).map(|_| Vec::new()).collect();
@@ -626,7 +631,12 @@ impl Shards {
                                     }
                                 }
                             }
-                            Err(_) => break,
+                            Err(error) => {
+                                if !stop_all_for_producer.load(Ordering::Acquire) {
+                                    let _ = producer_failure.set(error.to_string());
+                                }
+                                break;
+                            }
                         }
                     }
                     // The loop is over, by stop or by device error, and
@@ -767,8 +777,15 @@ impl Shards {
             stop_all: PipelineStop(Arc::clone(&stop_all)),
             pool,
             processed,
+            device_failure,
             threads,
         }
+    }
+
+    /// Why the pipeline ended on its own, if it did: the device's read
+    /// failed while nobody had asked it to stop.
+    pub fn device_failure(&self) -> Option<String> {
+        self.device_failure.get().cloned()
     }
 
     /// The doorbell of one shard, for host-side signalling that

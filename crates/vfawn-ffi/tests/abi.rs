@@ -117,6 +117,10 @@ fn a_null_handle_is_bad_and_destroy_is_null_tolerant() {
             vfawn_instance_stats(VFAWN_NULL_HANDLE, std::ptr::null_mut()),
             VFAWN_ERR_BAD_HANDLE
         );
+        assert_eq!(
+            vfawn_instance_health(VFAWN_NULL_HANDLE, std::ptr::null_mut(), 0),
+            VFAWN_ERR_BAD_HANDLE
+        );
         vfawn_instance_destroy(VFAWN_NULL_HANDLE);
     }
 }

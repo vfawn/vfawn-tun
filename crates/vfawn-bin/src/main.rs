@@ -67,18 +67,28 @@ fn up_command(args: &[String]) -> ExitCode {
         })
         .expect("spawn worker thread");
 
-    // Wait for Ctrl-C, then wake the worker so it runs its shutdown chain.
+    // Wait for Ctrl-C, or for the worker to leave on its own (a lost
+    // device), then wake the worker so it runs its shutdown chain.
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .expect("signal runtime");
     rt.block_on(async {
-        let _ = tokio::signal::ctrl_c().await;
+        let finished = async {
+            while !worker.is_finished() {
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+        };
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            () = finished => {}
+        }
     });
 
-    // The worker thread is parked in thread::park(); wake it. A second
+    // The worker parks between stop checks; ask, then wake it. A second
     // signal still kills the process (the default handler), which the
     // device-layer cleanup contract tolerates.
+    vfawn_bin::up::request_stop();
     worker.thread().unpark();
 
     match worker.join() {

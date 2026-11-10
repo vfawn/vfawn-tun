@@ -22,6 +22,9 @@ pub struct MockDevice {
     outbox: Arc<Mutex<VecDeque<BytesMut>>>,
     caps: DeviceCaps,
     shutdown: Arc<AtomicBool>,
+    /// The device went away outside the process (an adapter disabled
+    /// under the stack): reads fail from then on.
+    lost: Arc<AtomicBool>,
 }
 
 impl MockDevice {
@@ -32,7 +35,14 @@ impl MockDevice {
             outbox: Arc::new(Mutex::new(VecDeque::new())),
             caps,
             shutdown: Arc::new(AtomicBool::new(false)),
+            lost: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Take the device away under its readers, as an adapter disabled
+    /// outside the process does: every later read fails.
+    pub fn lose(&self) {
+        self.lost.store(true, Ordering::Release);
     }
 
     /// Queue packets for the next reads, in order.
@@ -57,6 +67,12 @@ impl MockDevice {
 
 impl PacketDevice for MockDevice {
     fn read_batch(&mut self, bufs: &mut [BytesMut]) -> io::Result<usize> {
+        if self.lost.load(Ordering::Acquire) {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "device is down",
+            ));
+        }
         if self.shutdown.load(Ordering::Acquire) {
             return Ok(0);
         }
@@ -106,6 +122,7 @@ impl PacketDevice for MockDevice {
             outbox: Arc::clone(&self.outbox),
             caps: self.caps,
             shutdown: Arc::clone(&self.shutdown),
+            lost: Arc::clone(&self.lost),
         }))
     }
 }

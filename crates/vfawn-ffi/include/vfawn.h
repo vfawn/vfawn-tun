@@ -33,6 +33,13 @@
 
 #define VFAWN_ERR_REENTRANT 9
 
+/**
+ * The running stack stopped on its own: its device went away (an
+ * adapter disabled or removed outside this process). The instance
+ * does not rebuild itself; shut it down and start a new one.
+ */
+#define VFAWN_ERR_DEVICE_LOST 10
+
 #define VFAWN_VERDICT_ACCEPT 0
 
 #define VFAWN_VERDICT_BYPASS 1
@@ -159,6 +166,19 @@ int vfawn_instance_start(struct vfawn_instance_t handle, char *err, uintptr_t er
  * handle.
  */
 int vfawn_instance_stats(struct vfawn_instance_t handle, struct vfawn_stats_t *stats);
+
+/**
+ * Whether the running stack is still up. [`VFAWN_OK`] while it runs
+ * (or before it was started); [`VFAWN_ERR_DEVICE_LOST`] once it stopped
+ * on its own, with the reason in `err`. Polling this is how a host
+ * learns to restart: as sing-tun's stack does, this one stops on a
+ * lost device rather than rebuilding it.
+ *
+ * # Safety
+ *
+ * `err` must be writable for `err_len` bytes when non-null.
+ */
+int vfawn_instance_health(struct vfawn_instance_t handle, char *err, uintptr_t err_len);
 
 /**
  * Hot-reconfigure the routes; a field that needs a restart answers

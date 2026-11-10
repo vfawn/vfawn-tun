@@ -91,6 +91,7 @@ impl StackBackend for IpstackBackend {
             write_device,
             Some(Arc::clone(&self.dns)),
             self.broadcast,
+            handle.clone(),
         );
         let bridge_stopper = bridge.stop_flag();
 

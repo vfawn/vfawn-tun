@@ -404,6 +404,15 @@ impl Instance {
         self.reconciler = Some(reconciler);
     }
 
+    /// Why the running stack stopped on its own, if it did: the device
+    /// went away under it (an adapter disabled or removed outside this
+    /// process). The stack does not rebuild itself, as sing-tun's does
+    /// not; a host that wants the capture back calls
+    /// [`Instance::shutdown`] and starts a new instance.
+    pub fn failure(&self) -> Option<String> {
+        self.handle.as_ref().and_then(StackHandle::failure)
+    }
+
     /// Current counters.
     pub fn stats(&self) -> StatsSnapshot {
         let (sessions_total, bytes_forward, bytes_reverse) = self.tracker.snapshot();

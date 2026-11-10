@@ -1555,11 +1555,19 @@ impl StackBackend for NativeBackend {
         // stops and joins every thread — and the producer's exit
         // knocks the device's I/O thread awake, so the interface
         // leaves with the pipeline instead of outliving it.
-        let stop_flag = handle.stop_flag();
+        // A device that dies under the pipeline ends it the same way,
+        // with the reason on the handle for the host.
+        let watched = handle.clone();
         std::thread::Builder::new()
             .name("vfawn-native-stop".into())
             .spawn(move || {
-                while !stop_flag.load(std::sync::atomic::Ordering::Acquire) {
+                while !watched.is_stopped() {
+                    if let Some(reason) = shards.device_failure() {
+                        if watched.fail(reason.clone()) {
+                            eprintln!("vfawn: device lost, stack stopped: {reason}");
+                        }
+                        break;
+                    }
                     std::thread::sleep(Duration::from_millis(50));
                 }
                 drop(shards);

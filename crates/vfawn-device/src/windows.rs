@@ -276,8 +276,10 @@ impl PacketDevice for TunDevice {
         let Some(reads) = &self.reads else {
             return Ok(0);
         };
+        // A stopped device is gone, not idle: the reader leaves and the
+        // stack reports the loss instead of polling a dead ring.
         if self.shared.stopped.load(Ordering::Acquire) {
-            return Ok(0);
+            return Err(io::Error::new(ErrorKind::NotConnected, "device is down"));
         }
         let mut frames = match reads.recv_timeout(std::time::Duration::from_millis(50)) {
             Ok(frames) => frames,

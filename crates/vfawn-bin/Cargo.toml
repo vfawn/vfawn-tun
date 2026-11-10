@@ -13,7 +13,7 @@ workspace = true
 vfawn = { path = "../vfawn", features = ["backend-native"] }
 vfawn-core = { path = "../vfawn-core" }
 async-trait = "0.1"
-tokio = { workspace = true, features = ["rt", "signal", "macros"] }
+tokio = { workspace = true, features = ["rt", "signal", "macros", "time"] }
 ipnet.workspace = true
 vfawn-wire = { path = "../vfawn-wire" }
 vfawn-platform = { path = "../vfawn-platform" }
