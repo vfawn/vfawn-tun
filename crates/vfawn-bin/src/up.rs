@@ -117,9 +117,10 @@ fn run_native(
 
     // Capture before traffic flows, exactly as the facade orders it
     // (`Instance::finish_start`): the rules reference the device's
-    // real name, and the firewall posture rides the same gate.
+    // real name. No firewall rule: the native stack reads the device
+    // and never accepts on a socket, and sing-tun takes its inbound
+    // rule only for the system stack, which does (stack_system.go:145).
     let mut orchestration = None;
-    let mut firewall_rule = None;
     if auto_route {
         let interface = device.name()?;
         let addresses: Vec<ipnet::IpNet> = config
@@ -132,7 +133,6 @@ fn run_native(
         orchestration = Some(vfawn::route_orchestration::RouteOrchestration::install(
             &config, &interface, &addresses,
         )?);
-        firewall_rule = vfawn_platform::firewall_gate(config.route.windows_firewall)?;
     }
 
     let mss = (config.device.mtu.min(65535) as u16)
@@ -141,6 +141,11 @@ fn run_native(
     let backend = Box::new(vfawn_stack_user::NativeBackend {
         congestion: config.stack.congestion,
         mss,
+        broadcast: config
+            .device
+            .inet4_address
+            .first()
+            .map(ipnet::Ipv4Net::broadcast),
         ..vfawn_stack_user::NativeBackend::default()
     });
     let _handle = vfawn_core::StackBackend::spawn(backend, Box::new(device), handler)?;
@@ -150,10 +155,7 @@ fn run_native(
 
     println!("shutting down ...");
     // The backend's threads live for the process; the capture rules
-    // and the firewall rule must not outlive an orderly stop.
-    if firewall_rule.is_some() {
-        let _ = vfawn_platform::firewall_gate_remove();
-    }
+    // must not outlive an orderly stop.
     if let Some(mut orchestration) = orchestration {
         let _ = orchestration.remove();
     }
