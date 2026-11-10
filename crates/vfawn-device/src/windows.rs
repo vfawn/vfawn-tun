@@ -217,11 +217,23 @@ fn io_loop(shared: Arc<Shared>, device: SyncDevice, writes: Receiver<Vec<BytesMu
             return;
         }
 
-        // One packet; the park is interruptible by the write side's
-        // knock and the shutdown flag's.
+        // One packet. Receive first and park only once the ring answers
+        // empty, as Wintun's own receive loop and sing-tun's Read
+        // (tun_windows.go:428-438) do: the read event is armed by the
+        // ERROR_NO_MORE_ITEMS answer, so a park taken while packets
+        // remain waits for an edge that never comes, and the ring fills
+        // behind it until the driver discards. tun-rs's recv_intr parks
+        // first; it is only the park here. The park is interruptible by
+        // the write side's knock and the shutdown flag's.
         buf.clear();
         buf.resize(seg, 0);
-        match device.recv_intr(&mut buf, &shared.event) {
+        let received = match device.try_recv(&mut buf) {
+            Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                device.recv_intr(&mut buf, &shared.event)
+            }
+            other => other,
+        };
+        match received {
             Ok(n) if n > 0 => {
                 let frame = buf.split_to(n);
                 match shared.reads.try_send(vec![frame]) {
@@ -239,7 +251,14 @@ fn io_loop(shared: Arc<Shared>, device: SyncDevice, writes: Receiver<Vec<BytesMu
                 // The knock or the flag: loop and re-read the world.
                 shared.event.reset().ok();
             }
-            Err(error) if error.kind() == ErrorKind::NotConnected => {
+            // ERROR_HANDLE_EOF: the session ended under us (sing-tun
+            // answers it with os.ErrClosed). Retrying would spin.
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    ErrorKind::NotConnected | ErrorKind::UnexpectedEof
+                ) =>
+            {
                 eprintln!("vfawn: tun I/O stopped: device down");
                 shared.stopped.store(true, Ordering::Release);
                 return;
