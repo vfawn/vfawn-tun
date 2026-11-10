@@ -34,7 +34,10 @@ pub fn run(
     // a binding cannot. The binding stays as the explicit override:
     // a socket bound to the physical interface answers the oif
     // constraint directly, which is the belt to the mark's braces.
-    config.stack.outbound_fd_hook = if bind_default_iface {
+    // Windows has no routing mark: the binding is the whole escape
+    // there, as sing-box runs it (IP_UNICAST_IF to the default
+    // interface).
+    config.stack.outbound_fd_hook = if bind_default_iface || (auto_route && cfg!(windows)) {
         vfawn_core::OutboundFdHook::BindDefaultIface
     } else if auto_route {
         vfawn_core::OutboundFdHook::Mark(config.route.mark)
@@ -47,19 +50,23 @@ pub fn run(
     let handler: Arc<dyn vfawn_core::SessionHandler> = if relay {
         // The hook binding only exists where the escape compiles; the
         // other platforms refuse the dial rather than loop it back.
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", windows))]
         let hook = config.stack.outbound_fd_hook.clone();
         let protect: vfawn::Protect = std::sync::Arc::new(move |fd| {
             #[cfg(target_os = "linux")]
             {
                 vfawn_platform::linux::protect(&hook, fd).map(|_| ())
             }
-            #[cfg(not(target_os = "linux"))]
+            #[cfg(windows)]
+            {
+                vfawn_platform::windows::protect(&hook, fd).map(|_| ())
+            }
+            #[cfg(not(any(target_os = "linux", windows)))]
             {
                 let _ = fd;
                 Err(std::io::Error::new(
                     std::io::ErrorKind::Unsupported,
-                    "relay escape needs the Linux hook",
+                    "relay escape needs the Linux or Windows hook",
                 ))
             }
         });
@@ -107,14 +114,12 @@ fn run_native(
     auto_route: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let device = vfawn_device::TunDevice::create(&config.device)?;
-    #[cfg(not(target_os = "linux"))]
-    let _ = auto_route;
 
-    // Capture before traffic flows, exactly as the facade orders it:
-    // the rules reference the device's real name.
-    #[cfg(target_os = "linux")]
+    // Capture before traffic flows, exactly as the facade orders it
+    // (`Instance::finish_start`): the rules reference the device's
+    // real name, and the firewall posture rides the same gate.
     let mut orchestration = None;
-    #[cfg(target_os = "linux")]
+    let mut firewall_rule = None;
     if auto_route {
         let interface = device.name()?;
         let addresses: Vec<ipnet::IpNet> = config
@@ -127,6 +132,7 @@ fn run_native(
         orchestration = Some(vfawn::route_orchestration::RouteOrchestration::install(
             &config, &interface, &addresses,
         )?);
+        firewall_rule = vfawn_platform::firewall_gate(config.route.windows_firewall)?;
     }
 
     let mss = (config.device.mtu.min(65535) as u16)
@@ -144,9 +150,10 @@ fn run_native(
 
     println!("shutting down ...");
     // The backend's threads live for the process; the capture rules
-    // must not outlive an orderly stop. Off Linux there was nothing
-    // to install.
-    #[cfg(target_os = "linux")]
+    // and the firewall rule must not outlive an orderly stop.
+    if firewall_rule.is_some() {
+        let _ = vfawn_platform::firewall_gate_remove();
+    }
     if let Some(mut orchestration) = orchestration {
         let _ = orchestration.remove();
     }
