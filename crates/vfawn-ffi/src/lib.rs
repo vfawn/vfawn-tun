@@ -76,7 +76,7 @@ const NULL_HANDLE: vfawn_instance_t = VFAWN_NULL_HANDLE;
 // --- The judge callback: the host's one synchronous seat --------------
 
 /// The verdict callback. `flow_json` is a borrowed, NUL-terminated
-/// JSON view of the flow (`{"source":"ip:port","destination":…,
+/// JSON view of the flow (`{"source":"ip:port","destination":...,
 /// "network":"tcp"}`) valid only for the call; copy what you keep.
 /// The callback runs on a data-plane thread: it must not block and
 /// must not reenter the ABI.

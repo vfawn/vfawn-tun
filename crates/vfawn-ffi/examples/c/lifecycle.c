@@ -3,11 +3,19 @@
 
 /*
  * The C host's whole lifecycle: validate, create, judge, start,
- * stats, hot-update, shutdown, destroy. One file, no framework — the
+ * stats, hot-update, shutdown, destroy. One file, no framework, the
  * ABI is the framework.
  *
  *   cc lifecycle.c -I ../../include -L ../../../../target/debug \
  *      -lvfawn_ffi -o lifecycle && LD_LIBRARY_PATH=../../../../target/debug ./lifecycle
+ *
+ * MSVC, from the workspace root in a developer prompt: rustc names the
+ * cdylib's import library vfawn_ffi.dll.lib, and the DLL must be on
+ * PATH at run time.
+ *
+ *   cl /utf-8 /WX /I crates\vfawn-ffi\include crates\vfawn-ffi\examples\c\lifecycle.c ^
+ *      /link /LIBPATH:target\debug vfawn_ffi.dll.lib /OUT:vfawn-lifecycle.exe
+ *   set PATH=%CD%\target\debug;%PATH% && vfawn-lifecycle.exe
  */
 
 #include <stdio.h>
@@ -59,7 +67,7 @@ int main(void) {
     check(vfawn_set_handler(instance, &vtable) == VFAWN_OK,
           "the judge vtable was accepted");
 
-    /* The real start: device up (no capture — the config's route is
+    /* The real start: device up (no capture, the config's route is
      * off), sessions flowing under the judge above. Privileges are
      * the platform's own rule for interface creation. */
     int started = vfawn_instance_start(instance, err, sizeof err);

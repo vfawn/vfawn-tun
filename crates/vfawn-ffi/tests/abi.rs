@@ -50,6 +50,23 @@ fn the_header_regenerates_byte_for_byte() {
     );
 }
 
+/// The C sources a host compiles stay ASCII: MSVC reads a BOM-less
+/// file in the system code page (936 on Chinese Windows) and warns
+/// C4819 on anything outside it, which `/WX` turns into a failure.
+#[test]
+fn the_c_sources_are_ascii() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    for file in ["include/vfawn.h", "examples/c/lifecycle.c"] {
+        let text = std::fs::read_to_string(root.join(file)).expect("the C source");
+        let offender = text.lines().enumerate().find(|(_, line)| !line.is_ascii());
+        assert!(
+            offender.is_none(),
+            "{file}:{} is not ASCII; the doc comments in src/ feed the header",
+            offender.map_or(0, |(index, _)| index + 1)
+        );
+    }
+}
+
 #[test]
 fn a_good_configuration_validates() {
     let mut err = [0u8; 256];
