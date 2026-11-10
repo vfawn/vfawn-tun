@@ -102,23 +102,21 @@ struct MonitorState {
 impl MonitorState {
     fn capture() -> Self {
         let snapshot = adapter_snapshot().unwrap_or_default();
-        let mut state = Self {
+        Self {
             links_up: snapshot
                 .adapters
                 .iter()
                 .filter(|adapter| adapter.up)
                 .map(|adapter| adapter.name.clone())
                 .collect(),
-            default_interface: None,
-        };
-        // The default route is the 0.0.0.0/0 row with the lowest
-        // metric; the platform keeps one table, so the search is a
-        // scan. A second table query for one row would be honest too;
-        // scanning the route snapshot keeps one API family per poll.
-        if let Ok(routes) = default_route_owner(&snapshot) {
-            state.default_interface = routes;
+            // Chosen the way the outbound bind chooses it (sing-tun's
+            // `checkUpdate`): the TUN's own default route is virtual
+            // and never names the way out.
+            default_interface: crate::windows::default_if::current_default_interface()
+                .ok()
+                .flatten()
+                .map(|interface| interface.name),
         }
-        state
     }
 
     fn diff(&self, new: &Self) -> Vec<MonitorEvent> {
@@ -132,45 +130,5 @@ impl MonitorState {
             });
         }
         events
-    }
-}
-
-/// The interface owning the default route, from the route table.
-fn default_route_owner(
-    snapshot: &crate::windows::route_backend::AdapterSnapshot,
-) -> io::Result<Option<String>> {
-    use windows_sys::Win32::Foundation::ERROR_SUCCESS;
-    use windows_sys::Win32::NetworkManagement::IpHelper::{
-        FreeMibTable, GetIpForwardTable2, MIB_IPFORWARD_TABLE2,
-    };
-    use windows_sys::Win32::Networking::WinSock::AF_INET;
-    // SAFETY: the table the kernel filled is freed before return; the
-    // rows are read inside the lifetime of that fill.
-    #[expect(unsafe_code)]
-    unsafe {
-        let mut table: *mut MIB_IPFORWARD_TABLE2 = std::ptr::null_mut();
-        if GetIpForwardTable2(AF_INET, &mut table) != ERROR_SUCCESS || table.is_null() {
-            return Ok(None);
-        }
-        let count = (*table).NumEntries as usize;
-        let rows = std::slice::from_raw_parts((*table).Table.as_ptr(), count);
-        let mut best: Option<(u32, u32)> = None; // (metric, index)
-        for row in rows {
-            let prefix = &row.DestinationPrefix;
-            let is_default = prefix.PrefixLength == 0
-                && prefix.Prefix.si_family == AF_INET
-                && prefix.Prefix.Ipv4.sin_addr.S_un.S_addr == 0;
-            if is_default && best.is_none_or(|(metric, _)| row.Metric < metric) {
-                best = Some((row.Metric, row.InterfaceIndex));
-            }
-        }
-        FreeMibTable(table.cast());
-        Ok(best.and_then(|(_, index)| {
-            snapshot
-                .adapters
-                .iter()
-                .find(|adapter| adapter.index == index)
-                .map(|adapter| adapter.name.clone())
-        }))
     }
 }
