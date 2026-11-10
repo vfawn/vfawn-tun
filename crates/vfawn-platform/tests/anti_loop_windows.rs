@@ -3,7 +3,7 @@
 
 //! Live checks of the Windows bind variant: the default interface is
 //! read off the host's routing table, and the option lands on the
-//! socket in each family's own byte order. IP_UNICAST_IF needs no
+//! socket naming that interface. IP_UNICAST_IF needs no
 //! elevation; the tests are ignored only because they read the live
 //! network.
 //!
@@ -55,7 +55,7 @@ fn the_default_interface_is_a_real_way_out() {
 
 #[test]
 #[ignore]
-fn protect_binds_a_v4_socket_in_network_order() {
+fn protect_binds_a_v4_socket_to_the_default_index() {
     let default = current_default_interface().unwrap().expect("default route");
     let socket = UdpSocket::bind("0.0.0.0:0").expect("udp socket");
     let raw = socket.as_raw_socket();
@@ -67,10 +67,10 @@ fn protect_binds_a_v4_socket_in_network_order() {
 
     let bound = protect(&OutboundFdHook::BindDefaultIface, raw).expect("apply the hook");
     assert_eq!(bound.as_deref(), Some(default.name.as_str()));
-    assert_eq!(
-        read_option(raw, IPPROTO_IP, IP_UNICAST_IF),
-        default.index.to_be()
-    );
+    // Set in network order, read back in host order (the IPPROTO_IP
+    // option table: "When getting this option, the optval returns the
+    // current default interface index ... in host byte order").
+    assert_eq!(read_option(raw, IPPROTO_IP, IP_UNICAST_IF), default.index);
 }
 
 #[test]
