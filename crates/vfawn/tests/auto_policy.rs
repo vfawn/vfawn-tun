@@ -57,9 +57,9 @@ fn a_userspace_policy_starts_the_instance() {
                 || text.contains("device")
                 // A runner without the device's permissions refuses it
                 // by errno, not by name — still the device's failure,
-                // still nothing the policy seam would explain.
-                || text.contains("Operation not permitted")
-                || text.contains("Permission denied"),
+                // still nothing the policy seam would explain. The kind,
+                // not the text: Windows words it in the system language.
+                || error.kind() == std::io::ErrorKind::PermissionDenied,
             "the failure must be the device, not the policy seam: {text}"
         );
     }
