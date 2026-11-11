@@ -32,3 +32,32 @@ pub trait RouteBackend: Send + Sync {
     /// kernel. Used by dry-run to report what would actually change.
     fn is_in_effect(&self, op: &RouteOp) -> io::Result<bool>;
 }
+
+/// The interface an operation names no longer exists: the device was
+/// removed underneath the capture. Carried inside an `io::Error` so a
+/// backend can say so through the narrow trait above, and told apart
+/// from every other `NotFound` (a netlink delete of an absent route
+/// answers `ENOENT` too, which is not this).
+#[derive(Debug)]
+pub struct InterfaceGone(pub String);
+
+impl std::fmt::Display for InterfaceGone {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "interface {} does not exist", self.0)
+    }
+}
+
+impl std::error::Error for InterfaceGone {}
+
+/// The error a backend answers when the interface it was told to use
+/// is gone.
+pub fn interface_gone(name: &str) -> io::Error {
+    io::Error::new(io::ErrorKind::NotFound, InterfaceGone(name.to_string()))
+}
+
+/// Whether `error` is a backend's [`interface_gone`].
+pub fn is_interface_gone(error: &io::Error) -> bool {
+    error
+        .get_ref()
+        .is_some_and(|inner| inner.is::<InterfaceGone>())
+}

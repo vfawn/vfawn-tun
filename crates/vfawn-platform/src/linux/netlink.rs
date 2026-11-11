@@ -364,10 +364,7 @@ fn resolve_ifindex(name: &str) -> io::Result<u32> {
     // call; if_nametoindex reads it and returns an integer.
     let index = unsafe { if_nametoindex(cname.as_ptr()) };
     if index == 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            format!("interface not found: {name}"),
-        ));
+        return Err(vfawn_route::interface_gone(name));
     }
     Ok(index)
 }

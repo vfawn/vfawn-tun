@@ -14,7 +14,7 @@ use std::io;
 use std::net::{IpAddr, Ipv4Addr};
 
 use ipnet::IpNet;
-use vfawn_route::backend::RouteBackend;
+use vfawn_route::backend::{RouteBackend, interface_gone};
 use vfawn_route::model::{ObservedState, RouteEntry, RouteOp};
 use windows_sys::Win32::Foundation::{ERROR_NOT_FOUND, ERROR_OBJECT_ALREADY_EXISTS, ERROR_SUCCESS};
 use windows_sys::Win32::NetworkManagement::IpHelper::{
@@ -112,12 +112,7 @@ impl WindowsRouteBackend {
             .iter()
             .find(|adapter| Some(&adapter.name) == entry.interface.as_ref())
             .map(|adapter| adapter.index)
-            .ok_or_else(|| {
-                io::Error::other(format!(
-                    "route interface {:?} does not exist",
-                    entry.interface
-                ))
-            })?;
+            .ok_or_else(|| interface_gone(entry.interface.as_deref().unwrap_or_default()))?;
         unsafe {
             let mut row: MIB_IPFORWARD_ROW2 = std::mem::zeroed();
             InitializeIpForwardEntry(&mut row);

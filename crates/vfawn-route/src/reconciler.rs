@@ -48,6 +48,11 @@ pub enum ReconcileError {
         residuals: Vec<String>,
         cause: String,
     },
+    /// The forward pass met an interface that no longer exists and the
+    /// rollback restored the original state. The device was removed
+    /// underneath the capture; its own read path reports that, so this
+    /// pass has nothing further to say.
+    InterfaceGone { cause: String },
     /// The backend snapshot failed before any operations were attempted.
     SnapshotFailed(String),
 }
@@ -64,6 +69,7 @@ impl std::fmt::Display for ReconcileError {
                 "rollback incomplete ({} residuals): {cause}",
                 residuals.len()
             ),
+            Self::InterfaceGone { cause } => write!(f, "interface gone: {cause}"),
             Self::SnapshotFailed(c) => write!(f, "snapshot failed: {c}"),
         }
     }
@@ -112,7 +118,15 @@ impl Reconciler {
                 }
                 Err(e) => {
                     self.log("apply", op, &format!("error:{e}"));
-                    return self.rollback(applied, format!("{}: {e}", op.describe()));
+                    let gone = crate::backend::is_interface_gone(&e);
+                    // A clean rollback after a vanished interface is
+                    // its own outcome; residuals stay the louder news.
+                    return match self.rollback(applied, format!("{}: {e}", op.describe())) {
+                        Err(ReconcileError::RolledBack { cause, .. }) if gone => {
+                            Err(ReconcileError::InterfaceGone { cause })
+                        }
+                        other => other,
+                    };
                 }
             }
         }
@@ -266,13 +280,16 @@ mod tests {
     use super::*;
     use crate::model::*;
     use std::io;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     /// A backend that records operations and can fail at a chosen step.
     struct MockBackend {
         state: Mutex<ObservedState>,
         calls: Mutex<Vec<String>>,
         fail_at: AtomicUsize,
+        /// What the injected failure is: a vanished interface, or any
+        /// other refusal.
+        fail_gone: AtomicBool,
     }
 
     impl MockBackend {
@@ -281,6 +298,7 @@ mod tests {
                 state: Mutex::new(ObservedState::default()),
                 calls: Mutex::new(Vec::new()),
                 fail_at: AtomicUsize::new(usize::MAX),
+                fail_gone: AtomicBool::new(false),
             }
         }
 
@@ -302,7 +320,11 @@ mod tests {
             let n = self.calls.lock().unwrap().len();
             self.calls.lock().unwrap().push(op.describe());
             if n == self.fail_at.load(Ordering::SeqCst) {
-                return Err(io::Error::other("injected failure"));
+                return Err(if self.fail_gone.load(Ordering::SeqCst) {
+                    crate::backend::interface_gone("tun0")
+                } else {
+                    io::Error::new(io::ErrorKind::NotFound, "injected failure")
+                });
             }
             let mut state = self.state.lock().unwrap();
             planner::simulate_apply(
@@ -502,6 +524,36 @@ mod tests {
         assert!(snap.addresses.is_empty());
         assert!(snap.routes.is_empty());
         assert!(snap.rules.is_empty());
+    }
+
+    #[test]
+    fn a_vanished_interface_rolls_back_and_says_so() {
+        let backend = Arc::new(MockBackend::new());
+        backend.fail_at_step(2);
+        backend.fail_gone.store(true, Ordering::SeqCst);
+        let re = Reconciler::new(backend.clone());
+
+        match re.apply(&test_desired()) {
+            Err(ReconcileError::InterfaceGone { cause }) => {
+                assert!(cause.contains("tun0"), "{cause}");
+            }
+            other => panic!("expected InterfaceGone, got {other:?}"),
+        }
+        let snap = backend.snapshot().unwrap();
+        assert!(snap.addresses.is_empty() && snap.routes.is_empty() && snap.rules.is_empty());
+    }
+
+    #[test]
+    fn any_other_not_found_stays_a_failure() {
+        // A netlink delete of an absent route answers ENOENT, the same
+        // kind; only the backend's own marker means the device is gone.
+        let backend = Arc::new(MockBackend::new());
+        backend.fail_at_step(2);
+        let re = Reconciler::new(backend);
+        assert!(matches!(
+            re.apply(&test_desired()),
+            Err(ReconcileError::RolledBack { .. })
+        ));
     }
 
     #[test]

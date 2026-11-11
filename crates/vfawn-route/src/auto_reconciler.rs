@@ -10,7 +10,7 @@
 //! coalesce into at most one follow-up pass.
 
 use crate::model::DesiredState;
-use crate::reconciler::Reconciler;
+use crate::reconciler::{ReconcileError, Reconciler};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::Receiver;
@@ -64,7 +64,16 @@ impl AutoReconciler {
                         // hot-updated since the last pass).
                         let snapshot = desired.read().expect("desired state lock poisoned").clone();
                         match reconciler.apply(&snapshot) {
-                            Ok(()) => {}
+                            // The device was removed underneath us
+                            // (an adapter disabled by hand): its read
+                            // fails and the host shuts down, which is
+                            // the report. Routes onto it cannot heal,
+                            // and sing-tun never tries — Windows
+                            // installs them once at start
+                            // (`tun_windows.go`), Linux re-sets rules
+                            // only on an Android VPN update
+                            // (`tun_linux.go:1177-1187`).
+                            Ok(()) | Err(ReconcileError::InterfaceGone { .. }) => {}
                             Err(e) => {
                                 eprintln!("auto-reconcile failed: {e:?}");
                             }

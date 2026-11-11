@@ -21,7 +21,7 @@ pub mod planner;
 pub mod reconciler;
 
 pub use auto_reconciler::AutoReconciler;
-pub use backend::RouteBackend;
+pub use backend::{InterfaceGone, RouteBackend, interface_gone, is_interface_gone};
 pub use model::{
     Conflict, DesiredState, InterfaceAddress, ObservedState, Plan, PolicyRule, RouteEntry, RouteOp,
     RuleAction, RuleSelector,
