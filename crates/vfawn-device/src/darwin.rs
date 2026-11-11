@@ -15,17 +15,20 @@
 //! own business; the pipeline sees the same raw-IP framing the Linux
 //! path hands it.
 
+use std::collections::VecDeque;
 use std::io;
 use std::io::ErrorKind;
 use std::os::fd::{AsRawFd, RawFd};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
+use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError};
 use std::thread;
 
 use bytes::BytesMut;
 use tun_rs::{DeviceBuilder, SyncDevice};
 use vfawn_core::{DeviceCaps, DeviceConfig, PacketDevice};
+
+use crate::read_queue::{self, Backlog, Delivery};
 
 /// Frame budget when the configuration leaves the MTU to the platform.
 const DEFAULT_MTU: u32 = 65535;
@@ -147,6 +150,16 @@ struct Shared {
     writes: SyncSender<Vec<BytesMut>>,
     wake: Arc<WakePipe>,
     stopped: AtomicBool,
+    backlog: Backlog,
+}
+
+impl Shared {
+    /// Wake the I/O thread wherever it waits: the kqueue park through
+    /// the bell, a held batch's park through the backlog.
+    fn wake(&self) {
+        self.backlog.wake();
+        self.wake.ring();
+    }
 }
 
 /// One end of the device: the reader's half by construction, the
@@ -157,7 +170,7 @@ pub struct TunDevice {
     reads: Option<Receiver<Vec<BytesMut>>>,
     /// Frames of a batch the caller's buffer could not take in one
     /// call; the next call serves these before another batch lands.
-    leftover: std::collections::VecDeque<BytesMut>,
+    leftover: VecDeque<BytesMut>,
     caps: DeviceCaps,
     name: Option<String>,
 }
@@ -171,7 +184,7 @@ impl ShutdownHandle {
     /// Request shutdown. Idempotent.
     pub fn shutdown(&self) -> io::Result<()> {
         self.shared.stopped.store(true, Ordering::Release);
-        self.shared.wake.ring();
+        self.shared.wake();
         Ok(())
     }
 }
@@ -239,6 +252,7 @@ impl TunDevice {
             writes: write_tx,
             wake: Arc::clone(&wake),
             stopped: AtomicBool::new(false),
+            backlog: Backlog::default(),
         });
         let io_shared = Arc::clone(&shared);
         thread::Builder::new()
@@ -247,7 +261,7 @@ impl TunDevice {
         Ok(TunDevice {
             shared,
             reads: Some(read_rx),
-            leftover: std::collections::VecDeque::new(),
+            leftover: VecDeque::new(),
             caps,
             name: Some(name),
         })
@@ -426,6 +440,11 @@ fn io_loop(shared: Arc<Shared>, device: SyncDevice, writes: Receiver<Vec<BytesMu
     let mut frames: Vec<BytesMut> = Vec::with_capacity(slot_count);
     let mut prefix: [u8; 4] = [0; 4];
     let mut refused: u64 = 0;
+    shared.backlog.register();
+    // A batch the read channel had no room for: while it waits nothing
+    // more is read, and the backlog stays in the kernel's utun queue
+    // (read_queue.rs says why).
+    let mut held: Option<Vec<BytesMut>> = None;
 
     // The park: the descriptor for packets, the wake pipe for writes
     // and shutdowns. Registered once, level-triggered.
@@ -536,6 +555,20 @@ fn io_loop(shared: Arc<Shared>, device: SyncDevice, writes: Receiver<Vec<BytesMu
         if shared.stopped.load(Ordering::Acquire) {
             return;
         }
+        if let Some(frames) = held.take() {
+            match shared.backlog.deliver(&shared.reads, frames) {
+                Delivery::Sent => {}
+                Delivery::Held(frames) => {
+                    held = Some(frames);
+                    shared.backlog.wait();
+                    continue;
+                }
+                Delivery::Gone => {
+                    eprintln!("vfawn: tun I/O stopped: reader gone");
+                    return;
+                }
+            }
+        }
 
         // One batch read of everything the kernel queued.
         // SAFETY: the slot storage outlives the syscall (same frame),
@@ -571,10 +604,13 @@ fn io_loop(shared: Arc<Shared>, device: SyncDevice, writes: Receiver<Vec<BytesMu
                 slot.frame.resize(mtu + 4, 0);
             }
             if !frames.is_empty() {
-                match shared.reads.try_send(std::mem::take(&mut frames)) {
-                    Ok(()) => {}
-                    Err(TrySendError::Full(_dropped)) => {}
-                    Err(TrySendError::Disconnected(_)) => {
+                match shared
+                    .backlog
+                    .deliver(&shared.reads, std::mem::take(&mut frames))
+                {
+                    Delivery::Sent => {}
+                    Delivery::Held(batch) => held = Some(batch),
+                    Delivery::Gone => {
                         eprintln!("vfawn: tun I/O stopped: reader gone");
                         return;
                     }
@@ -630,35 +666,14 @@ impl PacketDevice for TunDevice {
         if self.shared.stopped.load(Ordering::Acquire) {
             return Ok(0);
         }
-        // Serve the leftovers of an earlier oversized batch first: a
-        // dropped tail would be silent packet loss the caller can
-        // neither see nor pace against.
-        let mut served = 0;
-        while served < bufs.len() {
-            let Some(mut frame) = self.leftover.pop_front() else {
-                break;
-            };
-            std::mem::swap(&mut bufs[served], &mut frame);
-            served += 1;
+        // The leftovers of an earlier oversized batch first: a dropped
+        // tail would be silent packet loss the caller can neither see
+        // nor pace against.
+        let served = read_queue::fill(reads, &mut self.leftover, bufs);
+        if served > 0 {
+            // Room was made: a batch the I/O thread holds can go now.
+            self.shared.backlog.wake();
         }
-        if served == bufs.len() {
-            return Ok(served);
-        }
-        let frames = match reads.recv_timeout(std::time::Duration::from_millis(50)) {
-            Ok(frames) => frames,
-            Err(_) => return Ok(served),
-        };
-        let mut frames = frames.into_iter();
-        while served < bufs.len() {
-            match frames.next() {
-                Some(mut frame) => {
-                    std::mem::swap(&mut bufs[served], &mut frame);
-                    served += 1;
-                }
-                None => return Ok(served),
-            }
-        }
-        self.leftover.extend(frames);
         Ok(served)
     }
 
@@ -671,7 +686,7 @@ impl PacketDevice for TunDevice {
         if self.shared.writes.send(batch).is_err() {
             return Err(io::Error::new(ErrorKind::NotConnected, "device is down"));
         }
-        self.shared.wake.ring();
+        self.shared.wake();
         Ok(count)
     }
 
@@ -690,7 +705,7 @@ impl PacketDevice for TunDevice {
         Ok(Box::new(TunDevice {
             shared: Arc::clone(&self.shared),
             reads: None,
-            leftover: std::collections::VecDeque::new(),
+            leftover: VecDeque::new(),
             caps: self.caps,
             name: self.name.clone(),
         }))

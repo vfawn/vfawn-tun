@@ -12,12 +12,15 @@
 //! no external DLL; the pipeline sees the same raw-IP framing every
 //! other platform hands it.
 
+use std::collections::VecDeque;
 use std::io;
 use std::io::ErrorKind;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
+use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError};
 use std::thread;
+
+use crate::read_queue::{self, Backlog, Delivery};
 
 use bytes::BytesMut;
 use tun_rs::{DeviceBuilder, InterruptEvent, SyncDevice};
@@ -46,6 +49,16 @@ struct Shared {
     /// next packet.
     event: Arc<InterruptEvent>,
     stopped: AtomicBool,
+    backlog: Backlog,
+}
+
+impl Shared {
+    /// Wake the I/O thread wherever it waits: the ring's park through
+    /// the event, a held frame's park through the backlog.
+    fn wake(&self) -> io::Result<()> {
+        self.backlog.wake();
+        self.event.trigger()
+    }
 }
 
 /// One end of the device: the reader's half by construction, the
@@ -54,6 +67,7 @@ struct Shared {
 pub struct TunDevice {
     shared: Arc<Shared>,
     reads: Option<Receiver<Vec<BytesMut>>>,
+    leftover: VecDeque<BytesMut>,
     caps: DeviceCaps,
     name: Option<String>,
 }
@@ -67,7 +81,7 @@ impl ShutdownHandle {
     /// Request shutdown. Idempotent.
     pub fn shutdown(&self) -> io::Result<()> {
         self.shared.stopped.store(true, Ordering::Release);
-        self.shared.event.trigger()
+        self.shared.wake()
     }
 }
 
@@ -141,6 +155,7 @@ impl TunDevice {
             writes: write_tx,
             event: Arc::clone(&event),
             stopped: AtomicBool::new(false),
+            backlog: Backlog::default(),
         });
         let io_shared = Arc::clone(&shared);
         thread::Builder::new()
@@ -149,6 +164,7 @@ impl TunDevice {
         Ok(TunDevice {
             shared,
             reads: Some(read_rx),
+            leftover: VecDeque::new(),
             caps,
             name: Some(name),
         })
@@ -186,7 +202,11 @@ fn io_loop(shared: Arc<Shared>, device: SyncDevice, writes: Receiver<Vec<BytesMu
     let seg = 1514;
     let mut buf = BytesMut::zeroed(seg);
     let mut refused: u64 = 0;
-    let mut overflowed: u64 = 0;
+    shared.backlog.register();
+    // A frame the read queue had no room for: while it waits nothing
+    // more leaves the ring, and the backlog stays in the driver's ring
+    // (read_queue.rs says why).
+    let mut held: Option<Vec<BytesMut>> = None;
 
     loop {
         // Writes first: a batch already waiting is worth more than
@@ -225,6 +245,21 @@ fn io_loop(shared: Arc<Shared>, device: SyncDevice, writes: Receiver<Vec<BytesMu
             return;
         }
 
+        if let Some(frames) = held.take() {
+            match shared.backlog.deliver(&shared.reads, frames) {
+                Delivery::Sent => {}
+                Delivery::Held(frames) => {
+                    held = Some(frames);
+                    shared.backlog.wait();
+                    continue;
+                }
+                Delivery::Gone => {
+                    eprintln!("vfawn: tun I/O stopped: reader gone");
+                    return;
+                }
+            }
+        }
+
         // One packet. Receive first and park only once the ring answers
         // empty, as Wintun's own receive loop and sing-tun's Read
         // (tun_windows.go:428-438) do: the read event is armed by the
@@ -244,18 +279,10 @@ fn io_loop(shared: Arc<Shared>, device: SyncDevice, writes: Receiver<Vec<BytesMu
         match received {
             Ok(n) if n > 0 => {
                 let frame = buf.split_to(n);
-                match shared.reads.try_send(vec![frame]) {
-                    Ok(()) => {}
-                    Err(TrySendError::Full(_dropped)) => {
-                        // The stack fell behind the ring: the frame is
-                        // lost here instead of in the driver, and the
-                        // count says so.
-                        overflowed = overflowed.wrapping_add(1);
-                        if overflowed == 1 || overflowed.is_multiple_of(10_000) {
-                            eprintln!("vfawn: tun read queue full; dropped {overflowed} frames");
-                        }
-                    }
-                    Err(TrySendError::Disconnected(_)) => {
+                match shared.backlog.deliver(&shared.reads, vec![frame]) {
+                    Delivery::Sent => {}
+                    Delivery::Held(frames) => held = Some(frames),
+                    Delivery::Gone => {
                         eprintln!("vfawn: tun I/O stopped: reader gone");
                         return;
                     }
@@ -297,15 +324,11 @@ impl PacketDevice for TunDevice {
         if self.shared.stopped.load(Ordering::Acquire) {
             return Err(io::Error::new(ErrorKind::NotConnected, "device is down"));
         }
-        let mut frames = match reads.recv_timeout(std::time::Duration::from_millis(50)) {
-            Ok(frames) => frames,
-            Err(_) => return Ok(0),
-        };
-        // One packet rides each message by construction — the ring's
-        // pop is one packet per call — so the swap never truncates.
-        let count = frames.len().min(bufs.len());
-        for (slot, frame) in bufs.iter_mut().zip(frames.iter_mut()).take(count) {
-            std::mem::swap(slot, frame);
+        // A backlog drains a caller's batch per call, not a frame.
+        let count = read_queue::fill(reads, &mut self.leftover, bufs);
+        if count > 0 {
+            // Room was made: a frame the I/O thread holds can go now.
+            self.shared.backlog.wake();
         }
         Ok(count)
     }
@@ -319,7 +342,7 @@ impl PacketDevice for TunDevice {
         if self.shared.writes.send(batch).is_err() {
             return Err(io::Error::new(ErrorKind::NotConnected, "device is down"));
         }
-        self.shared.event.trigger()?;
+        self.shared.wake()?;
         Ok(count)
     }
 
@@ -338,6 +361,7 @@ impl PacketDevice for TunDevice {
         Ok(Box::new(TunDevice {
             shared: Arc::clone(&self.shared),
             reads: None,
+            leftover: VecDeque::new(),
             caps: self.caps,
             name: self.name.clone(),
         }))

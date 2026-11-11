@@ -13,6 +13,7 @@
 //! lets the kernel steer inbound packets to the half that never reads.
 //! A thread that owns both directions has neither problem.
 
+use std::collections::VecDeque;
 use std::io;
 use std::io::ErrorKind;
 use std::os::fd::RawFd;
@@ -25,6 +26,8 @@ use std::thread;
 use bytes::BytesMut;
 use tun_rs::{DeviceBuilder, InterruptEvent, SyncDevice, VIRTIO_NET_HDR_LEN};
 use vfawn_core::{DeviceCaps, DeviceConfig, PacketDevice};
+
+use crate::read_queue::{self, Backlog, Delivery};
 
 /// Frame budget when the configuration leaves the MTU to the platform.
 /// Large frames keep the syscall rate down; the kernel never reads past
@@ -54,6 +57,7 @@ struct Shared {
     writes: SyncSender<Vec<BytesMut>>,
     event: InterruptEvent,
     stopped: AtomicBool,
+    backlog: Backlog,
     /// The read-side fast dispatch, installed once at stack spawn: a
     /// claimed packet never enters the read channel. The lock is taken
     /// once per read batch, not per packet, and is otherwise
@@ -71,6 +75,10 @@ struct Shared {
 pub struct TunDevice {
     shared: Arc<Shared>,
     reads: Option<Receiver<Vec<BytesMut>>>,
+    /// The tail of a batch wider than the caller's buffers: a merged
+    /// GRO burst splits into up to [`BATCH`] frames, more than a
+    /// caller asks for at once.
+    leftover: VecDeque<BytesMut>,
     caps: DeviceCaps,
     name: Option<String>,
 }
@@ -87,6 +95,7 @@ impl ShutdownHandle {
     /// Request shutdown and wake the I/O thread. Idempotent.
     pub fn shutdown(&self) -> io::Result<()> {
         self.shared.stopped.store(true, Ordering::Release);
+        self.shared.backlog.wake();
         self.shared.event.trigger()
     }
 }
@@ -201,6 +210,7 @@ impl TunDevice {
             writes: write_tx,
             event,
             stopped: AtomicBool::new(false),
+            backlog: Backlog::default(),
             dispatch: Mutex::new(None),
             release: Mutex::new(None),
         });
@@ -227,6 +237,7 @@ impl TunDevice {
         Ok(TunDevice {
             shared,
             reads: Some(read_rx),
+            leftover: VecDeque::new(),
             caps,
             name: Some(name),
         })
@@ -265,6 +276,11 @@ fn io_loop(shared: Arc<Shared>, device: Arc<SharedTun>, vnet: bool) {
     let seg = 1514;
     let mut bufs: Vec<BytesMut> = (0..BATCH).map(|_| BytesMut::zeroed(seg)).collect();
     let mut original = vec![0u8; VIRTIO_NET_HDR_LEN + 65535];
+    shared.backlog.register();
+    // A batch the read channel had no room for: while it waits nothing
+    // more is read, and the backlog stays in the kernel's tun queue
+    // (read_queue.rs says why).
+    let mut held: Option<Vec<BytesMut>> = None;
 
     loop {
         for buf in bufs.iter_mut() {
@@ -274,6 +290,20 @@ fn io_loop(shared: Arc<Shared>, device: Arc<SharedTun>, vnet: bool) {
         }
         if shared.stopped.load(Ordering::Acquire) {
             return;
+        }
+        if let Some(frames) = held.take() {
+            match shared.backlog.deliver(&shared.reads, frames) {
+                Delivery::Sent => {}
+                Delivery::Held(frames) => {
+                    held = Some(frames);
+                    shared.backlog.wait();
+                    continue;
+                }
+                Delivery::Gone => {
+                    eprintln!("vfawn: tun I/O stopped: reader gone");
+                    return;
+                }
+            }
         }
         match device
             .0
@@ -325,17 +355,14 @@ fn io_loop(shared: Arc<Shared>, device: Arc<SharedTun>, vnet: bool) {
                 if frames.is_empty() {
                     continue;
                 }
-                // A full read channel drops the batch (a qdisc-shaped
-                // loss: TCP retransmits, UDP loses one datagram).
-                // Blocking here would freeze the device: the single
-                // I/O thread is the only reader AND the only writer,
-                // so a blocked send stalls both directions, which is
-                // the intermittent whole-pipeline death the multi-
-                // round bench kept hitting.
-                match shared.reads.try_send(frames) {
-                    Ok(()) => {}
-                    Err(std::sync::mpsc::TrySendError::Full(_dropped)) => {}
-                    Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                // A full read channel holds the batch rather than drop
+                // it. Not a blocking send: that would sleep through
+                // the stop flag, and the park the hold takes wakes on
+                // it as on the reader's room.
+                match shared.backlog.deliver(&shared.reads, frames) {
+                    Delivery::Sent => {}
+                    Delivery::Held(frames) => held = Some(frames),
+                    Delivery::Gone => {
                         eprintln!("vfawn: tun I/O stopped: reader gone");
                         return;
                     }
@@ -478,18 +505,13 @@ impl PacketDevice for TunDevice {
         if self.shared.stopped.load(Ordering::Acquire) {
             return Ok(0);
         }
-        // The old contract returns zero when nothing arrived, and
-        // callers loop on it; an unbounded block here would hang every
-        // poll-style reader past its own deadline.
-        let mut frames = match reads.recv_timeout(std::time::Duration::from_millis(50)) {
-            Ok(frames) => frames,
-            Err(_) => return Ok(0),
-        };
-        // Ownership swaps, bytes never copy: the caller's buffers join
-        // the circulating pool by leaving here inside its frames.
-        let count = frames.len().min(bufs.len());
-        for (slot, frame) in bufs.iter_mut().zip(frames.iter_mut()).take(count) {
-            std::mem::swap(slot, frame);
+        // Ownership moves, bytes never copy. A batch wider than `bufs`
+        // keeps its tail for the next call: truncating it here lost
+        // every segment of a GRO burst past the caller's eighth.
+        let count = read_queue::fill(reads, &mut self.leftover, bufs);
+        if count > 0 {
+            // Room was made: a batch the I/O thread holds can go now.
+            self.shared.backlog.wake();
         }
         Ok(count)
     }
@@ -529,6 +551,7 @@ impl PacketDevice for TunDevice {
         Ok(Box::new(TunDevice {
             shared: Arc::clone(&self.shared),
             reads: None,
+            leftover: VecDeque::new(),
             caps: self.caps,
             name: self.name.clone(),
         }))
