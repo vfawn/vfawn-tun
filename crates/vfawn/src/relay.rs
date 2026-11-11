@@ -113,6 +113,9 @@ impl SessionHandler for RelayHandler {
 
     async fn on_tcp(&self, mut session: TcpSession) {
         use tokio::io::AsyncWriteExt;
+        // Every line this session writes names its flow, so the log
+        // reads as a session list rather than anonymous exits.
+        let source = session.flow().source;
         let destination = session.flow().destination;
         let mut outbound = match dial_tcp(&self.protect, destination).await {
             Ok(stream) => stream,
@@ -123,7 +126,7 @@ impl SessionHandler for RelayHandler {
                 // line names the dial's refusal in the log; the
                 // session's drop closes the event channel, which is
                 // the slot's signal to reset the flow.
-                eprintln!("vfawn: relay dial failed to {destination} ({error})");
+                eprintln!("vfawn: relay tcp {source} -> {destination} dial failed ({error})");
                 return;
             }
         };
@@ -154,23 +157,23 @@ impl SessionHandler for RelayHandler {
             tokio::select! {
                 from_client = session.read_owned() => match from_client {
                     Ok(bytes) if bytes.is_empty() => {
-                        eprintln!("vfawn: relay exit: client EOF");
+                        eprintln!("vfawn: relay tcp {source} -> {destination} exit: client EOF");
                         break;
                     }
                     Err(error) => {
-                        eprintln!("vfawn: relay exit: client read error {error}");
+                        eprintln!("vfawn: relay tcp {source} -> {destination} exit: client read error {error}");
                         break;
                     }
                     Ok(bytes) => {
                         if let Err(error) = outbound.write_all(&bytes).await {
-                            eprintln!("vfawn: relay exit: outbound write {error}");
+                            eprintln!("vfawn: relay tcp {source} -> {destination} exit: outbound write {error}");
                             break;
                         }
                     }
                 },
                 ready = outbound.readable() => match ready {
                     Err(error) => {
-                        eprintln!("vfawn: relay exit: origin readable {error}");
+                        eprintln!("vfawn: relay tcp {source} -> {destination} exit: origin readable {error}");
                         break;
                     }
                     Ok(()) => {
@@ -200,16 +203,16 @@ impl SessionHandler for RelayHandler {
                                 continue;
                             }
                             Ok(0) => {
-                                eprintln!("vfawn: relay exit: origin EOF");
+                                eprintln!("vfawn: relay tcp {source} -> {destination} exit: origin EOF");
                                 break;
                             }
                             Err(error) => {
-                                eprintln!("vfawn: relay exit: origin read {error}");
+                                eprintln!("vfawn: relay tcp {source} -> {destination} exit: origin read {error}");
                                 break;
                             }
                             Ok(_) => {
                                 if let Err(error) = session.write(&down).await {
-                                    eprintln!("vfawn: relay exit: session write {error}");
+                                    eprintln!("vfawn: relay tcp {source} -> {destination} exit: session write {error}");
                                     break;
                                 }
                             }
@@ -229,6 +232,7 @@ impl SessionHandler for RelayHandler {
     }
 
     async fn on_udp(&self, mut session: UdpSession) {
+        let source = session.flow().source;
         let peer = session.flow().destination;
         let Ok(socket) = tokio::net::UdpSocket::bind("0.0.0.0:0").await else {
             return;
@@ -259,14 +263,14 @@ impl SessionHandler for RelayHandler {
                     Err(_) => break,
                     Ok((0, _)) => {}
                     Ok((n, _)) => {
-                        let client = session.flow().source;
-                        if session.send(&from_origin[..n], &client).await.is_err() {
+                        if session.send(&from_origin[..n], &source).await.is_err() {
                             break;
                         }
                     }
                 },
             }
         }
+        eprintln!("vfawn: relay udp {source} -> {peer} exit");
     }
 
     async fn on_icmp(&self, _packet: IcmpPacket) -> vfawn_core::Action {
