@@ -141,7 +141,18 @@ impl AcceptQueue {
             return None;
         }
         self.on_syn(source, now);
-        Some(self.sequence_for(source, now))
+        Some(self.secure_isn(source, now))
+    }
+
+    /// The ISN a new connection starts from, gVisor's
+    /// `generateSecureISN` (`connect.go`): a keyed hash of the flow
+    /// plus a 64 ns clock. The clock part keeps a reused four-tuple's
+    /// ISN climbing, so a SYN that reopens TIME-WAIT starts above the
+    /// old incarnation's sequence space (RFC 1122 4.2.2.13 (1)); the
+    /// whole 32-bit space takes ~274 s to wrap, beyond one TIME-WAIT.
+    fn secure_isn(&self, source: SocketAddr, now: Instant) -> u32 {
+        let ticks = (now.duration_since(self.epoch).as_nanos() >> 6) as u32;
+        self.sequence_at_generation(source, 0).wrapping_add(ticks)
     }
 
     /// The handshake completed for a flow. In backlog mode the
@@ -254,6 +265,21 @@ mod tests {
         queue.on_established(peer);
         assert_eq!(queue.half_open_len(), 0);
         assert_eq!(queue.established_count(), 1);
+    }
+
+    #[test]
+    fn a_reused_four_tuple_gets_a_climbing_isn() {
+        let mut queue = AcceptQueue::new(true, 8, Box::new(FixedSecret(0x8)));
+        let peer = client(40050);
+        let start = queue.epoch;
+        let first = queue.admit(peer, start).unwrap();
+        // One TIME-WAIT later, within a cookie generation or across
+        // one: the second incarnation starts ahead of the first.
+        for later in [Duration::from_micros(10), GENERATION, GENERATION * 2] {
+            let again = queue.admit(peer, start + later).unwrap();
+            let ahead = again.wrapping_sub(first);
+            assert!(ahead > 0 && ahead < u32::MAX / 2, "{later:?}: {ahead}");
+        }
     }
 
     #[test]

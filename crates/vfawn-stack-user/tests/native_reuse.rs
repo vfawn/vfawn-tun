@@ -116,9 +116,16 @@ fn await_segment(device: &MockDevice, wanted: u8, what: &str) -> Vec<u8> {
     found.expect("the segment")
 }
 
+/// The end of one connection: the client's send cursor and the
+/// server's ISN.
+struct Ends {
+    client_next: u32,
+    server_isn: u32,
+}
+
 /// One whole connection from `isn`, closed by `closer`, every
-/// segment answered. Returns the client's receive cursor at the end.
-fn one_connection(device: &MockDevice, script: &Script, isn: u32, closer: Closer) -> u32 {
+/// segment answered.
+fn one_connection(device: &MockDevice, script: &Script, isn: u32, closer: Closer) -> Ends {
     device.push(&[&script.tcp(isn, 0, SYN, b"")]);
     let server_isn = seq(&await_segment(device, SYN | ACK, "SYN-ACK"));
     let mut ours = isn.wrapping_add(1);
@@ -144,7 +151,10 @@ fn one_connection(device: &MockDevice, script: &Script, isn: u32, closer: Closer
             await_segment(device, ACK, "the ACK of our FIN");
         }
     }
-    ours
+    Ends {
+        client_next: ours,
+        server_isn,
+    }
 }
 
 fn the_port_reopens(closer: Closer) {
@@ -155,7 +165,7 @@ fn the_port_reopens(closer: Closer) {
         .expect("spawn native backend");
     let script = Script::new(CLIENT, SERVER);
 
-    let cursor = one_connection(&device, &script, 1000, closer);
+    let first = one_connection(&device, &script, 1000, closer);
     wait_for(
         || handler.sessions.load(Ordering::SeqCst) == 1,
         "the first session",
@@ -164,7 +174,20 @@ fn the_port_reopens(closer: Closer) {
 
     // The same four-tuple again, its ISN above everything the first
     // connection used (RFC 1122 4.2.2.13's condition for TIME-WAIT).
-    one_connection(&device, &script, cursor.wrapping_add(100_000), closer);
+    let second = one_connection(
+        &device,
+        &script,
+        first.client_next.wrapping_add(100_000),
+        closer,
+    );
+    // And ours above everything we used: the old ISN, its SYN and FIN.
+    let ahead = second.server_isn.wrapping_sub(first.server_isn);
+    assert!(
+        ahead > 1 && ahead < u32::MAX / 2,
+        "the server ISN must climb past the old FIN: {} -> {}",
+        first.server_isn,
+        second.server_isn
+    );
     wait_for(
         || handler.sessions.load(Ordering::SeqCst) == 2,
         "a second session on the reused port",

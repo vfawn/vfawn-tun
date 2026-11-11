@@ -406,11 +406,13 @@ impl ServerConnection {
 
     /// Whether `inbound` opens a new connection on this four-tuple: a
     /// SYN above everything the old one received, in TIME-WAIT (RFC
-    /// 1122 4.2.2.13; gVisor `rcv.go` `handleTimeWaitSegment`).
+    /// 1122 4.2.2.13; gVisor `rcv.go` `handleTimeWaitSegment`). The
+    /// reset check comes first there too, so a SYN|RST stays ignored.
     pub fn reopens_on(&self, inbound: &Inbound) -> bool {
         self.state == TcpState::TimeWait
             && inbound.has(ctl::SYN)
             && !inbound.has(ctl::ACK)
+            && !inbound.has(ctl::RST)
             && inbound.seq.wrapping_sub(self.recv.nxt).wrapping_sub(1) < u32::MAX / 2
     }
 
@@ -1454,6 +1456,10 @@ mod tests {
             "an old duplicate"
         );
         assert!(!connection.reopens_on(&segment(9000, 0, ctl::SYN | ctl::ACK)));
+        assert!(
+            !connection.reopens_on(&segment(9000, 0, ctl::SYN | ctl::RST)),
+            "RFC 1337: a reset never reopens either"
+        );
         assert!(
             !established().reopens_on(&segment(9000, 0, ctl::SYN)),
             "only TIME-WAIT yields its four-tuple"
