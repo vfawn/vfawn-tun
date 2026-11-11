@@ -31,6 +31,12 @@ const DEFAULT_MTU: u32 = 65535;
 const READ_DEPTH: usize = 1024;
 const WRITE_DEPTH: usize = 1024;
 
+/// The Wintun ring, in bytes: sing-tun's session size
+/// (`tun_windows.go:58`, `StartSession(0x800000)`). tun-rs's default
+/// is a quarter of it, and a ring that fills while the reader is
+/// descheduled is loss the driver takes silently.
+const RING_CAPACITY: u32 = 0x80_0000;
+
 /// Everything the handles share with the I/O thread.
 struct Shared {
     reads: SyncSender<Vec<BytesMut>>,
@@ -76,6 +82,7 @@ impl TunDevice {
         let mtu = effective_mtu(config.mtu);
         let mut builder = DeviceBuilder::new()
             .mtu(mtu as u16)
+            .ring_capacity(RING_CAPACITY)
             .wintun_file(extract_wintun_dll()?);
         if let Some(name) = &config.name {
             builder = builder.name(name.clone());
@@ -179,6 +186,7 @@ fn io_loop(shared: Arc<Shared>, device: SyncDevice, writes: Receiver<Vec<BytesMu
     let seg = 1514;
     let mut buf = BytesMut::zeroed(seg);
     let mut refused: u64 = 0;
+    let mut overflowed: u64 = 0;
 
     loop {
         // Writes first: a batch already waiting is worth more than
@@ -238,7 +246,15 @@ fn io_loop(shared: Arc<Shared>, device: SyncDevice, writes: Receiver<Vec<BytesMu
                 let frame = buf.split_to(n);
                 match shared.reads.try_send(vec![frame]) {
                     Ok(()) => {}
-                    Err(TrySendError::Full(_dropped)) => {}
+                    Err(TrySendError::Full(_dropped)) => {
+                        // The stack fell behind the ring: the frame is
+                        // lost here instead of in the driver, and the
+                        // count says so.
+                        overflowed = overflowed.wrapping_add(1);
+                        if overflowed == 1 || overflowed.is_multiple_of(10_000) {
+                            eprintln!("vfawn: tun read queue full; dropped {overflowed} frames");
+                        }
+                    }
                     Err(TrySendError::Disconnected(_)) => {
                         eprintln!("vfawn: tun I/O stopped: reader gone");
                         return;
