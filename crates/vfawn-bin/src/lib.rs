@@ -8,6 +8,7 @@
 //! argument parser on top.
 
 pub mod bench;
+pub mod stop;
 pub mod up;
 
 pub mod cleanup;

@@ -5,6 +5,8 @@
 
 use std::process::ExitCode;
 
+use vfawn_bin::stop::{STOP_DEADLINE, StopSignals, supervise};
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
@@ -67,100 +69,26 @@ fn up_command(args: &[String]) -> ExitCode {
         })
         .expect("spawn worker thread");
 
-    // Wait for a stop signal, or for the worker to leave on its own (a
-    // lost device), then wake the worker so it runs its shutdown chain.
+    // The main thread owns the signals: a stop request wakes the
+    // worker, which runs its shutdown chain within the stop deadline.
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .expect("signal runtime");
     let mut signals = {
         let _context = rt.enter();
-        StopSignals::new()
+        StopSignals::new().expect("signal handlers")
     };
-    rt.block_on(async {
-        tokio::select! {
-            () = signals.next() => {}
-            () = finished(&worker) => {}
-        }
-    });
-
-    // The worker parks between stop checks; ask, then wake it.
-    vfawn_bin::up::request_stop();
-    worker.thread().unpark();
-
-    // The orderly stop has a deadline, as sing-box's closeMonitor gives
-    // its own (FatalStopTimeout, 10s), and a second signal cuts it
-    // short: the installed handlers replaced the default action, so
-    // without this a stuck teardown would outlive every signal but
-    // SIGKILL. Returning from main ends the process, worker included;
-    // the device closes with its descriptor.
-    let outcome = rt.block_on(async {
-        tokio::select! {
-            () = finished(&worker) => None,
-            () = signals.next() => Some("a second signal"),
-            () = tokio::time::sleep(STOP_DEADLINE) => Some("the stop deadline"),
-        }
-    });
-    if let Some(cause) = outcome {
-        eprintln!("up: shutdown cut short by {cause}; exiting without it");
-        return ExitCode::FAILURE;
-    }
-
-    match worker.join() {
-        Ok(code) => code,
-        Err(_) => ExitCode::FAILURE,
-    }
-}
-
-/// How long an orderly stop may take before the process leaves
-/// without it: sing-box's FatalStopTimeout (constant/timeout.go:17).
-const STOP_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
-
-/// Resolves once the worker thread has returned.
-async fn finished<T>(worker: &std::thread::JoinHandle<T>) {
-    while !worker.is_finished() {
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-    }
-}
-
-/// The signals that stop `up`: SIGINT and SIGTERM, the pair sing-box's
-/// run loop listens for (cmd_run.go: os.Interrupt, syscall.SIGTERM).
-/// The streams are made once and kept, so a signal landing between two
-/// waits is still counted. Making them needs the runtime's context.
-struct StopSignals {
-    #[cfg(unix)]
-    interrupt: tokio::signal::unix::Signal,
-    #[cfg(unix)]
-    terminate: tokio::signal::unix::Signal,
-}
-
-impl StopSignals {
-    fn new() -> Self {
-        #[cfg(unix)]
-        {
-            use tokio::signal::unix::{SignalKind, signal};
-            Self {
-                interrupt: signal(SignalKind::interrupt()).expect("SIGINT handler"),
-                terminate: signal(SignalKind::terminate()).expect("SIGTERM handler"),
-            }
-        }
-        #[cfg(not(unix))]
-        {
-            Self {}
-        }
-    }
-
-    async fn next(&mut self) {
-        #[cfg(unix)]
-        {
-            tokio::select! {
-                _ = self.interrupt.recv() => {}
-                _ = self.terminate.recv() => {}
-            }
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = tokio::signal::ctrl_c().await;
+    let ask = |worker: &std::thread::Thread| {
+        vfawn_bin::up::request_stop();
+        worker.unpark();
+    };
+    match supervise(&rt, worker, &mut signals, ask, STOP_DEADLINE) {
+        Ok(Ok(code)) => code,
+        Ok(Err(_panic)) => ExitCode::FAILURE,
+        Err(cause) => {
+            eprintln!("up: shutdown cut short by {cause}; exiting without it");
+            ExitCode::FAILURE
         }
     }
 }
