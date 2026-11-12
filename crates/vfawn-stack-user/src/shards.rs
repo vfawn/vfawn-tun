@@ -347,6 +347,14 @@ pub trait SlotLogic: Send {
     fn replaced_by(&self, _packet: &[u8]) -> bool {
         false
     }
+
+    /// The stack is stopping with this flow still in its table: say
+    /// what the wire is owed, once, into `out`. gVisor's `Stack.Close`
+    /// aborts every registered endpoint (`stack.go:1955-1958`); a
+    /// connected one resets its peer with `<SEQ=SND.NXT><ACK=RCV.NXT>
+    /// <RST,ACK>` (`connect.go:1069-1088`), anything else only closes
+    /// (`endpoint.go:1035-1047`). The default is the latter.
+    fn abort(&mut self, _out: &mut VecDeque<BytesMut>) {}
 }
 
 /// One scheduled wake-up for a slot.
@@ -475,8 +483,30 @@ impl PipelineStop {
     }
 }
 
+/// A shard's leave, as the writer counts it: the shard's last frames
+/// (its aborts' resets) are in its outbox before the count drops, so
+/// the writer's drain after seeing zero carries them. A guard, so a
+/// shard that panics still counts as gone instead of holding the
+/// writer — and the device — open forever.
+struct ShardLeave {
+    left: Arc<AtomicUsize>,
+    writer_ping: Arc<(Mutex<()>, std::sync::Condvar)>,
+}
+
+impl Drop for ShardLeave {
+    fn drop(&mut self) {
+        self.left.fetch_sub(1, Ordering::AcqRel);
+        if let Ok(guard) = self.writer_ping.0.lock() {
+            drop(guard);
+            self.writer_ping.1.notify_all();
+        }
+    }
+}
+
 /// Handle over the running sharded data plane. Dropping it stops every
-/// thread; the device close is the caller's business as elsewhere.
+/// thread in sing-tun's order: inbound detaches, each shard aborts the
+/// flows it holds, and the writer closes the device once their resets
+/// are written.
 pub struct Shards {
     shared: Vec<ShardShared>,
     /// Each shard's doorbell, indexed like `shared`: the host-side
@@ -511,6 +541,7 @@ impl Shards {
         let mut shared = Vec::with_capacity(shard_count);
         let mut processed = Vec::with_capacity(shard_count);
         let mut threads = Vec::with_capacity(shard_count + 2);
+        let shards_left = Arc::new(AtomicUsize::new(shard_count));
 
         let mut bells: Vec<Arc<ShardBell>> = Vec::with_capacity(shard_count);
         for _ in 0..shard_count {
@@ -531,10 +562,15 @@ impl Shards {
             let stop_for_loop = Arc::clone(&stopped);
             let counter_for_loop = Arc::clone(&counter);
             let stop_all_for_shard = Arc::clone(&stop_all);
+            let leave = ShardLeave {
+                left: Arc::clone(&shards_left),
+                writer_ping: Arc::clone(&writer_ping),
+            };
             threads.push(
                 std::thread::Builder::new()
                     .name("vfawn-shard".into())
                     .spawn(move || {
+                        let _leave = leave;
                         shard_loop(
                             stop_all_for_shard,
                             inbox_for_loop,
@@ -570,6 +606,10 @@ impl Shards {
         let device_failure: Arc<std::sync::OnceLock<String>> = Arc::new(std::sync::OnceLock::new());
         let producer_failure = Arc::clone(&device_failure);
         let producer_shared: Vec<ShardShared> = shared.clone();
+        // Raised by the writer as it closes the device after a stop:
+        // the producer's cue to stop taking reads.
+        let device_closed = Arc::new(AtomicBool::new(false));
+        let device_closed_for_producer = Arc::clone(&device_closed);
         let mut staging: Vec<Vec<Option<BytesMut>>> =
             (0..shard_count).map(|_| Vec::new()).collect();
         threads.push(
@@ -652,15 +692,36 @@ impl Shards {
                             }
                         }
                     }
-                    // The loop is over, by stop or by device error, and
-                    // the I/O thread may be parked on the device's
-                    // read with no packet coming to wake it. The
-                    // shutdown call is that knock: the parked read
-                    // returns, the I/O thread drops the device it
-                    // owns, and the interface leaves with it — an
-                    // adapter that outlives its pipeline is residue a
-                    // later create would only have to recover from.
-                    let _ = device.shutdown();
+                    // The loop is over. A device error ends the device
+                    // here: the I/O thread may be parked on the
+                    // device's read with no packet coming to wake it,
+                    // and the shutdown call is that knock — the I/O
+                    // thread drops the device it owns, and the
+                    // interface leaves with it, since an adapter that
+                    // outlives its pipeline is residue a later create
+                    // would only have to recover from.
+                    if !stop_all_for_producer.load(Ordering::Acquire) {
+                        let _ = device.shutdown();
+                        return;
+                    }
+                    // A stop leaves the device to the writer, which
+                    // closes it once the aborts' resets are written
+                    // (sing-tun closes the stack before the tun,
+                    // `stack_gvisor.go:123-136`). Until then inbound
+                    // is detached, not abandoned: what the device
+                    // hands up is dropped, as gVisor's detached link
+                    // stops dispatching (`Attach(nil)`, fdbased
+                    // `endpoint.go:423-435`). Taking it still matters
+                    // — the device's I/O thread carries both
+                    // directions, and a reader that stopped taking
+                    // would hold the writes queued behind it.
+                    while !device_closed_for_producer.load(Ordering::Acquire) {
+                        match device.read_batch(&mut bufs) {
+                            Ok(0) => std::thread::sleep(Duration::from_millis(1)),
+                            Ok(_) => {}
+                            Err(_) => break,
+                        }
+                    }
                 })
                 .expect("spawn producer"),
         );
@@ -670,7 +731,7 @@ impl Shards {
         let writer_shared: Vec<ShardShared> = shared.clone();
         let writer_ping_for_writer = Arc::clone(&writer_ping);
         let writer_pool = Arc::clone(&pool);
-        let stop_all_for_writer = Arc::clone(&stop_all);
+        let shards_left_for_writer = Arc::clone(&shards_left);
         let writer_mtu = config.mtu;
         threads.push(
             std::thread::Builder::new()
@@ -680,11 +741,12 @@ impl Shards {
                     let mut batch: Vec<BytesMut> = Vec::with_capacity(32);
                     let mut write_refused = false;
                     loop {
-                        if stop_all_for_writer.load(Ordering::Acquire) {
-                            break;
-                        }
+                        // Read before the drain: a shard's last frames
+                        // are in its outbox before it counts itself
+                        // gone, so the drain that follows a zero
+                        // carries every one of them.
+                        let shards_gone = shards_left_for_writer.load(Ordering::Acquire) == 0;
                         batch.clear();
-                        let mut any_stopped = false;
                         for lane in &writer_shared {
                             let mut outbox = lane.outbox.lock().expect("outbox lock");
                             if outbox.len() > 8192
@@ -728,11 +790,6 @@ impl Shards {
                                 batch.push(packet);
                             }
                         }
-                        for lane in &writer_shared {
-                            if lane.stopped.load(Ordering::Acquire) {
-                                any_stopped = true;
-                            }
-                        }
                         if !batch.is_empty() {
                             // A refused write drops the batch and the
                             // writer carries on, as sing-tun's
@@ -756,22 +813,7 @@ impl Shards {
                                 writer_pool.release_packet(packet);
                             }
                         }
-                        if any_stopped {
-                            // Every shard said goodbye; drain once more
-                            // and leave.
-                            let mut tail = Vec::new();
-                            for lane in &writer_shared {
-                                let mut outbox = lane.outbox.lock().expect("outbox lock");
-                                while let Some(packet) = outbox.pop_front() {
-                                    tail.push(packet);
-                                }
-                            }
-                            if !tail.is_empty() {
-                                let _ = device.write_batch(&mut tail);
-                                for packet in tail {
-                                    writer_pool.release_packet(packet);
-                                }
-                            }
+                        if shards_gone {
                             break;
                         }
                         // Park on the doorbell rather than polling:
@@ -785,6 +827,14 @@ impl Shards {
                                 .expect("writer ping");
                         }
                     }
+                    // Every shard is gone and its last frames are
+                    // written: only now does the device close, as
+                    // sing-box closes the stack before the tun
+                    // (`protocol/tun/inbound.go:434-436`). The handle
+                    // shares the shutdown signal, so the producer's
+                    // parked read wakes with it.
+                    device_closed.store(true, Ordering::Release);
+                    let _ = device.shutdown();
                 })
                 .expect("spawn writer"),
         );
@@ -856,6 +906,12 @@ fn flush_lane(inbox: &Ring, shared: &ShardShared, lane: &mut Vec<Option<BytesMut
     let mut batch: Vec<BytesMut> = lane.drain(..).map(Option::unwrap).collect();
     while let Err(overflow) = inbox.try_push(batch) {
         batch = overflow;
+        // A stopped shard drains nothing more: the producer, still
+        // reading until the writer closes the device, must not wait
+        // on it.
+        if shared.stopped.load(Ordering::Acquire) {
+            return false;
+        }
         // Backpressure: the shard is behind; a bounded wait keeps the
         // kernel socket buffer as the final shock absorber.
         std::thread::sleep(Duration::from_micros(50));
@@ -895,6 +951,21 @@ fn shard_loop(
     let mut pending: VecDeque<BytesMut> = VecDeque::new();
     loop {
         if stopped.load(Ordering::Acquire) || stop_all.load(Ordering::Acquire) {
+            // Inbound is already over (the producer honors the same
+            // stop); every flow still here is aborted and its reset
+            // handed to the writer, which closes the device only
+            // after writing it — sing-tun's order: detach the reader
+            // (`stack_gvisor.go:131`), abort the endpoints (`:132`,
+            // gVisor `stack.go:1955-1958`), then close the tun.
+            for slot in connections.values_mut() {
+                slot.logic.abort(&mut pending);
+            }
+            if !pending.is_empty() {
+                outbox
+                    .lock()
+                    .expect("outbox lock")
+                    .extend(pending.drain(..));
+            }
             break;
         }
         bell.clear();

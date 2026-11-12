@@ -502,6 +502,19 @@ impl TcpSlot {
     /// aborted connection), the host learns the flow is gone, and the
     /// slot goes inert instead of paying retries forever.
     fn give_up(&mut self, out: &mut VecDeque<BytesMut>) {
+        // The Linux fast path's shared receive cursor runs ahead of
+        // the machine while the device's read dispatch claims steady
+        // segments (the catch-up in `on_packet` says why): the reset
+        // acknowledges the wire's position, not the machine's stale
+        // one, and the dispatch stops claiming the flow, so nothing of
+        // it is acknowledged after the reset.
+        #[cfg(target_os = "linux")]
+        if let Some(entry) = crate::splice_lane::SpliceLane::global().entry_for(&self.flow_key) {
+            if entry.cursor_armed() {
+                self.connection.catchup_recv(entry.recv_nxt_value());
+            }
+            entry.deactivate();
+        }
         let reset = Reaction::segment(
             self.connection.send_nxt(),
             self.connection.recv_nxt(),
@@ -913,6 +926,23 @@ impl SlotLogic for TcpSlot {
                 self.connection
                     .reopens_on(&Inbound::parse(&header, segment))
             })
+    }
+
+    fn abort(&mut self, out: &mut VecDeque<BytesMut>) {
+        // gVisor's Abort resets only a connected endpoint
+        // (`endpoint.go:1041-1045`), the states `connected()` names
+        // (`:91-98`): ESTABLISHED through TIME-WAIT. A handshake still
+        // in SYN-RECEIVED only closes — no session exists to tell —
+        // and a refused or finished flow is no longer registered.
+        if self.finished() {
+            return;
+        }
+        if matches!(
+            self.connection.state(),
+            TcpState::Established | TcpState::CloseWait | TcpState::LastAck | TcpState::TimeWait
+        ) {
+            self.give_up(out);
+        }
     }
 
     fn on_timer(&mut self, out: &mut VecDeque<BytesMut>, _pool: &BufferPool) {

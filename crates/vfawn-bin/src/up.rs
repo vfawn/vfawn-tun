@@ -13,6 +13,11 @@ use vfawn::{Instance, VfawnConfig};
 /// Raised by `main` on SIGINT or SIGTERM, before it unparks the worker.
 static STOP_REQUESTED: AtomicBool = AtomicBool::new(false);
 
+/// The native path's drain window, the facade's `DRAIN_TIMEOUT`: the
+/// native stack does not register its sessions, so the drain waits it
+/// out whole, well inside the stop deadline.
+const NATIVE_DRAIN: Duration = Duration::from_secs(2);
+
 /// Ask a running `up` to shut down; the caller unparks its thread.
 pub fn request_stop() {
     STOP_REQUESTED.store(true, Ordering::Release);
@@ -178,8 +183,13 @@ fn run_native(
     let outcome = wait_for_stop(|| handle.failure());
 
     println!("shutting down ...");
-    // The backend's threads live for the process; the capture rules
-    // must not outlive an orderly stop.
+    // The facade's order (`Instance::shutdown`): stop the stack, give
+    // it the drain window — the native stack resets its live flows and
+    // closes the device on its own threads inside it, so a client's
+    // socket learns of the stop instead of waiting out its own timeout
+    // — and only then take the capture rules down.
+    handle.stop();
+    handle.drain(NATIVE_DRAIN);
     if let Some(mut orchestration) = orchestration {
         let _ = orchestration.remove();
     }
