@@ -353,28 +353,8 @@ impl NetlinkBackend {
     }
 }
 
-// Interface-name resolution is the second sanctioned unsafe spot (the
-// first being fd adoption in the device crate). Both carry their
-// reasoning inline.
-#[expect(unsafe_code)]
 fn resolve_ifindex(name: &str) -> io::Result<u32> {
-    let cname = std::ffi::CString::new(name)
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "interface name"))?;
-    // SAFETY: the pointer comes from a valid CString that outlives the
-    // call; if_nametoindex reads it and returns an integer.
-    let index = unsafe { if_nametoindex(cname.as_ptr()) };
-    if index == 0 {
-        return Err(vfawn_route::interface_gone(name));
-    }
-    Ok(index)
-}
-
-// SAFETY: this extern declaration matches the C ABI of
-// if_nametoindex(3), which takes a NUL-terminated name and returns u32.
-#[expect(unsafe_code)]
-unsafe extern "C" {
-    #[link_name = "if_nametoindex"]
-    fn if_nametoindex(ifname: *const std::ffi::c_char) -> u32;
+    crate::unix::interface_index(name).ok_or_else(|| vfawn_route::interface_gone(name))
 }
 
 fn parse_address(msg: &AddressMessage) -> Option<InterfaceAddress> {
