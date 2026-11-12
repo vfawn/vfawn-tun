@@ -12,6 +12,7 @@
 
 #![cfg(target_os = "macos")]
 
+use std::collections::BTreeSet;
 use std::process::Command;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -19,10 +20,6 @@ use std::time::{Duration, Instant};
 use vfawn::echo::EchoHandler;
 use vfawn::instance::Instance;
 use vfawn_core::VfawnConfig;
-
-/// The adapter is created under a fixed name so the route assertions
-/// can name it.
-const ADAPTER: &str = "utun9";
 
 /// The prefix the capture owns, and an address inside it to ask the
 /// route table about.
@@ -39,9 +36,12 @@ fn takeover_stats_and_clean_teardown() {
     assert_root();
 
     let outside_before = route_names(OUTSIDE);
+    // The kernel picks the unit: a fixed name collides with whatever
+    // utun the host already runs (EBUSY on a machine where a VPN holds
+    // utun9). The adapter is the one interface start added.
+    let interfaces_before = interfaces();
     let handler = Arc::new(EchoHandler::new());
     let mut config = VfawnConfig::default();
-    config.device.name = Some(ADAPTER.to_string());
     config.device.mtu = 1500;
     config.device.inet4_address = vec!["198.18.0.1/15".parse().unwrap()];
     config.route.auto_route = true;
@@ -49,27 +49,36 @@ fn takeover_stats_and_clean_teardown() {
 
     let mut instance = Instance::new(config, handler.clone()).expect("instance");
     instance.start(handler).expect("start");
+    let added: Vec<String> = interfaces()
+        .difference(&interfaces_before)
+        .filter(|name| name.starts_with("utun"))
+        .cloned()
+        .collect();
+    let [adapter] = added.as_slice() else {
+        panic!("start adds exactly one utun, saw {added:?}");
+    };
+    let adapter = adapter.as_str();
 
     // The takeover: a lookup inside the captured prefix answers with
     // our adapter.
     let deadline = Instant::now() + Duration::from_secs(5);
     let mut owned = false;
     while Instant::now() < deadline {
-        if route_names(ASK_ABOUT).is_some_and(|iface| iface == ADAPTER) {
+        if route_names(ASK_ABOUT).is_some_and(|iface| iface == adapter) {
             owned = true;
             break;
         }
         std::thread::sleep(Duration::from_millis(100));
     }
-    assert!(owned, "the captured prefix answers through {ADAPTER}");
+    assert!(owned, "the captured prefix answers through {adapter}");
 
     // A bounded capture is only that prefix (sing-tun's
     // BuildAutoRouteRanges): no default route through the adapter, so
     // everything else keeps its route.
     assert_ne!(
         route_names(OUTSIDE).as_deref(),
-        Some(ADAPTER),
-        "{OUTSIDE} must not answer through {ADAPTER}"
+        Some(adapter),
+        "{OUTSIDE} must not answer through {adapter}"
     );
     assert_eq!(
         route_names(OUTSIDE),
@@ -84,8 +93,8 @@ fn takeover_stats_and_clean_teardown() {
     assert!(
         !defaults
             .lines()
-            .any(|l| l.starts_with("default") && l.contains(ADAPTER)),
-        "no default route through {ADAPTER}:\n{defaults}"
+            .any(|l| l.starts_with("default") && l.split_whitespace().any(|f| f == adapter)),
+        "no default route through {adapter}:\n{defaults}"
     );
 
     // The counters answer while the capture stands.
@@ -96,13 +105,25 @@ fn takeover_stats_and_clean_teardown() {
     let deadline = Instant::now() + Duration::from_secs(5);
     let mut gone = false;
     while Instant::now() < deadline {
-        if route_names(ASK_ABOUT).is_none_or(|iface| iface != ADAPTER) {
+        if route_names(ASK_ABOUT).is_none_or(|iface| iface != adapter) {
             gone = true;
             break;
         }
         std::thread::sleep(Duration::from_millis(100));
     }
     assert!(gone, "the capture left with the instance");
+}
+
+/// Every interface name the system lists right now.
+fn interfaces() -> BTreeSet<String> {
+    let output = Command::new("ifconfig")
+        .arg("-l")
+        .output()
+        .expect("ifconfig -l");
+    String::from_utf8_lossy(&output.stdout)
+        .split_whitespace()
+        .map(str::to_string)
+        .collect()
 }
 
 /// Which interface the system's own reporter routes an address
