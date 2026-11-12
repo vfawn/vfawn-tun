@@ -10,7 +10,7 @@ use std::time::Duration;
 use vfawn::echo::VerboseEchoHandler;
 use vfawn::{Instance, VfawnConfig};
 
-/// Raised by `main` on Ctrl-C, before it unparks the worker.
+/// Raised by `main` on SIGINT or SIGTERM, before it unparks the worker.
 static STOP_REQUESTED: AtomicBool = AtomicBool::new(false);
 
 /// Ask a running `up` to shut down; the caller unparks its thread.
@@ -119,7 +119,7 @@ fn run_ipstack(
 
     println!("ready; sessions will appear below; Ctrl-C to stop");
 
-    // Block until `main` relays Ctrl-C or the stack stops on its own.
+    // Block until `main` relays a stop signal or the stack stops on its own.
     let outcome = wait_for_stop(|| instance.failure());
 
     println!("shutting down ...");
