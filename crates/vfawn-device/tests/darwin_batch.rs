@@ -40,15 +40,12 @@ fn island(round: u32) -> (String, Ipv4Addr, Ipv4Addr) {
 const PROBE_PORT: u16 = 5353;
 const PROBES: usize = 400;
 
-/// What the batch evidence says: packets per batch read, which is the
-/// syscall count per packet turned upside down.
 /// One full exchange on one device: send every probe, read them
-/// back, and report (frames, batches, first probe frame).
-fn probe_round(device: &mut TunDevice) -> (usize, usize, Option<Vec<u8>>) {
+/// back, and report (frames, batches).
+fn probe_round(device: &mut TunDevice) -> (usize, usize) {
     let mut bufs = vec![BytesMut::new(); 8];
     let mut batches = 0usize;
     let mut frames = 0usize;
-    let mut first: Option<Vec<u8>> = None;
     let deadline = Instant::now() + Duration::from_secs(6);
     while frames < PROBES && Instant::now() < deadline {
         let count = device.read_batch(&mut bufs).expect("read");
@@ -64,13 +61,18 @@ fn probe_round(device: &mut TunDevice) -> (usize, usize, Option<Vec<u8>>) {
             // looked at forty and never matched a probe — the
             // "zero-read" the pool change was blamed for was this
             // line all along.
-            if buf.len() > 28 && buf[9] == 17 && buf[28..].starts_with(b"vfawn-batch-probe-") {
-                first.get_or_insert_with(|| buf.to_vec());
+            if is_probe(buf, b"vfawn-batch-probe-") {
                 frames += 1;
             }
         }
     }
-    (frames, batches, first)
+    (frames, batches)
+}
+
+/// A UDP frame whose payload opens with `tag`. The payload begins at
+/// twenty-eight: the IP header's twenty plus the UDP header's eight.
+fn is_probe(frame: &[u8], tag: &[u8]) -> bool {
+    frame.len() > 28 && frame[9] == 17 && frame[28..].starts_with(tag)
 }
 
 /// What the batch evidence says: packets per batch read, which is the
@@ -82,7 +84,7 @@ fn batch_reads_and_the_writev_round_trip() {
     assert_root();
 
     let mut round = 0;
-    let (frames, batches, first) = loop {
+    let (frames, batches) = loop {
         round += 1;
         let (net, iface_addr, probe_addr) = island(round);
         let mut device = TunDevice::create(&DeviceConfig {
@@ -135,7 +137,7 @@ fn batch_reads_and_the_writev_round_trip() {
         let outcome = probe_round(&mut device);
         let _ = device.shutdown();
         if outcome.0 > 0 || round >= 3 {
-            break (outcome.0, outcome.1, outcome.2);
+            break outcome;
         }
         println!("round {round} read zero; retrying on a fresh island");
     };
@@ -168,36 +170,51 @@ fn batch_reads_and_the_writev_round_trip() {
     );
 
     // The write path needs a live device again: the probe rounds tore
-    // theirs down. A fresh island, a bounced frame, the interface's
-    // own input counter as the kernel's receipt.
-    let (net, _iface_addr, _probe_addr) = island(9);
+    // theirs down. The receipt is delivery, not the interface's input
+    // counter: that counter ticks before the kernel's protocol demux
+    // reads the family prefix, so a prefix in the wrong byte order
+    // passed it while every written frame died in the demux.
+    let (net, iface_addr, probe_addr) = island(9);
     let mut device = TunDevice::create(&DeviceConfig {
         mtu: 1500,
         inet4_address: vec![net.parse().expect("interface prefix")],
         ..DeviceConfig::default()
     })
     .expect("write-path device");
-    let name = device.name().expect("name");
-    let inbound = first.expect("a frame was read");
+    const BOUNCE_PROBE: &[u8] = b"vfawn-bounce-probe";
+    let socket =
+        std::net::UdpSocket::bind(std::net::SocketAddr::from((iface_addr, 0))).expect("bind");
+    socket
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .expect("read timeout");
+    socket
+        .connect(std::net::SocketAddr::from((probe_addr, PROBE_PORT)))
+        .expect("connect");
+    socket.send(BOUNCE_PROBE).expect("send");
+
+    let mut bufs = vec![BytesMut::new(); 8];
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let mut inbound = None;
+    while inbound.is_none() && Instant::now() < deadline {
+        let count = device.read_batch(&mut bufs).expect("read");
+        inbound = bufs
+            .iter()
+            .take(count)
+            .find(|buf| is_probe(buf, BOUNCE_PROBE))
+            .map(|buf| buf.to_vec());
+    }
+    let inbound = inbound.expect("the bounce probe reached the reader");
     let reply = bounce(&inbound).expect("a UDP frame to bounce");
-    let before = interface_input_packets(&name).expect("interface stats");
     let mut one = [BytesMut::from(&reply[..])];
     assert_eq!(device.write_batch(&mut one).expect("write"), 1);
-    // One writev, one accepted frame: the counter settles without a
-    // race because the I/O thread's write drain happens before its
-    // next park, and nothing else routes into the interface.
-    let deadline = Instant::now() + Duration::from_secs(3);
-    let mut after = before;
-    while Instant::now() < deadline {
-        after = interface_input_packets(&name).expect("interface stats");
-        if after > before {
-            break;
-        }
-    }
-    assert!(
-        after > before,
-        "the interface must accept the written frame (inputs {before} -> {after})"
-    );
+
+    // The connected socket takes only its peer's datagrams: the
+    // bounce, sourced from the probe address and port, is exactly one.
+    let mut answer = [0u8; 64];
+    let received = socket
+        .recv(&mut answer)
+        .expect("the written frame must reach the socket it was bounced to");
+    assert_eq!(&answer[..received], BOUNCE_PROBE);
 
     device.shutdown().expect("shutdown");
 }
@@ -244,29 +261,6 @@ fn assert_root() {
     #[expect(unsafe_code)]
     let euid = unsafe { libc::geteuid() };
     assert_eq!(euid, 0, "this test routes real traffic; it needs root");
-}
-
-/// The interface's input-packet count: for a utun, inputs are the
-/// frames user space wrote into the descriptor, which is exactly the
-/// write path's own accounting.
-fn interface_input_packets(name: &str) -> Option<u64> {
-    let output = Command::new("netstat")
-        .args(["-I", name, "-b"])
-        .output()
-        .ok()?;
-    let text = String::from_utf8_lossy(&output.stdout);
-    for line in text.lines().skip_while(|l| !l.contains("Name")) {
-        let fields: Vec<&str> = line.split_whitespace().collect();
-        // The link-level row leaves the Address column empty, so the
-        // row runs name, mtu, <Link#n>, then the input counts.
-        if fields.first().is_some_and(|f| *f == name)
-            && fields.get(2).is_some_and(|f| f.starts_with("<Link#"))
-            && fields.len() > 3
-        {
-            return fields[3].parse().ok();
-        }
-    }
-    None
 }
 
 /// The host-supplied descriptor path: a utun created by the host's own

@@ -410,13 +410,17 @@ unsafe fn submit_read(
 }
 
 /// The address-family prefix utun wants ahead of an outbound frame,
-/// by the frame's own IP version nibble.
+/// by the frame's own IP version nibble. The word is in network byte
+/// order, as the kernel's framer writes it and its demux reads it back
+/// (sing-tun's packetHeader4/6, tun_darwin.go:191). A host-order word
+/// still ticks the interface's input counter, which runs ahead of the
+/// demux, and then every frame dies there unseen.
 fn family_prefix(frame: &[u8]) -> [u8; 4] {
     let family: u32 = match frame.first().map(|byte| byte >> 4) {
         Some(6) => libc::AF_INET6 as u32,
         _ => libc::AF_INET as u32,
     };
-    family.to_ne_bytes()
+    family.to_be_bytes()
 }
 
 /// The I/O thread: one descriptor, two directions, one loop. Reads
@@ -756,10 +760,13 @@ mod tests {
 
     #[test]
     fn family_prefix_follows_the_ip_version() {
+        // The literal bytes, not a round trip through the same byte
+        // order: a host-order prefix passed the round trip and lost
+        // every written frame on a live kernel.
         let v4 = family_prefix(&[0x45, 0, 0, 0]);
         let v6 = family_prefix(&[0x60, 0, 0, 0]);
-        assert_eq!(u32::from_ne_bytes(v4), libc::AF_INET as u32);
-        assert_eq!(u32::from_ne_bytes(v6), libc::AF_INET6 as u32);
+        assert_eq!(v4, [0, 0, 0, libc::AF_INET as u8]);
+        assert_eq!(v6, [0, 0, 0, libc::AF_INET6 as u8]);
     }
 
     #[test]
