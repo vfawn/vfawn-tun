@@ -35,6 +35,17 @@ jobs:
       - name: fmt
         run: cargo fmt --all --check
 
+      # ipstack 1.0.1's build script copies wintun.dll into
+      # <target>/<profile>/examples without creating that directory.
+      # Cargo used to make it up front; the build-dir layout that is
+      # always on since Cargo 1.100 does not, so a cold target dir fails
+      # before any of our code compiles. Upstream build.rs is unchanged
+      # as of narrowlink/ipstack d02a7b8.
+      - name: ipstack build-script directory
+        if: runner.os == 'Windows'
+        shell: bash
+        run: mkdir -p target/debug/examples
+
       - name: clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
