@@ -678,6 +678,7 @@ impl Shards {
                 .spawn(move || {
                     let mut device = write_device;
                     let mut batch: Vec<BytesMut> = Vec::with_capacity(32);
+                    let mut write_refused = false;
                     loop {
                         if stop_all_for_writer.load(Ordering::Acquire) {
                             break;
@@ -733,19 +734,23 @@ impl Shards {
                             }
                         }
                         if !batch.is_empty() {
-                            if let Err(error) = device.write_batch(&mut batch) {
-                                // A device that refuses writes is a
-                                // dead pipeline: say so, stop every
-                                // thread, and release what was in
-                                // hand. Draining silently would turn
-                                // the outboxes into an unbounded sink
-                                // that nothing ever reads again.
-                                eprintln!("vfawn: device write failed ({error}); stopping");
-                                stop_all_for_writer.store(true, Ordering::Release);
-                                for packet in batch.drain(..) {
-                                    writer_pool.release_packet(packet);
-                                }
-                                break;
+                            // A refused write drops the batch and the
+                            // writer carries on, as sing-tun's
+                            // endpoint answers ErrAborted and drops
+                            // (`tun_windows_gvisor.go:128-137`). The
+                            // device's loss is the reader's to report
+                            // (`:73-75`): a writer that stopped the
+                            // pipeline itself won the race against a
+                            // read failing on the same dead device,
+                            // and the producer, seeing a stop, left
+                            // without the reason (N-13). Said once,
+                            // since a dead device refuses every batch
+                            // until the reader ends it.
+                            if let Err(error) = device.write_batch(&mut batch)
+                                && !write_refused
+                            {
+                                write_refused = true;
+                                eprintln!("vfawn: device write failed ({error}); dropping");
                             }
                             for packet in batch.drain(..) {
                                 writer_pool.release_packet(packet);

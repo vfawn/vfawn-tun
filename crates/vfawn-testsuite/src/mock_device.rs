@@ -14,7 +14,7 @@ use std::collections::VecDeque;
 use std::io;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use vfawn_core::{DeviceCaps, PacketDevice};
 
 pub struct MockDevice {
@@ -25,6 +25,9 @@ pub struct MockDevice {
     /// The device went away outside the process (an adapter disabled
     /// under the stack): reads fail from then on.
     lost: Arc<AtomicBool>,
+    /// Writes are refused while reads still work, and how many were.
+    writes_lost: Arc<AtomicBool>,
+    refused_writes: Arc<AtomicUsize>,
 }
 
 impl MockDevice {
@@ -36,6 +39,8 @@ impl MockDevice {
             caps,
             shutdown: Arc::new(AtomicBool::new(false)),
             lost: Arc::new(AtomicBool::new(false)),
+            writes_lost: Arc::new(AtomicBool::new(false)),
+            refused_writes: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -43,6 +48,17 @@ impl MockDevice {
     /// outside the process does: every later read fails.
     pub fn lose(&self) {
         self.lost.store(true, Ordering::Release);
+    }
+
+    /// Refuse every later write while reads still work: the moment a
+    /// dying device fails its writer before its reader.
+    pub fn lose_writes(&self) {
+        self.writes_lost.store(true, Ordering::Release);
+    }
+
+    /// How many writes were refused since `lose_writes`.
+    pub fn refused_writes(&self) -> usize {
+        self.refused_writes.load(Ordering::Acquire)
     }
 
     /// Queue packets for the next reads, in order.
@@ -89,6 +105,13 @@ impl PacketDevice for MockDevice {
     }
 
     fn write_batch(&mut self, bufs: &mut [BytesMut]) -> io::Result<usize> {
+        if self.writes_lost.load(Ordering::Acquire) {
+            self.refused_writes.fetch_add(1, Ordering::AcqRel);
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "device is down",
+            ));
+        }
         if self.shutdown.load(Ordering::Acquire) {
             return Err(io::Error::new(
                 io::ErrorKind::NotConnected,
@@ -123,6 +146,8 @@ impl PacketDevice for MockDevice {
             caps: self.caps,
             shutdown: Arc::clone(&self.shutdown),
             lost: Arc::clone(&self.lost),
+            writes_lost: Arc::clone(&self.writes_lost),
+            refused_writes: Arc::clone(&self.refused_writes),
         }))
     }
 }
