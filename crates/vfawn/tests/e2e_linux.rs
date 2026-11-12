@@ -335,17 +335,29 @@ fn assert_kill9_residue_free() {
     run(kill);
     std::thread::sleep(Duration::from_millis(300));
 
-    let cleanup = format!(
-        "{}/../vfawn-bin",
-        std::env::current_exe().unwrap().parent().unwrap().display()
-    );
-    run(in_ns(&[&cleanup, "cleanup"]));
+    let cleanup = vfawn_bin();
+    run(in_ns(&[cleanup.to_str().unwrap(), "cleanup"]));
     assert!(
         !capture_rules_present(),
         "cleanup removed every tagged rule"
     );
     let table = out(&mut in_ns(&["ip", "route", "show", "table", "2022"]));
     assert_eq!(table.trim(), "", "the dedicated table is empty");
+}
+
+/// The CLI the CI step builds beside this test (`cargo build -p
+/// vfawn-bin`). It lives in the profile directory, which is the test
+/// binary's grandparent under the old layout (`<profile>/deps/`) and a
+/// farther ancestor under the build-dir layout Cargo 1.100 made
+/// permanent (`<profile>/build/vfawn/<hash>/out/`); a fixed relative
+/// path fits only one of them.
+fn vfawn_bin() -> std::path::PathBuf {
+    let exe = std::env::current_exe().unwrap();
+    exe.ancestors()
+        .skip(1)
+        .map(|dir| dir.join("vfawn-bin"))
+        .find(|candidate| candidate.is_file())
+        .unwrap_or_else(|| panic!("no vfawn-bin above {}; build it first", exe.display()))
 }
 
 fn assert_capture_rules_present() {
