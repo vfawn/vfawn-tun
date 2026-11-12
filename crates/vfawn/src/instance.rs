@@ -46,6 +46,12 @@ pub struct StatsSnapshot {
 /// embedded hosts care about shutdown latency.
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// How long `shutdown` waits, after the drain, for the interface it
+/// created to disappear. Backends close the device on their own threads;
+/// the kernel removes a TUN interface once its last descriptor closes.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+const DEVICE_CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// A handle onto the running instance.
 ///
 /// Constructing an [`Instance`] creates the device and prepares the stack;
@@ -72,6 +78,10 @@ pub struct Instance {
     tracker: Arc<crate::stats::InstanceTracker>,
     /// The host runtime sessions run on, when the host lends one.
     runtime: Option<tokio::runtime::Handle>,
+    /// The interface this instance created, which `shutdown` waits to
+    /// see gone. None for an adopted descriptor: the host owns that one.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    created_interface: Option<String>,
 }
 
 impl Instance {
@@ -97,6 +107,8 @@ impl Instance {
             firewall_rule: None,
             tracker: Arc::new(crate::stats::InstanceTracker::new()),
             runtime: None,
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            created_interface: None,
         })
     }
 
@@ -312,6 +324,13 @@ impl Instance {
         if backend.accepts_on_host_sockets() {
             self.firewall_rule = vfawn_platform::firewall_gate(self.config.route.windows_firewall)?;
         }
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            self.created_interface = match self.config.device.file_descriptor {
+                Some(_) => None,
+                None => device.name().ok(),
+            };
+        }
 
         vfawn_core::StackBackend::spawn(backend, Box::new(device), handler).map(|handle| {
             self.handle = Some(handle);
@@ -355,6 +374,14 @@ impl Instance {
             eprintln!("vfawn: shutdown aborted {count} sessions still live after the drain window");
         }
         self.handle = None;
+        // The device closes with the shutdown, not some time after it,
+        // as sing-tun's Close closes the tun file before returning
+        // (tun_linux.go:357): a host that restarts under the same name
+        // must not find the old interface still holding it.
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        if let Some(name) = self.created_interface.take() {
+            wait_interface_gone(&name, DEVICE_CLOSE_TIMEOUT);
+        }
         // The firewall rule follows the same doctrine as the routes
         // below: it must not outlive an orderly shutdown.
         if self.firewall_rule.take().is_some() {
@@ -458,6 +485,21 @@ impl Instance {
     /// increments it when a worker thread is caught and contained.
     pub fn panic_counter(&self) -> Arc<AtomicU64> {
         Arc::clone(&self.panics)
+    }
+}
+
+/// Wait, at most `timeout`, for the interface `name` to leave the
+/// kernel. A deadline that passes is reported, not failed: the rest of
+/// the shutdown still has routes to remove.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn wait_interface_gone(name: &str, timeout: Duration) {
+    let deadline = std::time::Instant::now() + timeout;
+    while vfawn_platform::unix::interface_index(name).is_some() {
+        if std::time::Instant::now() >= deadline {
+            eprintln!("vfawn: interface {name} still present {timeout:?} after shutdown");
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(5));
     }
 }
 
