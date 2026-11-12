@@ -27,22 +27,35 @@ use vfawn_wire::{Ipv4Header, Ipv6Header, TcpFlags, TcpHeader, V6Payload};
 const CLIENT: SocketAddrV4 = SocketAddrV4::new(Ipv4Addr::new(192, 168, 1, 100), 45678);
 const SERVER: SocketAddrV4 = SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 1), 443);
 
+/// What a session does once the host has it.
+#[derive(Clone, Copy)]
+enum Session {
+    /// Return at once.
+    Return,
+    /// Park forever: only an abort ends it.
+    Hold,
+    /// Read until the stream ends, then count the finish: the echo
+    /// handler's shape, whose tail must run when the stack stops.
+    ReadToEnd,
+}
+
 struct Host {
     verdict: fn() -> Verdict,
-    /// Park every session forever: only an abort ends it.
-    hold: bool,
+    session: Session,
     judge_calls: AtomicUsize,
     sessions: AtomicUsize,
+    finished: AtomicUsize,
     session_threads: Mutex<Vec<String>>,
 }
 
 impl Host {
-    fn new(verdict: fn() -> Verdict, hold: bool) -> Arc<Self> {
+    fn new(verdict: fn() -> Verdict, session: Session) -> Arc<Self> {
         Arc::new(Self {
             verdict,
-            hold,
+            session,
             judge_calls: AtomicUsize::new(0),
             sessions: AtomicUsize::new(0),
+            finished: AtomicUsize::new(0),
             session_threads: Mutex::new(Vec::new()),
         })
     }
@@ -55,12 +68,20 @@ impl SessionHandler for Host {
         (self.verdict)()
     }
 
-    async fn on_tcp(&self, _session: TcpSession) {
+    async fn on_tcp(&self, mut session: TcpSession) {
         let name = std::thread::current().name().unwrap_or("").to_string();
         self.session_threads.lock().unwrap().push(name);
         self.sessions.fetch_add(1, Ordering::SeqCst);
-        if self.hold {
-            std::future::pending::<()>().await;
+        match self.session {
+            Session::Return => {}
+            Session::Hold => std::future::pending::<()>().await,
+            Session::ReadToEnd => {
+                let mut buffer = [0u8; 1500];
+                while let Ok(n) = session.read(&mut buffer).await
+                    && n > 0
+                {}
+                self.finished.fetch_add(1, Ordering::SeqCst);
+            }
         }
     }
 
@@ -104,7 +125,7 @@ fn wait_for(what: &str, deadline: Duration, mut done: impl FnMut() -> bool) {
 #[test]
 fn sessions_run_on_the_lent_runtime() {
     let runtime = host_runtime();
-    let host = Host::new(|| Verdict::Accept, false);
+    let host = Host::new(|| Verdict::Accept, Session::Return);
     let (handle, device) = spawn_on(Some(runtime.handle().clone()), &host).unwrap();
 
     let syn = Script::new(CLIENT, SERVER).tcp(1000, 0, 0x02, b"");
@@ -125,7 +146,7 @@ fn sessions_run_on_the_lent_runtime() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn a_current_thread_runtime_is_refused() {
-    let host = Host::new(|| Verdict::Accept, false);
+    let host = Host::new(|| Verdict::Accept, Session::Return);
     let refused = spawn_on(Some(tokio::runtime::Handle::current()), &host)
         .err()
         .expect("a current-thread runtime cannot host ipstack streams");
@@ -135,7 +156,7 @@ async fn a_current_thread_runtime_is_refused() {
 #[test]
 fn an_idle_drain_returns_at_once() {
     let runtime = host_runtime();
-    let host = Host::new(|| Verdict::Accept, false);
+    let host = Host::new(|| Verdict::Accept, Session::Return);
     let (handle, _device) = spawn_on(Some(runtime.handle().clone()), &host).unwrap();
     std::thread::sleep(Duration::from_millis(50));
 
@@ -152,7 +173,7 @@ fn an_idle_drain_returns_at_once() {
 #[test]
 fn a_session_outliving_the_window_is_aborted() {
     let runtime = host_runtime();
-    let host = Host::new(|| Verdict::Accept, true);
+    let host = Host::new(|| Verdict::Accept, Session::Hold);
     let (handle, device) = spawn_on(Some(runtime.handle().clone()), &host).unwrap();
 
     let syn = Script::new(CLIENT, SERVER).tcp(1000, 0, 0x02, b"");
@@ -198,7 +219,7 @@ fn tcp_segment(frame: &[u8]) -> Option<(TcpHeader, SocketAddr, SocketAddr)> {
 }
 
 fn assert_reject_resets(client: SocketAddr, server: SocketAddr) {
-    let host = Host::new(|| Verdict::Reject, false);
+    let host = Host::new(|| Verdict::Reject, Session::Return);
     let (handle, device) = spawn_on(None, &host).unwrap();
     std::thread::sleep(Duration::from_millis(100));
 
@@ -242,4 +263,69 @@ fn reject_answers_a_v6_syn_with_a_reset() {
     let client = SocketAddrV6::new(Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 2), 45678, 0, 0);
     let server = SocketAddrV6::new(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1), 443, 0, 0);
     assert_reject_resets(SocketAddr::V6(client), SocketAddr::V6(server));
+}
+
+/// One accepted session, running, on the given runtime.
+fn one_session(
+    runtime: Option<tokio::runtime::Handle>,
+    session: Session,
+) -> (StackHandle, MockDevice, Arc<Host>) {
+    let host = Host::new(|| Verdict::Accept, session);
+    let (handle, device) = spawn_on(runtime, &host).unwrap();
+    std::thread::sleep(Duration::from_millis(100));
+    let syn = Script::new(CLIENT, SERVER).tcp(1000, 0, 0x02, b"");
+    device.push(&[&syn]);
+    wait_for("the session", Duration::from_secs(3), || {
+        host.sessions.load(Ordering::SeqCst) == 1
+    });
+    (handle, device, host)
+}
+
+/// The private runtime is the CLI's: it must stay up for the drain.
+/// It was retired the moment the accept loop ended, dropping every
+/// session with it, so the drain found nothing and returned at once
+/// (the macOS retest of bdd84ca: an open connection left in 0.26 s).
+#[test]
+fn a_private_runtime_keeps_its_sessions_for_the_drain() {
+    let (handle, _device, _host) = one_session(None, Session::Hold);
+    handle.stop();
+    let window = Duration::from_millis(300);
+    let started = Instant::now();
+    assert_eq!(handle.drain(window), Drain::Aborted(1));
+    assert!(
+        started.elapsed() >= window,
+        "the session was gone before the window closed ({:?})",
+        started.elapsed()
+    );
+    assert_eq!(handle.drain(Duration::from_millis(10)), Drain::Idle);
+}
+
+/// A stopping stack ends its streams, so a handler reading its session
+/// finishes on its own, tail included, well inside the window.
+fn a_reading_session_finishes_when_the_stack_stops(runtime: Option<tokio::runtime::Handle>) {
+    let (handle, _device, host) = one_session(runtime, Session::ReadToEnd);
+    handle.stop();
+    let started = Instant::now();
+    assert_eq!(handle.drain(Duration::from_secs(3)), Drain::Idle);
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "the session waited out the window ({:?})",
+        started.elapsed()
+    );
+    assert_eq!(
+        host.finished.load(Ordering::SeqCst),
+        1,
+        "the handler ran its own end"
+    );
+}
+
+#[test]
+fn a_reading_session_finishes_on_the_private_runtime() {
+    a_reading_session_finishes_when_the_stack_stops(None);
+}
+
+#[test]
+fn a_reading_session_finishes_on_the_lent_runtime() {
+    let runtime = host_runtime();
+    a_reading_session_finishes_when_the_stack_stops(Some(runtime.handle().clone()));
 }

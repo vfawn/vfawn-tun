@@ -111,6 +111,11 @@ impl StackHandle {
         Arc::clone(&self.stop)
     }
 
+    /// How many registered sessions are still running.
+    pub fn live_sessions(&self) -> usize {
+        self.sessions.lock().live.len()
+    }
+
     /// Register one live session. The session counts until the returned
     /// guard drops; `abort` is how a drain that ran out of patience ends
     /// it, and must be safe to call from any thread, at most once.

@@ -171,6 +171,9 @@ impl Serve {
         // quiet tables.
         let sweep = tokio::spawn(sweep_loop(Arc::clone(&udp_nat), handle.clone()));
         let bridge_stop = bridge.stop_flag();
+        // Raised once the accept loop ends: every session's pending read
+        // or write answers it at once.
+        let (stopping, stopped) = tokio::sync::watch::channel(false);
         let mut stack = IpStack::new(config, bridge.io);
         loop {
             // ipstack's accept has no stop side; waiting for it to
@@ -180,16 +183,34 @@ impl Serve {
             tokio::select! {
                 _ = stop_watcher(&handle) => break,
                 accepted = stack.accept() => match accepted {
-                    Ok(stream) => spawn_session(&handle, stream, &handler, &gate, &udp_nat),
+                    Ok(stream) => {
+                        spawn_session(&handle, stream, &handler, &gate, &udp_nat, &stopped)
+                    }
                     Err(_) => break,
                 },
             }
         }
         sweep.abort();
+        // A stopped stack aborts its sessions, as sing-tun's gVisor stack
+        // aborts every endpoint it still holds on close
+        // (stack_gvisor.go:133-135): handlers see their transport fail
+        // and run their own ends now. ipstack's streams would not end
+        // with the stack itself; each runs on until its own timeout.
+        let _ = stopping.send(true);
+        drop(stack);
         // Wake the bridge threads out of their device reads so the fds
         // close and the interface can be recreated.
         bridge_stop.store(true, std::sync::atomic::Ordering::Release);
         let _ = closer.shutdown();
+        // The sessions finish on this runtime: their handlers run their
+        // own ends, and a handler busy elsewhere past the grace window is
+        // ended by the drain's aborts, which need a runtime to land on. A private
+        // runtime retired here instead dropped every session the moment
+        // the accept loop ended, so a drain always found the set empty
+        // and no handler got to finish.
+        while handle.live_sessions() > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
     }
 }
 
@@ -202,6 +223,7 @@ fn spawn_session(
     handler: &Arc<dyn SessionHandler>,
     gate: &Arc<SynGate>,
     udp_nat: &Arc<UdpNat>,
+    stopped: &Stopped,
 ) {
     let task: Arc<OnceLock<tokio::task::AbortHandle>> = Arc::default();
     let guard = handle.enter({
@@ -215,9 +237,10 @@ fn spawn_session(
     let handler = Arc::clone(handler);
     let gate = Arc::clone(gate);
     let udp_nat = Arc::clone(udp_nat);
+    let stopped = stopped.clone();
     let join = tokio::spawn(async move {
         let _session = guard;
-        dispatch(stream, &handler, &gate, &udp_nat).await;
+        dispatch(stream, &handler, &gate, &udp_nat, stopped).await;
     });
     let _ = task.set(join.abort_handle());
 }
@@ -324,6 +347,7 @@ async fn dispatch(
     handler: &Arc<dyn SessionHandler>,
     gate: &SynGate,
     udp_nat: &Arc<UdpNat>,
+    stopped: Stopped,
 ) {
     match stream {
         IpStackStream::Tcp(tcp) => {
@@ -346,7 +370,10 @@ async fn dispatch(
             let action = vfawn_core::verdict::execute(verdict, &flow);
             match action {
                 vfawn_core::VerdictAction::CreateSession { tracker, .. } => {
-                    let transport = Box::new(TcpIo { stream: tcp });
+                    let transport = Box::new(TcpIo {
+                        stream: tcp,
+                        stopped,
+                    });
                     let tracker = tracker.map(|t| t as Arc<dyn FlowTrackerHook>);
                     let session = TcpSession::new(flow, transport, tracker);
                     handler.on_tcp(session).await;
@@ -398,6 +425,7 @@ async fn dispatch(
                     );
                     let transport = Box::new(UdpIo {
                         stream: udp,
+                        stopped,
                         nat: Arc::clone(udp_nat),
                         source: flow.source,
                     });
@@ -443,29 +471,49 @@ async fn dispatch(
 
 /// TCP session adapter: our `TcpTransport` implemented over ipstack's
 /// async stream.
+/// The stack's stop, as each session's transport sees it.
+type Stopped = tokio::sync::watch::Receiver<bool>;
+
+/// Run one transport operation unless the stack stops first; a stopped
+/// stack answers every pending and later operation with an abort.
+async fn unless_stopped<T>(
+    stopped: &mut Stopped,
+    operation: impl std::future::Future<Output = io::Result<T>>,
+) -> io::Result<T> {
+    tokio::select! {
+        biased;
+        _ = stopped.wait_for(|stopped| *stopped) => Err(io::Error::new(
+            io::ErrorKind::ConnectionAborted,
+            "the stack stopped",
+        )),
+        result = operation => result,
+    }
+}
+
 struct TcpIo {
     stream: IpStackTcpStream,
+    stopped: Stopped,
 }
 
 #[async_trait]
 impl TcpTransport for TcpIo {
     async fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        self.stream.read(buf).await
+        unless_stopped(&mut self.stopped, self.stream.read(buf)).await
     }
 
     async fn read_owned(&mut self) -> io::Result<Vec<u8>> {
         let mut scratch = vec![0u8; 2048];
-        let n = self.stream.read(&mut scratch).await?;
+        let n = unless_stopped(&mut self.stopped, self.stream.read(&mut scratch)).await?;
         scratch.truncate(n);
         Ok(scratch)
     }
 
     async fn write(&mut self, data: &[u8]) -> io::Result<usize> {
-        self.stream.write(data).await
+        unless_stopped(&mut self.stopped, self.stream.write(data)).await
     }
 
     async fn shutdown_write(&mut self) -> io::Result<()> {
-        self.stream.shutdown().await
+        unless_stopped(&mut self.stopped, self.stream.shutdown()).await
     }
 
     async fn abort(&mut self) -> io::Result<()> {
@@ -480,6 +528,7 @@ impl TcpTransport for TcpIo {
 /// async datagram stream.
 struct UdpIo {
     stream: IpStackUdpStream,
+    stopped: Stopped,
     nat: Arc<UdpNat>,
     source: SocketAddr,
 }
@@ -488,7 +537,7 @@ struct UdpIo {
 impl UdpTransport for UdpIo {
     async fn recv(&mut self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
         loop {
-            let n = self.stream.read(buf).await?;
+            let n = unless_stopped(&mut self.stopped, self.stream.read(buf)).await?;
             // ipstack's UDP stream represents one flow; the remote is
             // the flow's peer. The table still gets a say, so a path
             // that expired or was never opened drops here too: the
@@ -507,6 +556,6 @@ impl UdpTransport for UdpIo {
     async fn send(&mut self, data: &[u8], _to: &SocketAddr) -> io::Result<()> {
         // ipstack routes by its own flow table; the destination address is
         // already determined by the session.
-        self.stream.write_all(data).await
+        unless_stopped(&mut self.stopped, self.stream.write_all(data)).await
     }
 }
