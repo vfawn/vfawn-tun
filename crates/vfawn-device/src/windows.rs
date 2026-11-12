@@ -209,6 +209,11 @@ fn io_loop(shared: Arc<Shared>, device: SyncDevice, writes: Receiver<Vec<BytesMu
     let mut held: Option<Vec<BytesMut>> = None;
 
     loop {
+        // Read before the writes: a batch accepted before the stop was
+        // queued before the flag, so the drain below still carries it
+        // (the stack's last resets ride exactly that batch) and only
+        // then does the loop leave.
+        let stopping = shared.stopped.load(Ordering::Acquire);
         // Writes first: a batch already waiting is worth more than
         // one more park.
         loop {
@@ -241,7 +246,7 @@ fn io_loop(shared: Arc<Shared>, device: SyncDevice, writes: Receiver<Vec<BytesMu
                 }
             }
         }
-        if shared.stopped.load(Ordering::Acquire) {
+        if stopping {
             return;
         }
 

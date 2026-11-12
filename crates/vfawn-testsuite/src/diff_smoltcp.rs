@@ -31,6 +31,9 @@ use crate::diff::{Scenario, SegmentRecord, StackDriver, Step};
 struct LoopDevice {
     injected: VecDeque<Vec<u8>>,
     emitted: Vec<Vec<u8>>,
+    /// The transmit tokens' hand-off, drained into `emitted` after
+    /// each poll.
+    pending_tx: std::rc::Rc<std::cell::RefCell<Vec<Vec<u8>>>>,
 }
 
 struct LoopRx {
@@ -43,22 +46,31 @@ impl RxToken for LoopRx {
     }
 }
 
-struct LoopTx;
+struct LoopTx {
+    pending: std::rc::Rc<std::cell::RefCell<Vec<Vec<u8>>>>,
+}
 
 impl TxToken for LoopTx {
     fn consume<R, F: FnOnce(&mut [u8]) -> R>(self, len: usize, f: F) -> R {
         let mut buffer = vec![0u8; len];
         let result = f(&mut buffer);
-        PENDING_TX.with(|tx| tx.borrow_mut().push(buffer));
+        self.pending.borrow_mut().push(buffer);
         result
     }
 }
 
 // The transmit token cannot borrow the device (smoltcp hands it out
 // before the device is borrowed again), so emitted frames pass through
-// this thread-local hand-off that `poll` drains right after.
-thread_local! {
-    static PENDING_TX: std::cell::RefCell<Vec<Vec<u8>>> = const { std::cell::RefCell::new(Vec::new()) };
+// a shared hand-off that `poll` drains right after. A per-driver queue
+// rather than a thread-local: the thread-local's const initializer
+// draws a clippy false positive on targets without native TLS
+// (aarch64-linux-android).
+impl LoopDevice {
+    fn tx(&self) -> LoopTx {
+        LoopTx {
+            pending: std::rc::Rc::clone(&self.pending_tx),
+        }
+    }
 }
 
 impl Device for LoopDevice {
@@ -67,11 +79,11 @@ impl Device for LoopDevice {
 
     fn receive(&mut self, _timestamp: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
         let frame = self.injected.pop_front()?;
-        Some((LoopRx { frame }, LoopTx))
+        Some((LoopRx { frame }, self.tx()))
     }
 
     fn transmit(&mut self, _timestamp: Instant) -> Option<Self::TxToken<'_>> {
-        Some(LoopTx)
+        Some(self.tx())
     }
 
     fn capabilities(&self) -> DeviceCapabilities {
@@ -187,10 +199,8 @@ impl SmoltcpDriver {
     }
 
     fn drain_emitted(&mut self) {
-        PENDING_TX.with(|tx| {
-            let pending = std::mem::take(&mut *tx.borrow_mut());
-            self.device.emitted.extend(pending);
-        });
+        let pending = std::mem::take(&mut *self.device.pending_tx.borrow_mut());
+        self.device.emitted.extend(pending);
     }
 }
 

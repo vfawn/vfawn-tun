@@ -415,9 +415,21 @@ fn write_loop(
     // frame ceiling once and the allocator never hears from this
     // loop again.
     let mut scratch: Vec<u8> = Vec::new();
-    while !shared.stopped.load(Ordering::Acquire) {
-        let mut batch = match writes.recv_timeout(std::time::Duration::from_millis(50)) {
+    loop {
+        // A stop still writes what was accepted before it: those
+        // batches were queued before the flag, so once the flag is
+        // seen the queue is drained without waiting and the loop
+        // leaves on the first empty look (the stack's last resets ride
+        // exactly those batches).
+        let stopping = shared.stopped.load(Ordering::Acquire);
+        let wait = if stopping {
+            std::time::Duration::ZERO
+        } else {
+            std::time::Duration::from_millis(50)
+        };
+        let mut batch = match writes.recv_timeout(wait) {
             Ok(batch) => batch,
+            Err(mpsc::RecvTimeoutError::Timeout) if stopping => return,
             Err(mpsc::RecvTimeoutError::Timeout) => continue,
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 eprintln!("vfawn: tun writer stopped: writers gone");

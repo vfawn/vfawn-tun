@@ -229,9 +229,16 @@ fn read_loop(shared: &Shared, device: &SyncDevice) {
 /// wants; its first zero byte names it (no IP packet starts with zero).
 fn write_loop(shared: &Shared, device: &SyncDevice, writes: &Receiver<Vec<BytesMut>>) {
     let mut refused = 0u64;
-    while !shared.is_stopped() {
-        let batch = match writes.recv_timeout(POLL) {
+    loop {
+        // A stop still writes what was accepted before it: those
+        // batches were queued before the flag, so once the flag is
+        // seen the queue is drained without waiting and the loop
+        // leaves on the first empty look (the stack's last resets ride
+        // exactly those batches).
+        let stopping = shared.is_stopped();
+        let batch = match writes.recv_timeout(if stopping { Duration::ZERO } else { POLL }) {
             Ok(batch) => batch,
+            Err(mpsc::RecvTimeoutError::Timeout) if stopping => return,
             Err(mpsc::RecvTimeoutError::Timeout) => continue,
             Err(mpsc::RecvTimeoutError::Disconnected) => return,
         };
@@ -240,7 +247,15 @@ fn write_loop(shared: &Shared, device: &SyncDevice, writes: &Receiver<Vec<BytesM
             let Some(packet) = frame.get(head..).filter(|packet| !packet.is_empty()) else {
                 continue;
             };
-            match device.send_intr(packet, &shared.event) {
+            // The shutdown event interrupts every wait once it fires,
+            // so the stop's drain writes without one: the descriptor
+            // is nonblocking, and a full queue loses the frame below.
+            let sent = if stopping {
+                device.send(packet)
+            } else {
+                device.send_intr(packet, &shared.event)
+            };
+            match sent {
                 Ok(_) => {}
                 Err(error) if error.kind() == ErrorKind::Interrupted => return,
                 Err(error) => {
