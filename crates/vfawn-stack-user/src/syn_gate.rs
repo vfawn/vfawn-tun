@@ -22,7 +22,6 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use vfawn_core::{FlowInfo, Network, SessionHandler, Verdict};
-use vfawn_wire::{IpProtocol, Ipv4Header, Ipv6Header, TcpHeader, V6Payload};
 
 /// Accepted verdicts waiting for their stream. ipstack accepts a SYN
 /// within the same scheduling round, so the table stays near empty; the
@@ -117,34 +116,16 @@ impl SynGate {
 /// The flow a pure SYN opens, plus the address its reset leaves from.
 /// Later fragments, non-TCP and anything but a bare SYN answer `None`.
 fn opening_syn(packet: &[u8]) -> Option<(FlowInfo, IpAddr)> {
-    let (src, dst, segment) = match packet.first()? >> 4 {
-        4 => {
-            let (ip, payload) = Ipv4Header::parse(packet).ok()?;
-            if ip.protocol != IpProtocol::Tcp || ip.fragment_offset != 0 {
-                return None;
-            }
-            (IpAddr::V4(ip.src), IpAddr::V4(ip.dst), payload)
-        }
-        6 => {
-            let (ip, rest) = Ipv6Header::parse(packet).ok()?;
-            let payload = V6Payload::walk(ip.next_header, rest).ok()?;
-            if payload.protocol != IpProtocol::Tcp {
-                return None;
-            }
-            (IpAddr::V6(ip.src), IpAddr::V6(ip.dst), payload.bytes)
-        }
-        _ => return None,
-    };
-    let (tcp, _) = TcpHeader::parse(segment).ok()?;
-    if !tcp.flags.is_syn() {
+    let segment = crate::live_flows::tcp_segment(packet)?;
+    if !segment.tcp.flags.is_syn() {
         return None;
     }
     let flow = FlowInfo {
         network: Network::Tcp,
-        source: SocketAddr::new(src, tcp.src_port),
-        destination: SocketAddr::new(dst, tcp.dst_port),
+        source: segment.src,
+        destination: segment.dst,
     };
-    Some((flow, dst))
+    Some((flow, segment.dst.ip()))
 }
 
 fn reset_for(syn: &[u8], from: IpAddr) -> Option<Vec<u8>> {
