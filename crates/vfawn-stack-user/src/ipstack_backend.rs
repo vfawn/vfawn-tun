@@ -33,6 +33,7 @@ use vfawn_core::{
 };
 
 use crate::ipstack_bridge;
+use crate::live_flows::{FlowHold, LiveFlows};
 use crate::syn_gate::SynGate;
 
 /// Configuration for the transitional ipstack backend.
@@ -100,11 +101,6 @@ impl StackBackend for IpstackBackend {
         // borrowed runtime nothing but the drain's aborts ends the tasks.
         let handle = StackHandle::tracked();
         let write_device = device.duplicate()?;
-        // A third handle whose only job is closing the device when the
-        // accept loop stops: the bridge halves live inside their threads,
-        // and the TUN interface only disappears once every fd is gone,
-        // which a restart that recreates it by name depends on.
-        let closer = device.duplicate()?;
         let gate = Arc::new(SynGate::new(Arc::clone(&handler)));
         let bridge = ipstack_bridge::start(
             device,
@@ -124,7 +120,6 @@ impl StackBackend for IpstackBackend {
         let serve = Serve {
             config,
             bridge,
-            closer,
             gate,
             handler,
             udp_nat: Arc::clone(&self.udp_nat),
@@ -146,7 +141,6 @@ impl StackBackend for IpstackBackend {
 struct Serve {
     config: IpStackConfig,
     bridge: ipstack_bridge::Bridge,
-    closer: Box<dyn PacketDevice>,
     gate: Arc<SynGate>,
     handler: Arc<dyn SessionHandler>,
     udp_nat: Arc<UdpNat>,
@@ -154,13 +148,13 @@ struct Serve {
 }
 
 impl Serve {
-    /// Accept until stopped, one registered task per stream, then close
-    /// the device so the bridge threads and the interface go with it.
+    /// Accept until stopped, one registered task per stream, then reset
+    /// the live flows and close the device so the bridge threads and the
+    /// interface go with it.
     async fn run(self) {
         let Serve {
             config,
             bridge,
-            closer,
             gate,
             handler,
             udp_nat,
@@ -170,11 +164,15 @@ impl Serve {
         // reclaimed; a one-second sweep keeps close reports flowing on
         // quiet tables.
         let sweep = tokio::spawn(sweep_loop(Arc::clone(&udp_nat), handle.clone()));
-        let bridge_stop = bridge.stop_flag();
+        let ipstack_bridge::Bridge {
+            io,
+            flows,
+            teardown,
+        } = bridge;
         // Raised once the accept loop ends: every session's pending read
         // or write answers it at once.
         let (stopping, stopped) = tokio::sync::watch::channel(false);
-        let mut stack = IpStack::new(config, bridge.io);
+        let mut stack = IpStack::new(config, io);
         loop {
             // ipstack's accept has no stop side; waiting for it to
             // notice a closed device is what kept whole process runs
@@ -184,24 +182,26 @@ impl Serve {
                 _ = stop_watcher(&handle) => break,
                 accepted = stack.accept() => match accepted {
                     Ok(stream) => {
-                        spawn_session(&handle, stream, &handler, &gate, &udp_nat, &stopped)
+                        spawn_session(&handle, stream, &handler, &gate, &udp_nat, &flows, &stopped)
                     }
                     Err(_) => break,
                 },
             }
         }
         sweep.abort();
-        // A stopped stack aborts its sessions, as sing-tun's gVisor stack
-        // aborts every endpoint it still holds on close
-        // (stack_gvisor.go:133-135): handlers see their transport fail
-        // and run their own ends now. ipstack's streams would not end
-        // with the stack itself; each runs on until its own timeout.
+        // sing-tun's gVisor stack detaches, aborts every endpoint it
+        // still holds, then closes (stack_gvisor.go:131-135); a connected
+        // endpoint's abort is a reset. ipstack has no abort, so the
+        // bridge resets the flows it saw established, from the cursors
+        // the wire last showed, and the writer closes the device after
+        // them. First, before any session ends: a dropped stream takes
+        // its flow out of the table, and its reset with it.
+        teardown.finish();
+        // Then the sessions: handlers see their transport fail and run
+        // their own ends now. ipstack's streams would not end with the
+        // stack itself; each runs on until its own timeout.
         let _ = stopping.send(true);
         drop(stack);
-        // Wake the bridge threads out of their device reads so the fds
-        // close and the interface can be recreated.
-        bridge_stop.store(true, std::sync::atomic::Ordering::Release);
-        let _ = closer.shutdown();
         // The sessions finish on this runtime: their handlers run their
         // own ends, and a handler busy elsewhere past the grace window is
         // ended by the drain's aborts, which need a runtime to land on. A private
@@ -223,6 +223,7 @@ fn spawn_session(
     handler: &Arc<dyn SessionHandler>,
     gate: &Arc<SynGate>,
     udp_nat: &Arc<UdpNat>,
+    flows: &Arc<LiveFlows>,
     stopped: &Stopped,
 ) {
     let task: Arc<OnceLock<tokio::task::AbortHandle>> = Arc::default();
@@ -237,10 +238,11 @@ fn spawn_session(
     let handler = Arc::clone(handler);
     let gate = Arc::clone(gate);
     let udp_nat = Arc::clone(udp_nat);
+    let flows = Arc::clone(flows);
     let stopped = stopped.clone();
     let join = tokio::spawn(async move {
         let _session = guard;
-        dispatch(stream, &handler, &gate, &udp_nat, stopped).await;
+        dispatch(stream, &handler, &gate, &udp_nat, &flows, stopped).await;
     });
     let _ = task.set(join.abort_handle());
 }
@@ -347,12 +349,18 @@ async fn dispatch(
     handler: &Arc<dyn SessionHandler>,
     gate: &SynGate,
     udp_nat: &Arc<UdpNat>,
+    flows: &Arc<LiveFlows>,
     stopped: Stopped,
 ) {
     match stream {
         IpStackStream::Tcp(tcp) => {
             let local = tcp.local_addr();
             let peer = tcp.peer_addr();
+            // Goes with the stream: once the stream is dropped ipstack
+            // sends nothing more for the flow, and no reset is owed.
+            let hold = flows.hold(local, peer);
+            // Rebound after the hold so every arm drops the stream first.
+            let tcp = tcp;
             let flow = FlowInfo {
                 network: Network::Tcp,
                 source: local,
@@ -373,6 +381,7 @@ async fn dispatch(
                     let transport = Box::new(TcpIo {
                         stream: tcp,
                         stopped,
+                        _hold: hold,
                     });
                     let tracker = tracker.map(|t| t as Arc<dyn FlowTrackerHook>);
                     let session = TcpSession::new(flow, transport, tracker);
@@ -491,8 +500,11 @@ async fn unless_stopped<T>(
 }
 
 struct TcpIo {
+    // Dropped before the hold: the stream's drop waits for its task, so
+    // the flow leaves the table only once ipstack is done with it.
     stream: IpStackTcpStream,
     stopped: Stopped,
+    _hold: FlowHold,
 }
 
 #[async_trait]

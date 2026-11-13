@@ -18,7 +18,7 @@ use crate::checksum;
 use crate::ipv4::Ipv4Header;
 use crate::protocol::IpProtocol;
 use crate::tcp::{TcpFlags, TcpHeader};
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
 
 /// The TTL stamped on generated packets; a host default, since these
 /// packets never travel far.
@@ -95,10 +95,44 @@ pub fn tcp_rst_v6(offending: &[u8], from: Ipv6Addr) -> Option<Vec<u8>> {
         )
     };
 
-    // The bare TCP segment: header only, no payload, no options.
+    let segment = bare_segment_v6(tcp.dst_port, tcp.src_port, seq, ack, flags, from, ip.src);
+    Some(ipv6_frame_v6(from, ip.src, IpProtocol::Tcp, 64, &segment))
+}
+
+/// The IPv6 twin of [`tcp_rst_teardown_v4`]: `<SEQ=SND.NXT>
+/// <ACK=RCV.NXT><CTL=RST,ACK>` for an established flow we own.
+pub fn tcp_rst_teardown_v6(
+    local: SocketAddrV6,
+    remote: SocketAddrV6,
+    seq: u32,
+    ack: u32,
+) -> Vec<u8> {
+    let segment = bare_segment_v6(
+        local.port(),
+        remote.port(),
+        seq,
+        ack,
+        TcpFlags::RST.union(TcpFlags::ACK),
+        *local.ip(),
+        *remote.ip(),
+    );
+    ipv6_frame_v6(*local.ip(), *remote.ip(), IpProtocol::Tcp, 64, &segment)
+}
+
+/// A bare TCP segment over IPv6: header only, no payload, no options,
+/// a zero window, and the checksum over the v6 pseudo-header.
+fn bare_segment_v6(
+    src_port: u16,
+    dst_port: u16,
+    seq: u32,
+    ack: u32,
+    flags: TcpFlags,
+    src: Ipv6Addr,
+    dst: Ipv6Addr,
+) -> Vec<u8> {
     let mut segment = Vec::with_capacity(20);
-    segment.extend_from_slice(&tcp.dst_port.to_be_bytes());
-    segment.extend_from_slice(&tcp.src_port.to_be_bytes());
+    segment.extend_from_slice(&src_port.to_be_bytes());
+    segment.extend_from_slice(&dst_port.to_be_bytes());
     segment.extend_from_slice(&seq.to_be_bytes());
     segment.extend_from_slice(&ack.to_be_bytes());
     segment.push(5 << 4); // data offset: no options
@@ -106,13 +140,11 @@ pub fn tcp_rst_v6(offending: &[u8], from: Ipv6Addr) -> Option<Vec<u8>> {
     segment.extend_from_slice(&0u16.to_be_bytes()); // window
     segment.extend_from_slice(&[0, 0]); // checksum, fixed below
     segment.extend_from_slice(&[0, 0]); // urgent
-    let sum =
-        crate::checksum::pseudo_header_v6(from, ip.src, IpProtocol::Tcp, segment.len() as u32)
-            + crate::checksum::sum_words(&segment);
+    let sum = crate::checksum::pseudo_header_v6(src, dst, IpProtocol::Tcp, segment.len() as u32)
+        + crate::checksum::sum_words(&segment);
     let fixed = !crate::checksum::fold(sum);
     segment[16..18].copy_from_slice(&fixed.to_be_bytes());
-
-    Some(ipv6_frame_v6(from, ip.src, IpProtocol::Tcp, 64, &segment))
+    segment
 }
 
 /// Build the RST that tears down an established flow we own, with the
@@ -522,6 +554,30 @@ mod v6_emit_tests {
         let datagram = rest;
         let sum = checksum::pseudo_header_v6(src, dst, IpProtocol::Udp, datagram.len() as u32)
             + checksum::sum_words(datagram);
+        assert_eq!(checksum::fold(sum), 0xffff);
+    }
+
+    #[test]
+    fn a_v6_teardown_rst_carries_both_cursors_and_verifies() {
+        let local =
+            std::net::SocketAddrV6::new(Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 1), 443, 0, 0);
+        let remote =
+            std::net::SocketAddrV6::new(Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 2), 45678, 0, 0);
+        let frame = tcp_rst_teardown_v6(local, remote, 5001, 8002);
+        let (header, rest) = Ipv6Header::parse(&frame).expect("v6 header");
+        assert_eq!(header.src, *local.ip());
+        assert_eq!(header.dst, *remote.ip());
+        assert_eq!(header.next_header, IpProtocol::Tcp);
+        let (tcp, _) = crate::tcp::TcpHeader::parse(rest).expect("tcp header");
+        assert_eq!((tcp.src_port, tcp.dst_port), (443, 45678));
+        assert_eq!((tcp.seq, tcp.ack), (5001, 8002));
+        assert_eq!(tcp.flags, TcpFlags::RST.union(TcpFlags::ACK));
+        let sum = checksum::pseudo_header_v6(
+            *local.ip(),
+            *remote.ip(),
+            IpProtocol::Tcp,
+            rest.len() as u32,
+        ) + checksum::sum_words(rest);
         assert_eq!(checksum::fold(sum), 0xffff);
     }
 

@@ -17,6 +17,13 @@
 //! fills, and the sending application feels it. The unbounded write
 //! direction trades memory for simplicity; the kernel TUN buffer absorbs
 //! bursts well enough for the transitional period.
+//!
+//! Every TCP frame crossing [`PacketIo`] is shown to [`LiveFlows`], so the
+//! stop can reset the flows ipstack leaves open. The stop runs in
+//! sing-tun's order (stack_gvisor.go:131-135): detach, reset, then close.
+//! [`Teardown`] seals the table, queues the resets behind everything
+//! ipstack already wrote, and ends the queue; the writer writes it out
+//! and only then shuts the device down.
 
 use bytes::BytesMut;
 use std::io;
@@ -28,30 +35,44 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::mpsc;
 use vfawn_core::{DnsHijack, PacketDevice};
 
+use crate::live_flows::LiveFlows;
 use crate::syn_gate::{GateOutcome, SynGate};
 
-/// The async device that ipstack sees, plus the flag that ends the
-/// bridge threads underneath it.
-///
-/// Stopping is not the channel's job: with no traffic the reader would
-/// wait on a channel whose receiver lives inside a future that is
-/// itself waiting for packets, so the loop closes on its own terms.
+/// The async device that ipstack sees, the flows it holds open, and
+/// the stop that ends the bridge threads underneath it.
 pub struct Bridge {
     pub io: PacketIo,
-    stop: Arc<AtomicBool>,
+    pub flows: Arc<LiveFlows>,
+    pub teardown: Teardown,
 }
 
-impl Bridge {
-    /// Signal both bridge threads to exit and release their device
-    /// handles. Idempotent.
-    pub fn stop(&self) {
-        self.stop.store(true, Ordering::Release);
-    }
+/// The bridge's stop. Stopping is not the channel's job: with no
+/// traffic the reader would wait on a channel whose receiver lives
+/// inside a future that is itself waiting for packets, so the loop
+/// closes on its own terms.
+///
+/// Runs on drop too, so a stack that unwinds still closes its device.
+pub struct Teardown {
+    stop: Arc<AtomicBool>,
+    flows: Arc<LiveFlows>,
+    tx: mpsc::UnboundedSender<BytesMut>,
+}
 
-    /// A shareable handle to the same signal, for tasks that outlive
-    /// this object's ownership of the packet io.
-    pub fn stop_flag(&self) -> Arc<AtomicBool> {
-        Arc::clone(&self.stop)
+impl Teardown {
+    /// Reset the live flows, then close the device once the writer has
+    /// put every queued frame and the resets on the wire.
+    pub fn finish(self) {}
+}
+
+impl Drop for Teardown {
+    fn drop(&mut self) {
+        // Set first: the device going down under the reader is the stop,
+        // not a lost device.
+        self.stop.store(true, Ordering::Release);
+        for reset in self.flows.seal() {
+            let _ = self.tx.send(BytesMut::from(&reset[..]));
+        }
+        let _ = self.tx.send(BytesMut::new());
     }
 }
 
@@ -59,6 +80,7 @@ impl Bridge {
 pub struct PacketIo {
     rx: mpsc::Receiver<BytesMut>,
     tx: mpsc::UnboundedSender<BytesMut>,
+    flows: Arc<LiveFlows>,
 }
 
 impl AsyncRead for PacketIo {
@@ -69,6 +91,7 @@ impl AsyncRead for PacketIo {
     ) -> Poll<io::Result<()>> {
         match self.rx.poll_recv(cx) {
             Poll::Ready(Some(packet)) => {
+                self.flows.inbound(&packet);
                 let len = packet.len().min(buf.remaining());
                 buf.put_slice(&packet[..len]);
                 Poll::Ready(Ok(()))
@@ -88,9 +111,17 @@ impl AsyncWrite for PacketIo {
         _cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        match self.tx.send(BytesMut::from(buf)) {
-            Ok(()) => Poll::Ready(Ok(buf.len())),
-            Err(_) => Poll::Ready(Err(io::Error::new(
+        // The empty frame is the writer's end marker; ipstack never
+        // writes one, and must not end the queue by accident.
+        if buf.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
+        match self
+            .flows
+            .outbound(buf, || self.tx.send(BytesMut::from(buf)))
+        {
+            Some(Ok(())) => Poll::Ready(Ok(buf.len())),
+            Some(Err(_)) | None => Poll::Ready(Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
                 "device writer closed",
             ))),
@@ -108,8 +139,8 @@ impl AsyncWrite for PacketIo {
 
 /// Start the reader and writer threads that connect a `PacketDevice` to
 /// ipstack's async world. The device is split through `duplicate`, so the
-/// reader and writer each own an independent handle; closing the channels
-/// stops both threads.
+/// reader and writer each own an independent handle; [`Teardown`] stops
+/// both threads.
 pub fn start(
     mut read_device: Box<dyn PacketDevice>,
     write_device: Box<dyn PacketDevice>,
@@ -121,6 +152,7 @@ pub fn start(
     let (rx_tx, rx_rx) = mpsc::channel::<BytesMut>(128);
     let (tx_tx, tx_rx) = mpsc::unbounded_channel::<BytesMut>();
     let stop = Arc::new(AtomicBool::new(false));
+    let flows = Arc::new(LiveFlows::default());
 
     // Reader: blocks in read_batch, pushes one packet per channel send.
     // blocking_send stalls when the bounded channel fills up, which is the
@@ -194,34 +226,45 @@ pub fn start(
         })
         .expect("spawn reader thread");
 
-    // Writer: pulls one packet at a time from the unbounded channel.
-    let writer_stop = Arc::clone(&stop);
+    // Writer: pulls one packet at a time from the unbounded channel until
+    // the teardown's end marker, then shuts the device down. The shutdown
+    // is the writer's so it lands after the last reset, never before.
     std::thread::Builder::new()
         .name("ipstack-device-writer".into())
         .spawn(move || {
             let mut tx_rx = tx_rx;
             let mut write_device = write_device;
+            // A failed write ends the writing, as it always has, but not
+            // the wait: the device stays up until the teardown says so.
+            let mut writing = true;
             while let Some(mut packet) = tx_rx.blocking_recv() {
-                if writer_stop.load(Ordering::Acquire) {
-                    return;
+                if packet.is_empty() {
+                    break;
+                }
+                if !writing {
+                    continue;
                 }
                 if let Some(engine) = dns.as_ref() {
                     engine.restore(&mut packet);
                 }
                 let mut batch = [packet];
-                if write_device.write_batch(&mut batch).is_err() {
-                    return;
-                }
+                writing = write_device.write_batch(&mut batch).is_ok();
             }
-            eprintln!("bridge writer: channel closed, exiting");
+            let _ = write_device.shutdown();
         })
         .expect("spawn writer thread");
 
     Bridge {
         io: PacketIo {
             rx: rx_rx,
+            tx: tx_tx.clone(),
+            flows: Arc::clone(&flows),
+        },
+        flows: Arc::clone(&flows),
+        teardown: Teardown {
+            stop,
+            flows,
             tx: tx_tx,
         },
-        stop,
     }
 }

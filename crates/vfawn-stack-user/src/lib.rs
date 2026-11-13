@@ -39,6 +39,8 @@ pub mod ipstack_backend;
 #[cfg(feature = "backend-ipstack")]
 pub mod ipstack_bridge;
 #[cfg(feature = "backend-ipstack")]
+pub mod live_flows;
+#[cfg(feature = "backend-ipstack")]
 pub mod syn_gate;
 
 #[cfg(feature = "backend-native")]
