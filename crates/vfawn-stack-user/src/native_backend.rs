@@ -58,7 +58,7 @@ use vfawn_wire::emit::tcp_rst_v6;
 const DEFAULT_MSS: u16 = 536;
 
 /// What a slot tells the session wrapper.
-enum HostEvent {
+pub(crate) enum HostEvent {
     Established,
     Bytes(Vec<u8>),
     Closed,
@@ -75,7 +75,7 @@ fn v4_ends(flow: &FlowKey) -> Option<(std::net::SocketAddr, std::net::SocketAddr
 /// The TCP header and whole segment bytes of a packet. The family
 /// decides where the segment starts; the machine downstream is
 /// family-blind (sequence space and flags).
-fn tcp_segment(packet: &[u8]) -> Option<(TcpHeader, &[u8])> {
+pub(crate) fn tcp_segment(packet: &[u8]) -> Option<(TcpHeader, &[u8])> {
     let segment = match packet.first().map(|byte| byte >> 4) {
         Some(4) => {
             let (ip, payload) = Ipv4Header::parse(packet).ok()?;
@@ -106,9 +106,9 @@ const TIME_WAIT: Duration = Duration::from_secs(60);
 /// that writes faster than the wire carries (a relay pumping from a
 /// memory-speed socket) must feel backpressure, or the queue becomes
 /// the process's memory ceiling.
-struct WriteLane {
-    writes: VecDeque<Vec<u8>>,
-    bytes: usize,
+pub(crate) struct WriteLane {
+    pub(crate) writes: VecDeque<Vec<u8>>,
+    pub(crate) bytes: usize,
 }
 
 /// How much unsent host output one flow may hold. A few windows'
@@ -137,8 +137,8 @@ pub struct TcpSlot {
     connection: ServerConnection,
     client: std::net::SocketAddr,
     server: std::net::SocketAddr,
-    handler: Arc<dyn SessionHandler>,
-    accept: Arc<std::sync::Mutex<AcceptQueue>>,
+    handler: Option<Arc<dyn SessionHandler>>,
+    accept: Option<Arc<std::sync::Mutex<AcceptQueue>>>,
     sessions: mpsc::SyncSender<SessionHandoff>,
     flow: FlowInfo,
     /// The lane this slot's host writes arrive on.
@@ -233,6 +233,67 @@ const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
 const KEEPALIVE_PROBE_MAX: u32 = 3;
 
 impl TcpSlot {
+    /// An active-open slot: the engine supplies the local tunnel
+    /// endpoint, the remote target, and the session channel the
+    /// handshake completion arrives on.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn connect(
+        flow_key: vfawn_wire::flow::FlowKey,
+        flow: FlowInfo,
+        local: std::net::SocketAddr,
+        remote: std::net::SocketAddr,
+        isn: u32,
+        mss: u16,
+        sessions: mpsc::SyncSender<SessionHandoff>,
+        shard_wake: Arc<ShardBell>,
+        cc: Box<dyn CongestionAlgo>,
+        frame_pool: Arc<crate::shards::BufferPool>,
+    ) -> Self {
+        Self {
+            connection: ServerConnection::connect(isn, mss),
+            flow_key,
+            // The emitter always writes server -> client; an outbound
+            // slot's "server" is our tunnel endpoint.
+            client: remote,
+            server: local,
+            handler: None,
+            accept: None,
+            sessions,
+            flow,
+            write_lane: Arc::new(std::sync::Mutex::new(WriteLane::new())),
+            shard_wake,
+            cc,
+            to_host: None,
+            judged: true,
+            refused: false,
+            flight: Vec::new(),
+            flight_head: 0,
+            flight_base: 0,
+            data_sent_at: None,
+            data_retries: 0,
+            synack_at: None,
+            synack_retries: 0,
+            fin_at: None,
+            persist_at: None,
+            persist_retries: 0,
+            diag_at: None,
+            diag_queued: 0,
+            keepalive_at: None,
+            keepalive_probes: 0,
+            time_wait_at: None,
+            tracker: None,
+            frame_pool,
+        }
+    }
+
+    /// Send the opening SYN: the slot's first wire action.
+    pub(crate) fn begin(&mut self, out: &mut VecDeque<BytesMut>) {
+        let reaction = self.connection.syn_reaction();
+        self.emit(&reaction, out);
+        self.synack_at = Some(Instant::now());
+        self.synack_retries = 0;
+    }
+
     fn announce(&mut self) {
         if self.to_host.is_some() || self.connection.state() != TcpState::Established {
             return;
@@ -252,10 +313,12 @@ impl TcpSlot {
         if self.sessions.send(handoff).is_ok() {
             let _ = event_tx.send(HostEvent::Established);
             self.to_host = Some(event_tx);
-            self.accept
-                .lock()
-                .expect("accept lock")
-                .on_established(self.flow.source);
+            if let Some(accept) = &self.accept {
+                accept
+                    .lock()
+                    .expect("accept lock")
+                    .on_established(self.flow.source);
+            }
         }
     }
 
@@ -266,8 +329,12 @@ impl TcpSlot {
     /// raw segment stays available for the RST the reject path owes.
     fn judge(&mut self, packet: &[u8], out: &mut VecDeque<BytesMut>) {
         self.judged = true;
+        let Some(handler) = self.handler.as_ref() else {
+            self.refused = true;
+            return;
+        };
         let verdict = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            self.handler.judge_flow(&self.flow, &[])
+            handler.judge_flow(&self.flow, &[])
         }))
         .unwrap_or(Verdict::Drop);
         match vfawn_core::verdict::execute(verdict, &self.flow) {
@@ -549,6 +616,44 @@ impl TcpSlot {
         if let Some(to_host) = &self.to_host {
             let _ = to_host.send(HostEvent::Bytes(bytes.to_vec()));
         }
+    }
+}
+
+impl TcpSlot {
+    /// Drive the slot with one inbound packet (the engine's entry).
+    pub(crate) fn drive(
+        &mut self,
+        packet: &[u8],
+        out: &mut VecDeque<BytesMut>,
+        pool: &BufferPool,
+        mtu: usize,
+    ) {
+        <Self as SlotLogic>::on_packet(self, packet, out, pool, mtu);
+    }
+
+    /// When the slot next needs the loop's attention.
+    pub(crate) fn next_deadline(&self) -> Option<Duration> {
+        <Self as SlotLogic>::timer_wanted(self)
+    }
+
+    /// Fire the timer the loop waited for.
+    pub(crate) fn fire(&mut self, out: &mut VecDeque<BytesMut>, pool: &BufferPool) {
+        <Self as SlotLogic>::on_timer(self, out, pool);
+    }
+
+    /// The periodic idle sweep.
+    pub(crate) fn idle(&mut self, out: &mut VecDeque<BytesMut>) {
+        <Self as SlotLogic>::on_idle(self, out);
+    }
+
+    /// Whether the flow has left every state.
+    pub(crate) fn is_finished(&self) -> bool {
+        <Self as SlotLogic>::finished(self)
+    }
+
+    /// Reset a live flow (the host aborted the connection).
+    pub(crate) fn reset(&mut self, out: &mut VecDeque<BytesMut>) {
+        <Self as SlotLogic>::abort(self, out);
     }
 }
 
@@ -856,6 +961,14 @@ impl SlotLogic for TcpSlot {
             return Some(Duration::ZERO);
         }
         match self.connection.state() {
+            // The SYN's clock while the active open waits, and the
+            // SYN-ACK's while the passive one does.
+            TcpState::SynSent if self.synack_retries <= SYNACK_RETRY_MAX => {
+                self.synack_at.map(|at| {
+                    (at + rto_backoff(self.synack_retries))
+                        .saturating_duration_since(Instant::now())
+                })
+            }
             // One more wait after the last retransmission: its expiry
             // is the handshake's failure (gVisor `handshakeFailed`).
             TcpState::SynReceived if self.synack_retries <= SYNACK_RETRY_MAX => {
@@ -947,6 +1060,18 @@ impl SlotLogic for TcpSlot {
 
     fn on_timer(&mut self, out: &mut VecDeque<BytesMut>, _pool: &BufferPool) {
         match self.connection.state() {
+            TcpState::SynSent if self.synack_retries >= SYNACK_RETRY_MAX => {
+                self.connection.abandon();
+            }
+            TcpState::SynSent => {
+                if let Some(reaction) = self.connection.syn_retransmit() {
+                    let options = self.connection.handshake_options(Instant::now());
+                    let frame = emit_tcp(self.server, self.client, &reaction, &options, &[]);
+                    out.push_back(BytesMut::from(&frame[..]));
+                    self.synack_retries = self.synack_retries.saturating_add(1);
+                    self.synack_at = Some(Instant::now());
+                }
+            }
             TcpState::SynReceived if self.synack_retries >= SYNACK_RETRY_MAX => {
                 // The handshake never completed: no session exists,
                 // the slot simply closes.
@@ -1395,12 +1520,12 @@ struct SpawnShared {
 }
 
 /// A ready session handed to the runtime side.
-struct SessionHandoff {
-    flow: FlowInfo,
-    events: tokio::sync::mpsc::UnboundedReceiver<HostEvent>,
-    write_lane: Arc<std::sync::Mutex<WriteLane>>,
-    shard_wake: Arc<ShardBell>,
-    tracker: Option<Arc<dyn vfawn_core::FlowTrackerHook>>,
+pub(crate) struct SessionHandoff {
+    pub(crate) flow: FlowInfo,
+    pub(crate) events: tokio::sync::mpsc::UnboundedReceiver<HostEvent>,
+    pub(crate) write_lane: Arc<std::sync::Mutex<WriteLane>>,
+    pub(crate) shard_wake: Arc<ShardBell>,
+    pub(crate) tracker: Option<Arc<dyn vfawn_core::FlowTrackerHook>>,
 }
 
 impl StackBackend for NativeBackend {
@@ -1520,8 +1645,8 @@ impl StackBackend for NativeBackend {
                     flow_key: *flow,
                     client,
                     server,
-                    handler: Arc::clone(&factory_shared.handler),
-                    accept: Arc::clone(&factory_shared.accept),
+                    handler: Some(Arc::clone(&factory_shared.handler)),
+                    accept: Some(Arc::clone(&factory_shared.accept)),
                     sessions: factory_shared.sessions.clone(),
                     flow: FlowInfo {
                         network: Network::Tcp,
@@ -1774,12 +1899,12 @@ pub mod cost_probe_support {
             },
             client,
             server,
-            handler: Arc::new(ProbeHandler),
-            accept: Arc::new(std::sync::Mutex::new(AcceptQueue::new(
+            handler: Some(Arc::new(ProbeHandler)),
+            accept: Some(Arc::new(std::sync::Mutex::new(AcceptQueue::new(
                 true,
                 64,
                 Box::new(crate::accept::FixedSecret(0)),
-            ))),
+            )))),
             sessions: sessions_tx,
             flow: FlowInfo {
                 network: Network::Tcp,
@@ -1859,12 +1984,12 @@ mod tests {
             },
             client,
             server,
-            handler: Arc::new(NoHandler),
-            accept: Arc::new(std::sync::Mutex::new(AcceptQueue::new(
+            handler: Some(Arc::new(NoHandler)),
+            accept: Some(Arc::new(std::sync::Mutex::new(AcceptQueue::new(
                 true,
                 64,
                 Box::new(FixedSecret(0)),
-            ))),
+            )))),
             sessions: sessions_tx,
             flow: FlowInfo {
                 network: Network::Tcp,

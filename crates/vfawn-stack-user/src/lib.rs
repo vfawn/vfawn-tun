@@ -18,6 +18,8 @@
 #[cfg(feature = "backend-native")]
 pub mod accept;
 #[cfg(feature = "backend-native")]
+pub mod client;
+#[cfg(feature = "backend-native")]
 pub mod congestion;
 #[cfg(feature = "backend-native")]
 pub mod fragment;
@@ -55,6 +57,8 @@ pub use icmp_slot::IcmpSlot;
 #[cfg(feature = "backend-native")]
 #[cfg(all(feature = "backend-native", target_os = "linux"))]
 pub mod splice_lane;
+#[cfg(feature = "backend-native")]
+pub use client::{ClientConfig, ClientStack, TcpStream, UdpSocket};
 #[cfg(feature = "backend-ipstack")]
 pub use ipstack_backend::IpstackBackend;
 #[cfg(feature = "backend-native")]

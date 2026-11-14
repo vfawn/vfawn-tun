@@ -44,6 +44,9 @@ pub mod ctl {
 pub enum TcpState {
     /// Waiting for a connection request (the listening side).
     Listen,
+    /// Waiting for the peer's SYN-ACK (RFC 9293: the client's
+    /// half-open state after an active open).
+    SynSent,
     /// Waiting for the client's ACK to complete the handshake
     /// (RFC 9293: the server's half-open state).
     SynReceived,
@@ -318,6 +321,41 @@ impl ServerConnection {
         }
     }
 
+    /// Active open (RFC 9293 §3.4): the client's side of the
+    /// handshake. The SYN leaves at `isn`; the peer's SYN-ACK carries
+    /// `isn + 1` and completes the connection.
+    pub fn connect(isn: u32, mss: u16) -> Self {
+        let mut connection = Self::new(isn, mss);
+        connection.state = TcpState::SynSent;
+        // The client offers both negotiations in its SYN: a window
+        // scale and a timestamp clock. The server's SYN-ACK decides
+        // whether either survives (RFC 7323 §2.2); `on_syn_sent`
+        // drops what the peer did not echo.
+        connection.scaled = true;
+        connection.arm_timestamps(vfawn_wire::tcp::Timestamps { tsval: 0, tsecr: 0 });
+        connection
+    }
+
+    /// The SYN an active open sends (RFC 9293 §3.4). The emitter adds
+    /// the options and books the sequence number.
+    pub fn syn_reaction(&self) -> Reaction {
+        Reaction::segment(self.send.nxt, 0, ctl::SYN, self.advertised_window())
+    }
+
+    /// The SYN again while the handshake waits, at the unacknowledged
+    /// ISN. None once the connection has left SYN-SENT.
+    pub fn syn_retransmit(&self) -> Option<Reaction> {
+        match self.state {
+            TcpState::SynSent => Some(Reaction::segment(
+                self.send.una,
+                0,
+                ctl::SYN,
+                self.advertised_window(),
+            )),
+            _ => None,
+        }
+    }
+
     pub fn state(&self) -> TcpState {
         self.state
     }
@@ -363,6 +401,7 @@ impl ServerConnection {
         }
         match self.state {
             TcpState::Listen => self.on_listen(inbound),
+            TcpState::SynSent => self.on_syn_sent(inbound),
             TcpState::SynReceived => self.on_syn_received(inbound),
             TcpState::Established | TcpState::CloseWait => {
                 let reaction = self.on_established(inbound);
@@ -414,6 +453,51 @@ impl ServerConnection {
             && !inbound.has(ctl::ACK)
             && !inbound.has(ctl::RST)
             && inbound.seq.wrapping_sub(self.recv.nxt).wrapping_sub(1) < u32::MAX / 2
+    }
+
+    /// SYN-SENT: the peer's SYN-ACK completes the active open
+    /// (RFC 9293 §3.4). Simultaneous open is not modelled: a bare SYN
+    /// is ignored rather than answered, which the reference stacks
+    /// also do when they have no listener on the tuple.
+    fn on_syn_sent(&mut self, inbound: &Inbound) -> Reaction {
+        if inbound.has(ctl::RST) {
+            if self.ack_acceptable(inbound.ack) {
+                self.state = TcpState::Closed;
+            }
+            return Reaction::silent();
+        }
+        if !inbound.has(ctl::SYN) || !inbound.has(ctl::ACK) {
+            return Reaction::silent();
+        }
+        if !self.ack_acceptable(inbound.ack) {
+            return Reaction::silent();
+        }
+        self.recv.nxt = inbound.seq.wrapping_add(1);
+        self.send.una = inbound.ack;
+        if let Some(offered) = inbound.options.mss {
+            self.mss = self.mss.min(offered);
+        }
+        // The peer's answer decides the negotiations: no wscale option
+        // means no scaling in either direction (RFC 7323 §2.2), and
+        // the same rule governs timestamps.
+        match inbound.options.wscale {
+            Some(shift) => {
+                self.scaled = true;
+                self.peer_shift = shift.min(14);
+            }
+            None => self.scaled = false,
+        }
+        match inbound.options.timestamps {
+            Some(offered) => self.arm_timestamps(offered),
+            None => self.timestamps = None,
+        }
+        self.state = TcpState::Established;
+        Reaction::segment(
+            self.send.nxt,
+            self.recv.nxt,
+            ctl::ACK,
+            self.advertised_window(),
+        )
     }
 
     /// LISTEN: a SYN opens the handshake (RFC 9293 §3.4: the listener

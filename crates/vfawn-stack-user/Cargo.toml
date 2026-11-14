@@ -41,6 +41,7 @@ workspace = true
 optional = true
 
 [dev-dependencies]
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "time", "sync"] }
 vfawn-wire.workspace = true
 vfawn-testsuite = { path = "../vfawn-testsuite" }
 bytes.workspace = true
