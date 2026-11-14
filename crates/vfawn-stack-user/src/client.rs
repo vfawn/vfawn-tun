@@ -459,11 +459,13 @@ impl Engine {
     }
 
     fn on_datagram(&mut self, packet: &[u8]) {
-        let Some((_source, destination, data)) = udp_datagram(packet) else {
+        let Some((source, destination, data)) = udp_datagram(packet) else {
             return;
         };
         if let Some(sender) = self.udp.get(&destination.port()) {
-            let _ = sender.send((data.to_vec(), destination));
+            // `recv_from` 必须给出远端来源；返回 destination 会让多目标关联
+            // 把回包当成来自隧道本地端点，无法按目标回写。
+            let _ = sender.send((data.to_vec(), source));
         }
     }
 
